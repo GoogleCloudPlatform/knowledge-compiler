@@ -1,0 +1,22 @@
+{
+  "command": "python3",
+  "args": [
+    "-B",
+    "-u",
+    "server.py"
+  ],
+  "restart_policy": "always",
+  "display_name": "Knowledge Graph",
+  "description": "Interactive 2D/3D graph of your Open Knowledge Format wiki with search and a Markdown reader.",
+  "has_web_ui": true,
+  "ui_config": {
+    "display_name": "Vault WebGL Graph",
+    "views": [
+      {
+        "path": "/",
+        "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE",
+        "title": "Vault WebGL Graph"
+      }
+    ]
+  }
+}
