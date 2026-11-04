@@ -150,13 +150,20 @@ def parse_simple_yaml(text: str) -> dict:
     except Exception:
         pass
 
-    # Fallback stdlib parser supporting key-value pairs, inline lists, and multi-line lists
+    # Fallback stdlib parser supporting key-value pairs, block scalars, inline lists, and multi-line lists
     data: dict = {}
     current_list_key: str | None = None
+    current_scalar_key: str | None = None
     for raw_line in text.splitlines():
         stripped = raw_line.strip()
         if not stripped or stripped.startswith("#"):
             continue
+        is_indented = raw_line[:1] in (" ", "\t")
+        if is_indented and current_scalar_key:
+            prev = str(data.get(current_scalar_key, ""))
+            data[current_scalar_key] = f"{prev} {stripped}".strip() if prev else stripped
+            continue
+        current_scalar_key = None
         if stripped.startswith("- ") and current_list_key:
             item = stripped[2:].strip().strip("'\"")
             if isinstance(data.get(current_list_key), list):
@@ -169,6 +176,10 @@ def parse_simple_yaml(text: str) -> dict:
             if not v:
                 data[k] = []
                 current_list_key = k
+            elif v in (">-", ">", "|-", "|"):
+                data[k] = ""
+                current_list_key = None
+                current_scalar_key = k
             elif v.startswith("[") and v.endswith("]"):
                 inner = v[1:-1].strip()
                 data[k] = (
@@ -180,6 +191,7 @@ def parse_simple_yaml(text: str) -> dict:
             else:
                 data[k] = v.strip("'\"")
                 current_list_key = None
+                current_scalar_key = k
     return data
 
 
