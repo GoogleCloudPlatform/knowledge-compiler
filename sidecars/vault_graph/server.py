@@ -22,7 +22,7 @@ _plugin_scripts = Path(os.path.abspath(__file__)).parents[2] / 'scripts'
 if _plugin_scripts.is_dir() and str(_plugin_scripts) not in sys.path:
     sys.path.insert(0, str(_plugin_scripts))
 
-import vault_graph
+import vault_graph  # noqa: E402
 
 if __name__ == '__main__':
     port = int(os.environ.get('ANTIGRAVITY_SIDECAR_WEB_PORT', '8765'))
