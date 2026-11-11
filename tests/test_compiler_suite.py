@@ -15,6 +15,8 @@
 """Hermetic test suite for CE Knowledge Compiler utilities."""
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -665,6 +667,158 @@ class TestKnowledgeCompilerSuite(unittest.TestCase):
         self.assertNotIn("Contoso", healed)
         self.assertNotIn("Fabrikam", healed)
         self.assertNotIn("wiki/entities/", healed)
+
+    def test_sanitize_check_and_migrate_sources_multiline_okf(self):
+        """Verify sanitize_check preserves multi-line {id, resource} blocks and vault_lint prints migration banner on healthy vaults."""
+        shared_repo = Path(self.test_dir) / "shared-okf-patterns"
+        init_vault.init_vault(shared_repo)
+
+        base_note = shared_repo / "wiki" / "concepts" / "Shared Foundation.md"
+        base_note.write_text(
+            "---\n"
+            'title: "Shared Foundation"\n'
+            "type: concept\n"
+            "status: stable\n"
+            "created: 2026-10-01\n"
+            "updated: 2026-11-11\n"
+            "tags:\n"
+            "  - architecture\n"
+            "---\n\n"
+            "# Shared Foundation\n",
+            encoding="utf-8",
+        )
+
+        # 1. Mixed private & public multi-line {id, resource, title} (indent-2 + indent-0 + quoted human: + epistemic)
+        ml_note = shared_repo / "wiki" / "concepts" / "MultiLine Shared Note.md"
+        ml_note.write_text(
+            "---\n"
+            'title: "MultiLine Shared Note"\n'
+            "type: concept\n"
+            "status: stable\n"
+            "created: 2026-10-01\n"
+            "updated: 2026-11-11\n"
+            "tags:\n"
+            "  - architecture\n"
+            "verified:\n"
+            '  - by: "human:Jane Doe"\n'
+            "    at: \"2026-11-11T00:00:00Z\"\n"
+            "sources:\n"
+            "  - id: raw-client-deck\n"
+            '    resource: "raw/client_deck.pptx"\n'
+            '    title: "Internal Slides"\n'
+            "  - id: local-notes\n"
+            '    resource: "/home/jdoe/ObsidianVault/notes.md"\n'
+            '    title: "Local Notes"\n'
+            "  - id: acmecorp-q3\n"
+            '    resource: "https://example.org/acmecorp-case"\n'
+            '    title: "Customer Ref"\n'
+            "  - id: gcp-arch\n"
+            '    resource: "https://cloud.google.com/architecture"\n'
+            '    title: "Google Cloud Architecture Center"\n'
+            "corroborates:\n"
+            "- id: priv-corr\n"
+            '  target: "[[wiki/entities/AcmeCorp]]"\n'
+            "- id: pub-corr\n"
+            '  target: "[[Shared Foundation]]"\n'
+            "---\n\n"
+            "# MultiLine Shared Note\n\n"
+            "Builds on [[Shared Foundation]].\n",
+            encoding="utf-8",
+        )
+
+        # Clean multi-line {id, resource} note must remain byte-for-byte untouched
+        clean_ml_note = shared_repo / "wiki" / "concepts" / "Clean MultiLine Note.md"
+        clean_ml_raw = (
+            "---\n"
+            'title: "Clean MultiLine Note"\n'
+            "type: concept\n"
+            "status: stable\n"
+            "created: 2026-10-01\n"
+            "updated: 2026-11-11\n"
+            "tags:\n"
+            "  - architecture\n"
+            "verified:\n"
+            "  - by: human:cloud-ce\n"
+            "sources:\n"
+            "  - id: gcp-docs\n"
+            '    resource: "https://cloud.google.com/docs"\n'
+            '    title: "Cloud Docs"\n'
+            "---\n\n"
+            "# Clean MultiLine Note\n\n"
+            "Builds on [[Shared Foundation]].\n"
+        )
+        clean_ml_note.write_text(clean_ml_raw, encoding="utf-8")
+
+        res1 = sanitize_check.run_sanitize_check(
+            targets=[shared_repo],
+            repo_root=shared_repo,
+            strict=True,
+            fix=True,
+        )
+        self.assertTrue(res1["ok"], msg=str(res1["violations"]))
+        self.assertEqual(res1["violation_count"], 0)
+        self.assertIn("wiki/concepts/MultiLine Shared Note.md", res1["fixed_files"])
+        self.assertNotIn("wiki/concepts/Clean MultiLine Note.md", res1["fixed_files"])
+        self.assertEqual(clean_ml_note.read_text(encoding="utf-8"), clean_ml_raw)
+
+        healed = ml_note.read_text(encoding="utf-8")
+        self.assertNotIn("Jane Doe", healed)
+        self.assertIn('by: "human:cloud-ce"', healed)
+        self.assertNotIn("raw-client-deck", healed)
+        self.assertNotIn("Internal Slides", healed)
+        self.assertNotIn("local-notes", healed)
+        self.assertNotIn("Local Notes", healed)
+        self.assertNotIn("acmecorp-q3", healed)
+        self.assertNotIn("Customer Ref", healed)
+        self.assertNotIn("priv-corr", healed)
+        self.assertNotIn("AcmeCorp", healed)
+        self.assertIn("  - id: gcp-arch\n    resource: \"https://cloud.google.com/architecture\"\n    title: \"Google Cloud Architecture Center\"", healed)
+        self.assertIn("- id: pub-corr\n  target: \"[[Shared Foundation]]\"", healed)
+
+        # Second strict pass must be a strict no-op (idempotency)
+        res2 = sanitize_check.run_sanitize_check(
+            targets=[shared_repo],
+            repo_root=shared_repo,
+            strict=True,
+            fix=True,
+        )
+        self.assertTrue(res2["ok"], msg=str(res2["violations"]))
+        self.assertEqual(res2["violation_count"], 0)
+        self.assertEqual(res2["fixed_files"], [])
+
+        # 2. Verify vault_lint --fix --migrate-sources prints migration summary even when 100% HEALTHY!
+        clean_vault = Path(self.test_dir) / "clean-vault-migrate"
+        init_vault.init_vault(clean_vault)
+        seed = clean_vault / "wiki" / "concepts" / "Seed Concept.md"
+        seed.write_text(
+            "---\n"
+            'title: "Seed Concept"\n'
+            "type: concept\n"
+            "status: stable\n"
+            "created: 2026-10-01\n"
+            "updated: 2026-11-11\n"
+            "tags:\n"
+            "  - architecture\n"
+            "sources:\n"
+            '  - "https://cloud.google.com/docs"\n'
+            "---\n\n"
+            "# Seed Concept\n\n"
+            "Linked from [[index|Master Index]].\n",
+            encoding="utf-8",
+        )
+        idx = clean_vault / "index.md"
+        idx.write_text(
+            idx.read_text(encoding="utf-8") + "\n- [[Seed Concept]]\n",
+            encoding="utf-8",
+        )
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            vault_lint.main([str(clean_vault), "--fix", "--migrate-sources"])
+        out_txt = buf.getvalue()
+        self.assertIn("Migrated Legacy String Sources to {id, resource}", out_txt)
+        self.assertIn("wiki/concepts/Seed Concept.md", out_txt)
+        self.assertIn("100% HEALTHY!", out_txt)
 
     def test_v070_manifest_and_learn_companion_invariants(self):
         repo_root = Path(__file__).resolve().parent.parent

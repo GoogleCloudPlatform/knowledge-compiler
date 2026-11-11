@@ -28,6 +28,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import sync_patterns  # noqa: E402
+import okf  # noqa: E402
 
 
 class TestSyncPatterns(unittest.TestCase):
@@ -360,6 +361,152 @@ Prevents infinite LLM recursion loops.
         self.assertNotIn("corroborates:", out_text)
         # Code block example must remain untouched
         self.assertIn("Keep literal syntax example: [[wiki/entities/ExampleAccount]]", out_text)
+
+    def test_multiline_okf_sources_sanitization_and_share(self):
+        """Test multi-line {id, resource} block mappings, flow lists, indent-0/-2 lists, and OKF conformance."""
+        (self.mock_vault / "tables" / "customers.md").write_text(
+            "| Customer Account | Industry | Notes |\n"
+            "| :--- | :--- | :--- |\n"
+            "| **[[AcmeCorp]]** | Enterprise Commercial Account | Active |\n",
+            encoding="utf-8",
+        )
+
+        # 1. Mixed private & public multi-line sources + epistemic links + human/author identity in kept items
+        raw_mixed = (
+            "---\n"
+            'title: "MultiLine Pattern"\n'
+            "type: concept\n"
+            "status: stable\n"
+            "created: 2026-10-01\n"
+            "updated: 2026-11-11\n"
+            "tags:\n"
+            "  - architecture/cloud\n"
+            "sources:\n"
+            "  - id: raw-deck\n"
+            '    resource: "raw/AcmeCorp_Review.pptx"\n'
+            '    title: "Internal Review"\n'
+            "  - id: local-log\n"
+            '    resource: "/home/alice/ObsidianVault/trace.md"\n'
+            "    author: jdoe\n"
+            "  - id: pub-doc\n"
+            '    resource: "https://cloud.google.com/architecture"\n'
+            '    title: "Cloud Architecture"\n'
+            '    by: "human:alice"\n'
+            "corroborates:\n"
+            "- id: priv-link\n"
+            '  target: "[[wiki/entities/AcmeCorp]]"\n'
+            "- id: shared-link\n"
+            '  target: "[[Cloud Pattern]]"\n'
+            "---\n\n"
+            "# MultiLine Pattern\n\n"
+            "Validated with [[AcmeCorp]] and [[Cloud Pattern]].\n"
+        )
+        shared_dir = self.mock_shared_repo / "wiki" / "concepts"
+        (shared_dir / "Cloud Pattern.md").write_text(
+            "---\ntitle: Cloud Pattern\ntype: concept\nstatus: stable\ncreated: 2026-10-01\nupdated: 2026-11-11\ntags: [cloud]\n---\n# Cloud Pattern\n",
+            encoding="utf-8",
+        )
+        valid_targets = sync_patterns._collect_shared_targets(self.mock_shared_repo)
+        sanitized, _notes = sync_patterns.sanitize_markdown(
+            raw_mixed, vault_root=self.mock_vault, valid_shared_targets=valid_targets
+        )
+
+        self.assertNotIn("raw-deck", sanitized)
+        self.assertNotIn("Internal Review", sanitized)
+        self.assertNotIn("local-log", sanitized)
+        self.assertNotIn("/workspace/ObsidianVault/trace.md", sanitized)
+        self.assertNotIn("author: jdoe", sanitized)
+        self.assertNotIn("priv-link", sanitized)
+        self.assertNotIn("AcmeCorp", sanitized)
+        self.assertIn("  - id: pub-doc\n    resource: \"https://cloud.google.com/architecture\"", sanitized)
+        self.assertIn('by: "human:cloud-ce"', sanitized)
+        self.assertIn("- id: shared-link\n  target: \"[[Cloud Pattern]]\"", sanitized)
+
+        for use_yaml in (True, False):
+            val_res = okf.validate_okf_concept(sanitized, use_pyyaml=use_yaml)
+            self.assertTrue(val_res["valid"], msg=f"use_yaml={use_yaml}: {val_res['errors']}")
+            self.assertEqual(val_res["errors"], [])
+
+        # 2. All-private multi-line sources -> `sources: []`; all-private epistemic -> omitted
+        raw_all_priv = (
+            "---\n"
+            'title: "Private Sources Pattern"\n'
+            "type: concept\n"
+            "status: stable\n"
+            "created: 2026-10-01\n"
+            "updated: 2026-11-11\n"
+            "tags:\n"
+            "  - architecture/cloud\n"
+            "sources:\n"
+            "  - id: only-raw\n"
+            '    resource: "raw/internal.pdf"\n'
+            "  - id: only-home\n"
+            '    resource: "/home/alice/notes.md"\n'
+            "corroborates:\n"
+            "  - id: priv-only\n"
+            '    target: "[[wiki/entities/AcmeCorp]]"\n'
+            "---\n\n"
+            "# Private Sources Pattern\n"
+        )
+        san_priv, _ = sync_patterns.sanitize_markdown(
+            raw_all_priv, vault_root=self.mock_vault, valid_shared_targets=valid_targets
+        )
+        self.assertIn("sources: []", san_priv)
+        self.assertNotIn("only-raw", san_priv)
+        self.assertNotIn("only-home", san_priv)
+        self.assertNotIn("/workspace/notes.md", san_priv)
+        self.assertNotIn("corroborates:", san_priv)
+        self.assertNotIn("priv-only", san_priv)
+        for use_yaml in (True, False):
+            val_priv = okf.validate_okf_concept(san_priv, use_pyyaml=use_yaml)
+            self.assertTrue(val_priv["valid"], msg=f"use_yaml={use_yaml}: {val_priv['errors']}")
+
+        # 3. Inline & multi-line flow lists
+        raw_flow = (
+            "---\n"
+            'title: "Flow Sources Pattern"\n'
+            "type: concept\n"
+            "status: stable\n"
+            "created: 2026-10-01\n"
+            "updated: 2026-11-11\n"
+            "tags: [cloud]\n"
+            'sources: [{id: "priv", resource: "/home/alice/deck.pdf"}, {id: "pub", resource: "https://cloud.google.com/docs", by: "human:alice"}]\n'
+            "corroborates: [\n"
+            '  "[[wiki/entities/AcmeCorp]]",\n'
+            '  "[[Cloud Pattern]]"\n'
+            "]\n"
+            "---\n\n"
+            "# Flow Sources Pattern\n"
+        )
+        san_flow, _ = sync_patterns.sanitize_markdown(
+            raw_flow, vault_root=self.mock_vault, valid_shared_targets=valid_targets
+        )
+        self.assertNotIn("deck.pdf", san_flow)
+        self.assertNotIn("/workspace/deck.pdf", san_flow)
+        self.assertIn("https://cloud.google.com/docs", san_flow)
+        self.assertIn("human:cloud-ce", san_flow)
+        self.assertNotIn("AcmeCorp", san_flow)
+        self.assertIn("[[Cloud Pattern]]", san_flow)
+        for use_yaml in (True, False):
+            val_flow = okf.validate_okf_concept(san_flow, use_pyyaml=use_yaml)
+            self.assertTrue(val_flow["valid"], msg=f"use_yaml={use_yaml}: {val_flow['errors']}")
+
+        # 4. End-to-end share_pattern() with multi-line OKF sources
+        src_note = self.mock_vault / "wiki" / "concepts" / "Share Multiline OKF.md"
+        src_note.write_text(raw_mixed, encoding="utf-8")
+        share_res = sync_patterns.share_pattern(
+            src_note,
+            self.mock_shared_repo,
+            vault_root=self.mock_vault,
+            dry_run=False,
+        )
+        self.assertTrue(share_res["success"])
+        shared_text = (self.mock_shared_repo / "wiki" / "concepts" / "Share Multiline OKF.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("https://cloud.google.com/architecture", shared_text)
+        self.assertNotIn("raw-deck", shared_text)
+        self.assertNotIn("local-log", shared_text)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 # Knowledge Compiler (`knowledge-compiler`)
 
-[![Version](https://img.shields.io/badge/version-1.0.0-1A73E8?style=flat-square)](https://github.com/GoogleCloudPlatform/knowledge-compiler)
+[![Version](https://img.shields.io/badge/version-1.0.1-1A73E8?style=flat-square)](https://github.com/GoogleCloudPlatform/knowledge-compiler)
 [![OKF Standard](https://img.shields.io/badge/Open_Knowledge_Format-OKF_v0.2-34A853?style=flat-square)](https://github.com/GoogleCloudPlatform/open-knowledge-format)
 [![License](https://img.shields.io/badge/license-Apache_2.0-FBBC04?style=flat-square)](LICENSE)
 
@@ -77,7 +77,7 @@ python3 scripts/install_plugin.py
 
 ## Release History
 
-### **v1.0.0** (`Latest`)
+### **v1.0.1** (`Latest`)
 - **`1.x` Stability & Unified `vault-*` CLI Contract ([STABILITY.md](STABILITY.md))**: Freezes `wiki/` as the OKF v0.2 bundle root, standardizes `vault-init`, `vault-extract`, `vault-lint`, `vault-correct`, `vault-query`, `vault-graph`, `vault-sync-patterns`, `vault-sanitize-check`, and `kc-install-plugin` with deterministic exit codes (`0`/`1`/`2`), and marks `/wikiskill` (`vault-analyze-trace`) as Experimental.
 - **Zero-Dependency In-Memory BM25 Retrieval & Incremental Graph Cache**: Adds `vault-query` (`scripts/vault_query.py`) with identifier splitting, CJK bigrams, duplicate check (`--check-duplicate`), and raw fence isolation (`--include-raw`), plus `(mtime_ns, ctime_ns, size)` incremental caching in `vault-graph`.
 - **Pluggable Federation Architecture**: `FederationProvider` interface (`scripts/federation_provider.py`) supporting `LocalGitPatternProvider` for a Git-backed shared patterns repository.

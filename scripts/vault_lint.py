@@ -115,7 +115,7 @@ def check_upstream_okf_version(timeout: float = 5.0) -> dict[str, Any]:
     }
 
     headers = {
-        "User-Agent": "knowledge-compiler-okf-checker/1.0.0",
+        "User-Agent": "knowledge-compiler-okf-checker/1.0.1",
         "Accept": "application/vnd.github.v3+json",
     }
 
@@ -1454,6 +1454,13 @@ def _print_lint_report(results: dict[str, Any], *, auto_fix: bool, strict: bool)
     )
     print("-" * 60)
 
+    if results["migrated_sources_files"]:
+        print(
+            f"🔄 Migrated Legacy String Sources to {{id, resource}} ({len(results['migrated_sources_files'])}):"
+        )
+        for mf in results["migrated_sources_files"]:
+            print(f"   • {mf}")
+
     if results["strict_passed"]:
         print(
             "✨ 100% HEALTHY! All links resolve, OKF conformance passes, and index is synchronized."
@@ -1487,13 +1494,6 @@ def _print_lint_report(results: dict[str, Any], *, auto_fix: bool, strict: bool)
                 print(f"   • [{v['file']}] {v['snippet']}  (Should be: {v['fix']})")
             if auto_fix and results["fixed_files"]:
                 print(f"   ⚡ Automatically fixed in {len(results['fixed_files'])} files!")
-
-        if results["migrated_sources_files"]:
-            print(
-                f"🔄 Migrated Legacy String Sources to {{id, resource}} ({len(results['migrated_sources_files'])}):"
-            )
-            for mf in results["migrated_sources_files"]:
-                print(f"   • {mf}")
 
         if results["stale_notes"]:
             label = "❌" if strict else "⚠️"

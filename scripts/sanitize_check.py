@@ -51,12 +51,14 @@ def normalize_shadow_view(text: str) -> str:
     no_comments = _HTML_COMMENT_RE.sub("", norm)
     return _INVISIBLE_CHARS_RE.sub("", no_comments)
 
+import okf  # noqa: E402
 from sync_patterns import (  # noqa: E402
     BLOCKED_KEYWORD_PATTERNS,
     DEFAULT_CUSTOMER_ANONYMIZATIONS,
     EPISTEMIC_FRONTMATTER_KEYS,
     build_entity_archetype_map,
     discover_customer_entities,
+    is_private_frontmatter_item_block,
     lookup_sha256_archetype,
     scan_sha256_entities_in_text,
 )
@@ -337,103 +339,274 @@ def rewrite_private_entity_wikilinks(
             out = out[:start_off] + arch + out[end_off:]
         return out
 
+    def _scrub_human_handle_line(fl: str) -> str:
+        def _rep_h_q(m: re.Match) -> str:
+            handle = m.group(2).strip()
+            if handle in ("cloud-ce", "ce-name", "author"):
+                return m.group(0)
+            conversions.append(
+                {
+                    "original": fl.strip(),
+                    "replacement": "human:cloud-ce",
+                    "kind": "frontmatter_verifier",
+                }
+            )
+            return f"{m.group(1)}human:cloud-ce{m.group(1)}"
+
+        out_fl = re.sub(r'(["\'])human:([^"\'\n]+)\1', _rep_h_q, fl)
+
+        def _rep_h_unq(m: re.Match) -> str:
+            handle = m.group(1)
+            if handle in ("cloud-ce", "ce-name", "author"):
+                return m.group(0)
+            conversions.append(
+                {
+                    "original": fl.strip(),
+                    "replacement": "human:cloud-ce",
+                    "kind": "frontmatter_verifier",
+                }
+            )
+            return "human:cloud-ce"
+
+        return re.sub(r"\bhuman:([a-zA-Z0-9._-]+)", _rep_h_unq, out_fl)
+
+    fm_raw, fm_opt, body_after = okf.split_frontmatter(content)
     fm_prefix = ""
     body_text = content
-    if content.startswith("---"):
-        parts = content.split("---", 2)
-        if len(parts) >= 3:
-            fm_lines = parts[1].splitlines()
-            cleaned_fm: list[str] = []
-            active_key: str | None = None
-            buf_header: str | None = None
-            buf_items: list[str] = []
+    if fm_opt is not None:
+        fm_lines = fm_opt.splitlines()
+        cleaned_fm: list[str] = []
+        active_key: str | None = None
+        list_key_indent: int = 0
+        item_dash_indent: int | None = None
+        buf_header: str | None = None
+        buf_items: list[str] = []
+        cur_item_lines: list[str] | None = None
+        had_dropped: bool = False
 
-            def _flush_fm() -> None:
-                nonlocal active_key, buf_header, buf_items
-                if active_key is None or buf_header is None:
-                    return
-                if active_key == "sources":
+        list_key_set = ("sources", *EPISTEMIC_FRONTMATTER_KEYS)
+        list_key_re = re.compile(
+            r"^(" + "|".join(re.escape(k) for k in list_key_set) + r"):(.*)$"
+        )
+
+        def _flush_item_sc() -> None:
+            nonlocal cur_item_lines, had_dropped
+            if not cur_item_lines:
+                cur_item_lines = None
+                return
+            if is_private_frontmatter_item_block(
+                cur_item_lines,
+                archetypes=archetypes,
+                lower_archetypes=lower_archetypes,
+                vault_root=vault_root,
+                valid_targets=valid_targets,
+            ):
+                had_dropped = True
+                conversions.append(
+                    {
+                        "original": cur_item_lines[0].strip(),
+                        "replacement": "<pruned private frontmatter link>",
+                        "kind": f"frontmatter_{active_key}",
+                    }
+                )
+            else:
+                for il in cur_item_lines:
+                    buf_items.append(_scrub_human_handle_line(il))
+            cur_item_lines = None
+
+        def _flush_fm() -> None:
+            nonlocal active_key, list_key_indent, item_dash_indent
+            nonlocal buf_header, buf_items, had_dropped
+            _flush_item_sc()
+            if active_key is None or buf_header is None:
+                return
+            if active_key == "sources":
+                if buf_items:
                     cleaned_fm.append(buf_header)
                     cleaned_fm.extend(buf_items)
-                elif buf_items:
+                elif had_dropped:
+                    cleaned_fm.append("sources: []")
+                else:
                     cleaned_fm.append(buf_header)
-                    cleaned_fm.extend(buf_items)
-                active_key = None
-                buf_header = None
-                buf_items = []
+            elif buf_items:
+                cleaned_fm.append(buf_header)
+                cleaned_fm.extend(buf_items)
+            active_key = None
+            list_key_indent = 0
+            item_dash_indent = None
+            buf_header = None
+            buf_items = []
+            had_dropped = False
 
-            for fl in fm_lines:
-                s_fl = fl.strip()
-                matched_k = None
-                for k in ("sources", *EPISTEMIC_FRONTMATTER_KEYS):
-                    if s_fl == f"{k}:":
-                        matched_k = k
-                        break
-                if matched_k:
+        idx = 0
+        n_fm = len(fm_lines)
+        while idx < n_fm:
+            fl = fm_lines[idx]
+            s_fl = fl.strip()
+            line_indent = len(fl) - len(fl.lstrip(" "))
+
+            if active_key is not None:
+                if not s_fl:
+                    peek_idx = idx + 1
+                    while peek_idx < n_fm and not fm_lines[peek_idx].strip():
+                        peek_idx += 1
+                    if (
+                        peek_idx < n_fm
+                        and cur_item_lines is not None
+                        and item_dash_indent is not None
+                    ):
+                        p_line = fm_lines[peek_idx]
+                        p_indent = len(p_line) - len(p_line.lstrip(" "))
+                        p_dash = bool(re.match(r"^[ \t]*-(?:\s+.*|\s*)$", p_line))
+                        if p_indent > item_dash_indent or (
+                            p_dash and p_indent == item_dash_indent
+                        ):
+                            if p_indent > item_dash_indent and not p_dash:
+                                cur_item_lines.append(fl)
+                            idx += 1
+                            continue
                     _flush_fm()
-                    active_key = matched_k
+                    cleaned_fm.append(fl)
+                    idx += 1
+                    continue
+
+                if s_fl.startswith("#"):
+                    if (
+                        cur_item_lines is not None
+                        and item_dash_indent is not None
+                        and line_indent > item_dash_indent
+                    ):
+                        cur_item_lines.append(fl)
+                    elif item_dash_indent is None or line_indent >= item_dash_indent:
+                        _flush_item_sc()
+                        buf_items.append(fl)
+                    else:
+                        _flush_fm()
+                        cleaned_fm.append(fl)
+                    idx += 1
+                    continue
+
+                m_dash = re.match(r"^[ \t]*-(?:\s+(.*)|\s*)$", fl)
+                if m_dash and line_indent >= list_key_indent:
+                    if item_dash_indent is None:
+                        item_dash_indent = line_indent
+                        cur_item_lines = [fl]
+                        idx += 1
+                        continue
+                    if line_indent == item_dash_indent:
+                        _flush_item_sc()
+                        cur_item_lines = [fl]
+                        idx += 1
+                        continue
+                    if line_indent > item_dash_indent and cur_item_lines is not None:
+                        cur_item_lines.append(fl)
+                        idx += 1
+                        continue
+
+                if (
+                    cur_item_lines is not None
+                    and item_dash_indent is not None
+                    and line_indent > item_dash_indent
+                ):
+                    cur_item_lines.append(fl)
+                    idx += 1
+                    continue
+
+                _flush_fm()
+
+            m_lk = list_key_re.match(fl)
+            if m_lk:
+                _flush_fm()
+                k_name = m_lk.group(1)
+                raw_rest = m_lk.group(2)
+                val_clean = okf._strip_inline_comment(raw_rest).strip()
+                if not val_clean:
+                    active_key = k_name
+                    list_key_indent = 0
+                    item_dash_indent = None
                     buf_header = fl
                     buf_items = []
+                    cur_item_lines = None
+                    had_dropped = False
+                    idx += 1
                     continue
-                if active_key is not None:
-                    if s_fl.startswith("- ") or s_fl == "-":
-                        low = fl.lower()
-                        drop = any(
-                            p in low
-                            for p in (
-                                "raw/",
-                                "wiki/entities/",
-                                "entities/",
-                                "wiki/sources/",
-                                "wiki/synthesis/",
-                                "wiki/skill-impact",
-                                "/home/",
-                                "/users/",
-                                "/usr/local/google/home/",
-                            )
-                        )
-                        if not drop:
-                            for wm in re.finditer(r"\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]", fl):
-                                w_stem = wm.group(1).strip().removesuffix(".md").split("/")[-1].strip()
-                                if _resolve_entity_archetype(w_stem, None, archetypes, lower_archetypes):
-                                    drop = True
-                                elif vault_root and (
-                                    (vault_root / "wiki" / "entities" / f"{w_stem}.md").is_file()
-                                    or (vault_root / "wiki" / "synthesis" / f"{w_stem}.md").is_file()
-                                    or (vault_root / "wiki" / "sources" / f"{w_stem}.md").is_file()
-                                ):
-                                    drop = True
-                                elif valid_targets is not None and w_stem not in valid_targets:
-                                    drop = True
-                        if drop:
-                            conversions.append(
-                                {
-                                    "original": s_fl,
-                                    "replacement": "<pruned private frontmatter link>",
-                                    "kind": f"frontmatter_{active_key}",
-                                }
-                            )
+                if val_clean.startswith("["):
+                    flow_str, next_idx = okf._accumulate_multiline_flow(
+                        fm_lines, raw_rest.lstrip(), idx + 1, strict=False
+                    )
+                    flow_clean = okf._strip_inline_comment(flow_str).strip()
+                    if flow_clean.startswith("[") and flow_clean.endswith("]"):
+                        inner = flow_clean[1:-1].strip()
+                        if not inner:
+                            cleaned_fm.extend(fm_lines[idx:next_idx])
+                            idx = next_idx
                             continue
-                        buf_items.append(fl)
+                        raw_items = okf._split_flow_items(inner)
+                        kept_items: list[str] = []
+                        flow_dropped = False
+                        flow_changed = False
+                        for item in raw_items:
+                            if is_private_frontmatter_item_block(
+                                [item],
+                                archetypes=archetypes,
+                                lower_archetypes=lower_archetypes,
+                                vault_root=vault_root,
+                                valid_targets=valid_targets,
+                            ):
+                                flow_dropped = True
+                                conversions.append(
+                                    {
+                                        "original": item.strip(),
+                                        "replacement": "<pruned private frontmatter link>",
+                                        "kind": f"frontmatter_{k_name}",
+                                    }
+                                )
+                            else:
+                                scrubbed_item = _scrub_human_handle_line(item)
+                                if scrubbed_item != item:
+                                    flow_changed = True
+                                kept_items.append(scrubbed_item)
+                        if flow_dropped or flow_changed:
+                            if kept_items:
+                                cleaned_fm.append(f"{k_name}: [{', '.join(kept_items)}]")
+                            elif k_name == "sources":
+                                cleaned_fm.append("sources: []")
+                        else:
+                            cleaned_fm.extend(fm_lines[idx:next_idx])
+                        idx = next_idx
                         continue
-                    elif not fl.startswith((" ", "\t")) and ":" in s_fl:
-                        _flush_fm()
-                if "by: human:" in fl and "by: human:cloud-ce" not in fl:
-                    new_fl = re.sub(r"by:\s*human:[a-zA-Z0-9._-]+", "by: human:cloud-ce", fl)
-                    if new_fl != fl:
-                        conversions.append(
-                            {
-                                "original": s_fl,
-                                "replacement": new_fl.strip(),
-                                "kind": "frontmatter_verifier",
-                            }
-                        )
-                        cleaned_fm.append(new_fl)
-                        continue
-                cleaned_fm.append(fl)
-            _flush_fm()
-            fm_prefix = "---" + "\n".join(cleaned_fm) + "\n---"
-            body_text = parts[2]
+                if is_private_frontmatter_item_block(
+                    [val_clean],
+                    archetypes=archetypes,
+                    lower_archetypes=lower_archetypes,
+                    vault_root=vault_root,
+                    valid_targets=valid_targets,
+                ):
+                    conversions.append(
+                        {
+                            "original": val_clean,
+                            "replacement": "<pruned private frontmatter link>",
+                            "kind": f"frontmatter_{k_name}",
+                        }
+                    )
+                    if k_name == "sources":
+                        cleaned_fm.append("sources: []")
+                    idx += 1
+                    continue
+
+            cleaned_fm.append(_scrub_human_handle_line(fl))
+            idx += 1
+
+        _flush_fm()
+        if cleaned_fm == fm_lines:
+            fm_prefix = fm_raw
+        else:
+            bom = "\ufeff" if fm_raw.startswith("\ufeff") else ""
+            close_eol = "\r\n" if fm_raw.endswith("\r\n") else ("\n" if fm_raw.endswith("\n") else "")
+            eol = "\r\n" if "\r\n" in fm_raw else "\n"
+            inner_yaml = (eol.join(cleaned_fm) + eol) if cleaned_fm else ""
+            fm_prefix = f"{bom}---{eol}{inner_yaml}---{close_eol}"
+        body_text = body_after
 
     protected_spans: list[str] = []
 

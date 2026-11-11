@@ -576,6 +576,191 @@ def _anonymize_free_text(text: str, archetypes: Dict[str, str]) -> str:
     return out
 
 
+_PRIVATE_FM_ITEM_FRAGMENTS = (
+    "raw/",
+    "wiki/entities/",
+    "entities/",
+    "wiki/sources/",
+    "wiki/synthesis/",
+    "wiki/skill-impact",
+    "/home/",
+    "/users/",
+    "/usr/local/google/home/",
+    "/workspace/obsidianvault/raw/",
+)
+
+
+def is_private_frontmatter_item_block(
+    item_lines: List[str],
+    *,
+    archetypes: Dict[str, str],
+    lower_archetypes: Dict[str, str],
+    vault_root: Optional[Path] = None,
+    valid_targets: Optional[Set[str]] = None,
+) -> bool:
+    """Return True if a single-line or multi-line YAML sequence item references private vault paths or entities."""
+    block_text = "\n".join(item_lines)
+    low = block_text.lower()
+    if any(frag in low for frag in _PRIVATE_FM_ITEM_FRAGMENTS):
+        return True
+    if LOCAL_PATH_REGEX.search(block_text):
+        return True
+
+    for wl_m in re.finditer(r"\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]", block_text):
+        wl_raw = wl_m.group(1).strip().lstrip("/")
+        wl_low = wl_raw.lower()
+        if wl_low.startswith(
+            (
+                "raw/",
+                "wiki/entities/",
+                "entities/",
+                "wiki/sources/",
+                "sources/",
+                "wiki/synthesis/",
+                "synthesis/",
+                "wiki/skill-impact",
+            )
+        ):
+            return True
+        wl_stem = wl_raw.removesuffix(".md").split("/")[-1].strip()
+        if _lookup_archetype(wl_stem, archetypes, lower_archetypes):
+            return True
+        if vault_root and (
+            (vault_root / "wiki" / "entities" / f"{wl_stem}.md").is_file()
+            or (vault_root / "wiki" / "synthesis" / f"{wl_stem}.md").is_file()
+            or (vault_root / "wiki" / "sources" / f"{wl_stem}.md").is_file()
+        ):
+            return True
+        if (
+            valid_targets is not None
+            and wl_stem not in valid_targets
+            and wl_raw.removesuffix(".md") not in valid_targets
+        ):
+            return True
+
+    dehyphen_block = re.sub(r"[-_/]+", " ", block_text)
+    for variant in (block_text, dehyphen_block):
+        if scan_sha256_entities_in_text(variant):
+            return True
+        for cust_name in archetypes:
+            if len(cust_name) <= 3:
+                if cust_name in _MERMAID_DIRECTIONS:
+                    continue
+                if re.search(r"(?<!\w)" + re.escape(cust_name) + r"(?!\w)", variant):
+                    return True
+            else:
+                if re.search(
+                    r"(?<!\w)" + re.escape(cust_name) + r"(?!\w)",
+                    variant,
+                    re.IGNORECASE,
+                ):
+                    return True
+    return False
+
+
+def _scrub_fm_identity_in_item_line(line: str) -> Tuple[str, List[str]]:
+    """Scrub personal human/agent identities inside a kept frontmatter list item line."""
+    notes: List[str] = []
+    out = line
+
+    def _rep_human_q(m: re.Match) -> str:
+        handle = m.group(3).strip()
+        if handle in ("cloud-ce", "ce-name", "author"):
+            return m.group(0)
+        notes.append("Sanitized human identity in frontmatter item to 'human:cloud-ce'")
+        return f"{m.group(1)}{m.group(2)}human:cloud-ce{m.group(2)}"
+
+    out = re.sub(
+        r'(\b(?:by|author|authors|owner|owners|created_by|maintainer|reviewed_by|contributor|contributors):\s*)(["\'])human:([^"\'\n]+)\2',
+        _rep_human_q,
+        out,
+    )
+
+    def _rep_human_unq(m: re.Match) -> str:
+        handle = m.group(2).strip()
+        if handle in ("cloud-ce", "ce-name", "author"):
+            return m.group(0)
+        notes.append("Sanitized human identity in frontmatter item to 'human:cloud-ce'")
+        return f"{m.group(1)}human:cloud-ce"
+
+    out = re.sub(
+        r'(\b(?:by|author|authors|owner|owners|created_by|maintainer|reviewed_by|contributor|contributors):\s*)human:([^\s"\'}\],#]+)',
+        _rep_human_unq,
+        out,
+    )
+
+    def _rep_agent_q(m: re.Match) -> str:
+        handle = m.group(3).strip()
+        if handle == "knowledge-compiler":
+            return m.group(0)
+        notes.append("Sanitized agent identity in frontmatter item to 'agent:knowledge-compiler'")
+        return f"{m.group(1)}{m.group(2)}agent:knowledge-compiler{m.group(2)}"
+
+    out = re.sub(r'(\bby:\s*)(["\'])agent:([^"\'\n]+)\2', _rep_agent_q, out)
+
+    def _rep_agent_unq(m: re.Match) -> str:
+        handle = m.group(2).strip()
+        if handle == "knowledge-compiler":
+            return m.group(0)
+        notes.append("Sanitized agent identity in frontmatter item to 'agent:knowledge-compiler'")
+        return f"{m.group(1)}agent:knowledge-compiler"
+
+    out = re.sub(r'(\bby:\s*)agent:([^\s"\'}\],#]+)', _rep_agent_unq, out)
+
+    m_flow_id = re.match(
+        r'^(\s*(?:-\s*)?(?:author|authors|owner|owners|created_by|maintainer|reviewed_by|contributor|contributors):\s*)\[(.*)\](\s*(?:#.*)?)$',
+        out,
+    )
+    if m_flow_id:
+        inner = m_flow_id.group(2).strip()
+        if inner:
+            raw_items = [it.strip() for it in okf._split_flow_items(inner) if it.strip()]
+            new_items = ['"human:cloud-ce"' for _ in raw_items]
+            rebuilt = f"{m_flow_id.group(1)}[{', '.join(new_items)}]{m_flow_id.group(3)}"
+            if rebuilt != out:
+                notes.append("Sanitized inline identity list in frontmatter item to 'human:cloud-ce'")
+                out = rebuilt
+        return out, notes
+
+    m_scalar_id = re.match(
+        r'^(\s*(?:-\s*)?(?:author|authors|owner|owners|created_by|maintainer|reviewed_by|contributor|contributors):\s*)(["\']?)([^"\'{\[\n#][^"\'\n]*?)(["\']?)(\s*(?:#.*)?)$',
+        out,
+    )
+    if m_scalar_id:
+        val = m_scalar_id.group(3).strip()
+        if (
+            val
+            and not val.startswith("-")
+            and val not in ("human:cloud-ce", "human:ce-name", "human:author")
+        ):
+            q = m_scalar_id.group(2) or m_scalar_id.group(4) or ""
+            q_end = m_scalar_id.group(4) or m_scalar_id.group(2) or q
+            rebuilt = f"{m_scalar_id.group(1)}{q}human:cloud-ce{q_end}{m_scalar_id.group(5)}"
+            if rebuilt != out:
+                notes.append("Sanitized identity in frontmatter item to 'human:cloud-ce'")
+                out = rebuilt
+            return out, notes
+
+    def _rep_inline_id(m: re.Match) -> str:
+        val = (m.group(3) or m.group(4) or "").strip()
+        if (
+            not val
+            or val in ("human:cloud-ce", "human:ce-name", "human:author")
+            or val.startswith(("[", "{"))
+        ):
+            return m.group(0)
+        q = m.group(2) or ""
+        notes.append("Sanitized inline mapping identity in frontmatter item to 'human:cloud-ce'")
+        return f"{m.group(1)}{q}human:cloud-ce{q}"
+
+    out = re.sub(
+        r'(\b(?:author|owner|created_by|maintainer|reviewed_by):\s*)(?:(["\'])([^"\'\n]+)\2|([^,\}\]\s]+))',
+        _rep_inline_id,
+        out,
+    )
+    return out, notes
+
+
 def sanitize_markdown(
     content: str,
     vault_root: Optional[Path] = None,
@@ -588,8 +773,9 @@ def sanitize_markdown(
        and converts them into clean enterprise archetype prose while preserving code blocks/spans.
     2. Unwraps private `wiki/sources/` and `wiki/synthesis/` wikilinks and unresolved public tech
        entity links so zero broken or private vault links enter the shared repository.
-    3. Scrubs local filesystem paths (`/usr/local/google/home/...`, `/home/...`, `/Users/...`).
-    4. Prunes private vault entries from YAML frontmatter `sources:` and 5-way epistemic lists.
+    3. Prunes private vault entries (including multi-line `{id, resource}` blocks and flow lists)
+       from YAML frontmatter `sources:` and 5-way epistemic lists before local path rewriting.
+    4. Scrubs local filesystem paths (`/usr/local/google/home/...`, `/home/...`, `/Users/...`).
     """
     scrub_notes: List[str] = []
     if _HTML_COMMENT_RE.search(content):
@@ -606,16 +792,388 @@ def sanitize_markdown(
     lower_archetypes = {k.lower(): v for k, v in archetypes.items() if len(k) > 3}
     lower_public = {p.lower(): p for p in public_entities}
 
-    # Split frontmatter vs body so YAML lists and prose links are each handled cleanly
-    fm_prefix = ""
+    # 1. Scrub frontmatter `sources:`, 5-way epistemic lists, and personal identities FIRST
+    #    (before LOCAL_PATH_REGEX rewrites `/home/...` so local source entries are pruned cleanly)
+    def _sanitize_frontmatter_lines(fm_lines: List[str]) -> List[str]:
+        out_lines: List[str] = []
+        active_list_key: Optional[str] = None
+        list_key_indent: int = 0
+        item_dash_indent: Optional[int] = None
+        buffered_list_header: Optional[str] = None
+        buffered_list_items: List[str] = []
+        current_item_lines: Optional[List[str]] = None
+        had_dropped: bool = False
+        active_id_list_key: Optional[str] = None
+        active_flow_id_list: bool = False
+
+        list_key_set = ("sources", *EPISTEMIC_FRONTMATTER_KEYS)
+        list_key_re = re.compile(
+            r"^(" + "|".join(re.escape(k) for k in list_key_set) + r"):(.*)$"
+        )
+
+        def _flush_current_item() -> None:
+            nonlocal current_item_lines, had_dropped
+            if not current_item_lines:
+                current_item_lines = None
+                return
+            if is_private_frontmatter_item_block(
+                current_item_lines,
+                archetypes=archetypes,
+                lower_archetypes=lower_archetypes,
+                vault_root=vault_root,
+                valid_targets=valid_shared_targets,
+            ):
+                had_dropped = True
+                scrub_notes.append(
+                    f"Scrubbed private vault reference from frontmatter '{active_list_key}': {current_item_lines[0].strip()}"
+                )
+            else:
+                for iline in current_item_lines:
+                    cleaned_iline, line_notes = _scrub_fm_identity_in_item_line(iline)
+                    scrub_notes.extend(line_notes)
+                    buffered_list_items.append(cleaned_iline)
+            current_item_lines = None
+
+        def _flush_list() -> None:
+            nonlocal active_list_key, list_key_indent, item_dash_indent
+            nonlocal buffered_list_header, buffered_list_items, had_dropped
+            _flush_current_item()
+            if active_list_key is None or buffered_list_header is None:
+                return
+            if active_list_key == "sources":
+                if buffered_list_items:
+                    out_lines.append(buffered_list_header)
+                    out_lines.extend(buffered_list_items)
+                elif had_dropped:
+                    out_lines.append("sources: []")
+                else:
+                    out_lines.append(buffered_list_header)
+            else:
+                if buffered_list_items:
+                    out_lines.append(buffered_list_header)
+                    out_lines.extend(buffered_list_items)
+            active_list_key = None
+            list_key_indent = 0
+            item_dash_indent = None
+            buffered_list_header = None
+            buffered_list_items = []
+            had_dropped = False
+
+        idx = 0
+        n_fm = len(fm_lines)
+        while idx < n_fm:
+            line = fm_lines[idx]
+            stripped_l = line.strip()
+            line_indent = len(line) - len(line.lstrip(" "))
+
+            if active_list_key is not None:
+                if not stripped_l:
+                    peek_idx = idx + 1
+                    while peek_idx < n_fm and not fm_lines[peek_idx].strip():
+                        peek_idx += 1
+                    if (
+                        peek_idx < n_fm
+                        and current_item_lines is not None
+                        and item_dash_indent is not None
+                    ):
+                        p_line = fm_lines[peek_idx]
+                        p_indent = len(p_line) - len(p_line.lstrip(" "))
+                        p_dash = bool(re.match(r"^[ \t]*-(?:\s+.*|\s*)$", p_line))
+                        if p_indent > item_dash_indent or (
+                            p_dash and p_indent == item_dash_indent
+                        ):
+                            if p_indent > item_dash_indent and not p_dash:
+                                current_item_lines.append(line)
+                            idx += 1
+                            continue
+                    _flush_list()
+                    out_lines.append(line)
+                    idx += 1
+                    continue
+
+                if stripped_l.startswith("#"):
+                    if (
+                        current_item_lines is not None
+                        and item_dash_indent is not None
+                        and line_indent > item_dash_indent
+                    ):
+                        current_item_lines.append(line)
+                    elif item_dash_indent is None or line_indent >= item_dash_indent:
+                        _flush_current_item()
+                        buffered_list_items.append(line)
+                    else:
+                        _flush_list()
+                        out_lines.append(line)
+                    idx += 1
+                    continue
+
+                m_dash = re.match(r"^[ \t]*-(?:\s+(.*)|\s*)$", line)
+                if m_dash and line_indent >= list_key_indent:
+                    if item_dash_indent is None:
+                        item_dash_indent = line_indent
+                        current_item_lines = [line]
+                        idx += 1
+                        continue
+                    if line_indent == item_dash_indent:
+                        _flush_current_item()
+                        current_item_lines = [line]
+                        idx += 1
+                        continue
+                    if line_indent > item_dash_indent and current_item_lines is not None:
+                        current_item_lines.append(line)
+                        idx += 1
+                        continue
+
+                if (
+                    current_item_lines is not None
+                    and item_dash_indent is not None
+                    and line_indent > item_dash_indent
+                ):
+                    current_item_lines.append(line)
+                    idx += 1
+                    continue
+
+                _flush_list()
+
+            m_lk = list_key_re.match(line)
+            if m_lk:
+                _flush_list()
+                active_id_list_key = None
+                active_flow_id_list = False
+                k_name = m_lk.group(1)
+                raw_rest = m_lk.group(2)
+                val_clean = okf._strip_inline_comment(raw_rest).strip()
+                if not val_clean:
+                    active_list_key = k_name
+                    list_key_indent = 0
+                    item_dash_indent = None
+                    buffered_list_header = line
+                    buffered_list_items = []
+                    current_item_lines = None
+                    had_dropped = False
+                    idx += 1
+                    continue
+                if val_clean.startswith("["):
+                    flow_str, next_idx = okf._accumulate_multiline_flow(
+                        fm_lines, raw_rest.lstrip(), idx + 1, strict=False
+                    )
+                    flow_clean = okf._strip_inline_comment(flow_str).strip()
+                    if flow_clean.startswith("[") and flow_clean.endswith("]"):
+                        inner = flow_clean[1:-1].strip()
+                        if not inner:
+                            out_lines.extend(fm_lines[idx:next_idx])
+                            idx = next_idx
+                            continue
+                        raw_items = okf._split_flow_items(inner)
+                        kept_items: List[str] = []
+                        flow_dropped = False
+                        flow_identity_changed = False
+                        for item in raw_items:
+                            if is_private_frontmatter_item_block(
+                                [item],
+                                archetypes=archetypes,
+                                lower_archetypes=lower_archetypes,
+                                vault_root=vault_root,
+                                valid_targets=valid_shared_targets,
+                            ):
+                                flow_dropped = True
+                                scrub_notes.append(
+                                    f"Scrubbed private vault reference from frontmatter '{k_name}': {item.strip()}"
+                                )
+                            else:
+                                cleaned_item, inotes = _scrub_fm_identity_in_item_line(item)
+                                if cleaned_item != item:
+                                    flow_identity_changed = True
+                                    scrub_notes.extend(inotes)
+                                kept_items.append(cleaned_item)
+                        if flow_dropped or flow_identity_changed:
+                            if kept_items:
+                                out_lines.append(f"{k_name}: [{', '.join(kept_items)}]")
+                            elif k_name == "sources":
+                                out_lines.append("sources: []")
+                        else:
+                            out_lines.extend(fm_lines[idx:next_idx])
+                        idx = next_idx
+                        continue
+                if is_private_frontmatter_item_block(
+                    [val_clean],
+                    archetypes=archetypes,
+                    lower_archetypes=lower_archetypes,
+                    vault_root=vault_root,
+                    valid_targets=valid_shared_targets,
+                ):
+                    scrub_notes.append(
+                        f"Scrubbed private vault reference from frontmatter '{k_name}': {val_clean}"
+                    )
+                    if k_name == "sources":
+                        out_lines.append("sources: []")
+                    idx += 1
+                    continue
+
+            # Multi-line or inline identity flow list e.g. authors: [jdoe, Jane Doe] or authors: [
+            if re.search(
+                r"^\s*(?:author|authors|owner|owners|created_by|maintainer|reviewed_by|contributor|contributors):\s*\[",
+                line,
+            ):
+                if "]" in line:
+                    m_lead = re.match(
+                        r"(^\s*(?:author|authors|owner|owners|created_by|maintainer|reviewed_by|contributor|contributors):\s*)\[(.*)\]",
+                        line,
+                    )
+                    if m_lead:
+                        prefix = m_lead.group(1)
+                        inner = m_lead.group(2).strip()
+                        if inner:
+                            items = [item.strip() for item in inner.split(",") if item.strip()]
+                            new_items = ['"human:cloud-ce"' for _ in items]
+                            subbed_line = f"{prefix}[{', '.join(new_items)}]"
+                        else:
+                            subbed_line = f"{prefix}[]"
+                        out_lines.append(subbed_line)
+                        scrub_notes.append(
+                            "Sanitized inline identity list in frontmatter to 'human:cloud-ce'"
+                        )
+                        active_id_list_key = None
+                        active_flow_id_list = False
+                        idx += 1
+                        continue
+                else:
+                    active_flow_id_list = True
+                    out_lines.append(line)
+                    idx += 1
+                    continue
+
+            if active_flow_id_list:
+                if "]" in line:
+                    active_flow_id_list = False
+                subbed_line = re.sub(
+                    r'([^,\[\]\s"\']+(?:\s+[^,\[\]\s"\']+)*)',
+                    r"human:cloud-ce",
+                    line,
+                )
+                out_lines.append(subbed_line)
+                scrub_notes.append(
+                    "Sanitized multi-line flow identity item in frontmatter to 'human:cloud-ce'"
+                )
+                idx += 1
+                continue
+
+            matched_id_key = None
+            for ik in (
+                "author",
+                "authors",
+                "owner",
+                "owners",
+                "created_by",
+                "maintainer",
+                "reviewed_by",
+                "contributor",
+                "contributors",
+            ):
+                if stripped_l == f"{ik}:":
+                    matched_id_key = ik
+                    break
+            if matched_id_key:
+                _flush_list()
+                active_id_list_key = matched_id_key
+                out_lines.append(line)
+                idx += 1
+                continue
+
+            if active_id_list_key is not None:
+                if stripped_l.startswith("- ") or stripped_l == "-":
+                    subbed_item = re.sub(
+                        r'(-\s*)(["\']?)[^"\'\n]+(["\']?)',
+                        r"\1\2human:cloud-ce\3",
+                        line,
+                    )
+                    out_lines.append(subbed_item)
+                    scrub_notes.append(
+                        f"Sanitized identity in frontmatter list '{active_id_list_key}' to 'human:cloud-ce'"
+                    )
+                    idx += 1
+                    continue
+                if re.search(r'^\s+name:\s*["\']?[^"\'{\[\s][^"\'\n]*', line):
+                    subbed_line = re.sub(
+                        r'(^\s*name:\s*)(["\']?)[^"\'\n]+(["\']?)',
+                        r"\1\2Google Cloud CE\3",
+                        line,
+                    )
+                    out_lines.append(subbed_line)
+                    scrub_notes.append(
+                        "Sanitized name under author/contributor in frontmatter to 'Google Cloud CE'"
+                    )
+                    idx += 1
+                    continue
+                if not line.startswith((" ", "\t")) and ":" in stripped_l:
+                    active_id_list_key = None
+
+            # Sanitize author/owner/by names in frontmatter verified/generated/author
+            if re.search(
+                r'\b(?:by|author|authors|owner|owners|created_by|maintainer|reviewed_by):\s*["\']?human:[^"\']+',
+                line,
+            ):
+                subbed_line = re.sub(
+                    r'(\b(?:by|author|authors|owner|owners|created_by|maintainer|reviewed_by):\s*)(["\']?)human:[^"\'}\],]+(["\']?)',
+                    r"\1\2human:cloud-ce\3",
+                    line,
+                )
+                out_lines.append(subbed_line)
+                if subbed_line != line:
+                    scrub_notes.append(
+                        "Sanitized human identity in frontmatter to 'human:cloud-ce'"
+                    )
+                idx += 1
+                continue
+            if re.search(
+                r'^\s*(?:author|authors|owner|owners|created_by|maintainer|reviewed_by|contributor|contributors):\s*["\']?[^"\'{\[\s\-][^"\'\n]*',
+                line,
+            ):
+                subbed_line = re.sub(
+                    r'(^\s*(?:author|authors|owner|owners|created_by|maintainer|reviewed_by|contributor|contributors):\s*)(["\']?)[^"\'\n]+(["\']?)',
+                    r"\1\2human:cloud-ce\3",
+                    line,
+                )
+                out_lines.append(subbed_line)
+                if subbed_line != line:
+                    scrub_notes.append(
+                        "Sanitized identity in frontmatter to 'human:cloud-ce'"
+                    )
+                idx += 1
+                continue
+            if re.search(r'\bby:\s*["\']?agent:[^"\'}\],]+', line):
+                subbed_line = re.sub(
+                    r'(\bby:\s*)(["\']?)agent:[^"\'}\],]+(["\']?)',
+                    r"\1\2agent:knowledge-compiler\3",
+                    line,
+                )
+                out_lines.append(subbed_line)
+                if subbed_line != line:
+                    scrub_notes.append(
+                        "Sanitized agent identity in frontmatter to 'agent:knowledge-compiler'"
+                    )
+                idx += 1
+                continue
+
+            out_lines.append(line)
+            idx += 1
+
+        _flush_list()
+        return out_lines
+
     _fm_raw, fm_opt, body_after = okf.split_frontmatter(content)
     if fm_opt is not None:
-        fm_prefix = f"---\n{fm_opt}\n---"
-        body_text = "\n" + body_after if not body_after.startswith("\n") else body_after
+        cleaned_fm_lines = _sanitize_frontmatter_lines(fm_opt.splitlines())
+        if cleaned_fm_lines:
+            fm_prefix = "---\n" + "\n".join(cleaned_fm_lines) + "\n---\n"
+        else:
+            fm_prefix = "---\n---\n"
+        body_text = body_after
     else:
+        fm_prefix = ""
         body_text = content.lstrip("\ufeff")
 
-    # Protect fenced code blocks and inline code spans in body_text during wikilink rewriting
+    # 2. Protect fenced code blocks and inline code spans in body_text during wikilink rewriting
     protected_tokens: List[str] = []
 
     def _stash_code(m: re.Match) -> str:
@@ -728,7 +1286,7 @@ def sanitize_markdown(
 
     sanitized = fm_prefix + rewritten_body
 
-    # 2. Scrub local absolute filesystem paths (`/usr/local/*/home/...`, `/home/...`, `/Users/...`)
+    # 3. Scrub remaining local absolute filesystem paths (`/usr/local/*/home/...`, `/home/...`, `/Users/...`)
     def replace_local_path(match: re.Match) -> str:
         path_str = match.group(0)
         if path_str.startswith("/usr/local/"):
@@ -756,221 +1314,8 @@ def sanitize_markdown(
         return path_str
 
     sanitized = LOCAL_PATH_REGEX.sub(replace_local_path, sanitized)
-
-    # 3. Scrub frontmatter `sources:` and 5-way epistemic lists pointing to private vault files/entities
-    lines = sanitized.splitlines()
-    in_frontmatter = False
-    active_list_key: Optional[str] = None
-    active_id_list_key: Optional[str] = None
-    active_flow_id_list: bool = False
-    buffered_list_header: Optional[str] = None
-    buffered_list_items: List[str] = []
-    new_lines: List[str] = []
-
-    def _flush_list() -> None:
-        nonlocal active_list_key, buffered_list_header, buffered_list_items
-        if active_list_key is None or buffered_list_header is None:
-            return
-        if active_list_key == "sources":
-            # Always keep `sources:` header (even if empty, or keep remaining public sources)
-            new_lines.append(buffered_list_header)
-            new_lines.extend(buffered_list_items)
-        else:
-            # For optional 5-way epistemic keys, only emit key if >=1 valid shared edge remains
-            if buffered_list_items:
-                new_lines.append(buffered_list_header)
-                new_lines.extend(buffered_list_items)
-        active_list_key = None
-        buffered_list_header = None
-        buffered_list_items = []
-
-    def _is_private_fm_item(item_line: str) -> bool:
-        low = item_line.lower()
-        if any(
-            frag in low
-            for frag in (
-                "raw/",
-                "wiki/entities/",
-                "entities/",
-                "wiki/sources/",
-                "wiki/synthesis/",
-                "wiki/skill-impact",
-                "/home/",
-                "/users/",
-                "/usr/local/google/home/",
-                "/workspace/obsidianvault/raw/",
-            )
-        ):
-            return True
-        for wl_m in re.finditer(r"\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]", item_line):
-            wl_stem = wl_m.group(1).strip().removesuffix(".md").split("/")[-1].strip()
-            if _lookup_archetype(wl_stem, archetypes, lower_archetypes):
-                return True
-            if vault_root and (
-                (vault_root / "wiki" / "entities" / f"{wl_stem}.md").is_file()
-                or (vault_root / "wiki" / "synthesis" / f"{wl_stem}.md").is_file()
-                or (vault_root / "wiki" / "sources" / f"{wl_stem}.md").is_file()
-            ):
-                return True
-            if (
-                valid_shared_targets is not None
-                and wl_stem not in valid_shared_targets
-            ):
-                return True
-        return False
-
-    for line in lines:
-        if line.strip() == "---":
-            if in_frontmatter:
-                _flush_list()
-                active_id_list_key = None
-                active_flow_id_list = False
-            in_frontmatter = not in_frontmatter
-            new_lines.append(line)
-            continue
-
-        if in_frontmatter:
-            stripped_l = line.strip()
-            matched_key = None
-            for k in ("sources", *EPISTEMIC_FRONTMATTER_KEYS):
-                if stripped_l == f"{k}:":
-                    matched_key = k
-                    break
-            if matched_key:
-                _flush_list()
-                active_id_list_key = None
-                active_flow_id_list = False
-                active_list_key = matched_key
-                buffered_list_header = line
-                buffered_list_items = []
-                continue
-
-            # Multi-line or inline identity flow list e.g. authors: [jdoe, Jane Doe] or authors: [
-            if re.search(r'^\s*(?:author|authors|owner|owners|created_by|maintainer|reviewed_by|contributor|contributors):\s*\[', line):
-                if "]" in line:
-                    m_lead = re.match(r'(^\s*(?:author|authors|owner|owners|created_by|maintainer|reviewed_by|contributor|contributors):\s*)\[(.*)\]', line)
-                    if m_lead:
-                        prefix = m_lead.group(1)
-                        inner = m_lead.group(2).strip()
-                        if inner:
-                            items = [item.strip() for item in inner.split(",") if item.strip()]
-                            new_items = ['"human:cloud-ce"' for _ in items]
-                            subbed_line = f"{prefix}[{', '.join(new_items)}]"
-                        else:
-                            subbed_line = f"{prefix}[]"
-                        new_lines.append(subbed_line)
-                        scrub_notes.append("Sanitized inline identity list in frontmatter to 'human:cloud-ce'")
-                        active_id_list_key = None
-                        active_flow_id_list = False
-                        continue
-                else:
-                    active_flow_id_list = True
-                    new_lines.append(line)
-                    continue
-
-            if active_flow_id_list:
-                if "]" in line:
-                    active_flow_id_list = False
-                subbed_line = re.sub(r'([^,\[\]\s"\']+(?:\s+[^,\[\]\s"\']+)*)', r'human:cloud-ce', line)
-                new_lines.append(subbed_line)
-                scrub_notes.append("Sanitized multi-line flow identity item in frontmatter to 'human:cloud-ce'")
-                continue
-
-            matched_id_key = None
-            for ik in (
-                "author",
-                "authors",
-                "owner",
-                "owners",
-                "created_by",
-                "maintainer",
-                "reviewed_by",
-                "contributor",
-                "contributors",
-            ):
-                if stripped_l == f"{ik}:":
-                    matched_id_key = ik
-                    break
-            if matched_id_key:
-                _flush_list()
-                active_id_list_key = matched_id_key
-                new_lines.append(line)
-                continue
-
-            if active_list_key is not None:
-                if stripped_l.startswith("- ") or stripped_l == "-":
-                    if _is_private_fm_item(line):
-                        scrub_notes.append(
-                            f"Scrubbed private vault reference from frontmatter '{active_list_key}': {stripped_l}"
-                        )
-                        continue
-                    buffered_list_items.append(line)
-                    continue
-                elif not line.startswith((" ", "\t")) and ":" in stripped_l:
-                    _flush_list()
-
-            if active_id_list_key is not None:
-                if stripped_l.startswith("- ") or stripped_l == "-":
-                    subbed_item = re.sub(
-                        r'(-\s*)(["\']?)[^"\'\n]+(["\']?)',
-                        r'\1\2human:cloud-ce\3',
-                        line,
-                    )
-                    new_lines.append(subbed_item)
-                    scrub_notes.append(
-                        f"Sanitized identity in frontmatter list '{active_id_list_key}' to 'human:cloud-ce'"
-                    )
-                    continue
-                elif re.search(r'^\s+name:\s*["\']?[^"\'{\[\s][^"\'\n]*', line):
-                    subbed_line = re.sub(
-                        r'(^\s*name:\s*)(["\']?)[^"\'\n]+(["\']?)',
-                        r'\1\2Google Cloud CE\3',
-                        line,
-                    )
-                    new_lines.append(subbed_line)
-                    scrub_notes.append("Sanitized name under author/contributor in frontmatter to 'Google Cloud CE'")
-                    continue
-                elif not line.startswith((" ", "\t")) and ":" in stripped_l:
-                    active_id_list_key = None
-
-            # Sanitize author/owner/by names in frontmatter verified/generated/author
-            if re.search(r'\b(?:by|author|authors|owner|owners|created_by|maintainer|reviewed_by):\s*["\']?human:[^"\']+', line):
-                subbed_line = re.sub(
-                    r'(\b(?:by|author|authors|owner|owners|created_by|maintainer|reviewed_by):\s*)(["\']?)human:[^"\'}\],]+(["\']?)',
-                    r'\1\2human:cloud-ce\3',
-                    line,
-                )
-                new_lines.append(subbed_line)
-                scrub_notes.append(
-                    "Sanitized human identity in frontmatter to 'human:cloud-ce'"
-                )
-                continue
-            if re.search(r'^\s*(?:author|authors|owner|owners|created_by|maintainer|reviewed_by|contributor|contributors):\s*["\']?[^"\'{\[\s\-][^"\'\n]*', line):
-                subbed_line = re.sub(
-                    r'(^\s*(?:author|authors|owner|owners|created_by|maintainer|reviewed_by|contributor|contributors):\s*)(["\']?)[^"\'\n]+(["\']?)',
-                    r'\1\2human:cloud-ce\3',
-                    line,
-                )
-                new_lines.append(subbed_line)
-                scrub_notes.append(
-                    "Sanitized identity in frontmatter to 'human:cloud-ce'"
-                )
-                continue
-            if re.search(r'\bby:\s*["\']?agent:[^"\'}\],]+', line):
-                subbed_line = re.sub(
-                    r'(\bby:\s*)(["\']?)agent:[^"\'}\],]+(["\']?)',
-                    r'\1\2agent:knowledge-compiler\3',
-                    line,
-                )
-                new_lines.append(subbed_line)
-                scrub_notes.append(
-                    "Sanitized agent identity in frontmatter to 'agent:knowledge-compiler'"
-                )
-                continue
-
-        new_lines.append(line)
-
-    sanitized = "\n".join(new_lines) + "\n"
+    if sanitized and not sanitized.endswith("\n"):
+        sanitized += "\n"
     return sanitized, scrub_notes
 
 

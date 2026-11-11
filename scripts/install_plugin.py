@@ -32,7 +32,7 @@ PLUGIN_MANIFEST = {
     "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
     "name": "knowledge-compiler",
     "displayName": "Knowledge Compiler",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "description": (
         "Compile PDFs, slides, docs, and agent sessions into a local Open Knowledge Format "
         "(OKF v0.2) Markdown wiki with a 2D/3D WebGL graph and linter."
@@ -512,7 +512,7 @@ def main() -> None:
         harnesses.append("Default (~/.gemini/config)")
 
     print("============================================================")
-    print(" Knowledge Compiler — Global Plugin Installer (v1.0.0)")
+    print(" Knowledge Compiler — Global Plugin Installer (v1.0.1)")
     print("============================================================")
     print(f" Detected Harnesses : {', '.join(harnesses)}")
     print(f" Plugin Directory   : {result['plugin_dir']}")

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "knowledge-compiler"
-version = "1.0.0"
+version = "1.0.1"
 description = "Compile PDFs, slides, docs, and agent sessions into a local Open Knowledge Format (OKF v0.2) Markdown wiki with a 2D/3D WebGL graph and linter."
 readme = "README.md"
 license = {text = "Apache-2.0"}
