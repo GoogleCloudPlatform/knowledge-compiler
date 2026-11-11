@@ -6,7 +6,7 @@ description: >-
 
 # 🧬 WikiSkill: Autonomous Agent Skill Evolution (`/wikiskill`)
 
-> **Status**: Experimental in v1.0 (see [STABILITY.md](../../STABILITY.md)).
+> **Status**: Stable in v1.1+ (see `STABILITY.md`).
 
 This skill implements the Google Research **WikiSkill** framework (Tang et al., 2026) to discover, compile, and evolve modular procedural skills (`SKILL.md`) using a **three-layer architecture**, **on-demand ReAct proposing**, and **asymmetric rollback gating**.
 
@@ -55,13 +55,13 @@ This skill implements the Google Research **WikiSkill** framework (Tang et al., 
 
 ## ⚡ Execution Workflow
 
-### Step 1: Trace Ingestion (`analyze_trace.py`)
-1. Locate recent conversation transcripts in `<appDataDir>/brain/<conversation-id>/.system_generated/logs/transcript.jsonl`.
-2. Run the trace analyzer to extract tool errors and user corrections:
+### Step 1: Trace Ingestion & Diff-Only Proposals (`analyze_trace.py`)
+1. Locate recent conversation transcripts in `<appDataDir>/brain/<conversation-id>/.system_generated/logs/transcript.jsonl` or hook telemetry in `${XDG_STATE_HOME:-~/.local/state}/knowledge-compiler/logs/error_traces.jsonl`.
+2. Run the trace analyzer to extract tool errors, user corrections, and structured diff-only candidate guardrails (written outside the vault under `$XDG_STATE_HOME/knowledge-compiler/proposals` with `0700`/`0600` permissions and secret redaction):
    ```bash
-   python3 <plugin_dir>/skills/wikiskill/scripts/analyze_trace.py <path_to_transcript.jsonl>
+   python3 <plugin_dir>/skills/wikiskill/scripts/analyze_trace.py <path_to_transcript.jsonl> --propose --json
    ```
-3. Identify recurring error signatures, parameter schema violations, or procedural ambiguities.
+3. Inspect `latest_proposals.md` / `latest_proposals.json` to identify recurring error signatures, parameter schema violations, or procedural ambiguities.
 
 ### Step 2: Compile Pattern Dossier (`wiki/patterns/`)
 1. Create or update a persistent pattern dossier at:
@@ -85,16 +85,24 @@ This skill implements the Google Research **WikiSkill** framework (Tang et al., 
    - **Corrective Strategy**: The verified, minimal procedural directive to prevent recurrence.
 
 ### Step 3: On-Demand Skill Proposing
-1. Read the target skill (e.g. `~/.gemini/config/plugins/<plugin>/skills/<skill>/SKILL.md` or `.agents/skills/<skill>/SKILL.md`).
+1. Read the target skill (e.g. `<plugin_dir>/skills/<skill>/SKILL.md` or `.agents/skills/<skill>/SKILL.md`).
 2. Read `${OBSIDIAN_VAULT_PATH:-~/ObsidianVault}/wiki/skill-impact.md` to review prior accepted and rejected proposals (avoiding previously failed approaches).
-3. Draft a clean, atomic patch $P_k$ to the target `SKILL.md`.
+3. Draft a clean, atomic patch $P_k$ to a candidate copy of `SKILL.md` (never auto-mutating instruction files unattended).
 
-### Step 4: Validation Gating & Asymmetric Rollback
-1. Execute validation test rollouts against sample tasks.
-2. **Failure Mode Isolation**: Ensure the test agent executes purely against the candidate `SKILL.md` (no background wiki cheating).
-3. Evaluate outcome:
-   - **If Validation Passes**: Keep the updated `SKILL.md`. Append an `Accepted` entry to `wiki/skill-impact.md`.
-   - **If Validation Fails/Regresses**: Immediately revert `SKILL.md` to previous checkpoint $S_{k-1}$. Append a `Rejected` entry to `wiki/skill-impact.md` with the diff and failure explanation. **The wiki record is never rolled back**.
+### Step 4: Deterministic Validation Gating & Asymmetric Rollback (`vault-wikiskill-eval`)
+1. Execute offline Asymmetric Rollback Evaluation against deterministic test cases:
+   ```bash
+   python3 <plugin_dir>/scripts/wikiskill_eval.py \
+     --baseline-skill <baseline_SKILL.md> \
+     --candidate-skill <candidate_SKILL.md> \
+     --eval-suite <eval_suite.json> \
+     --vault "${OBSIDIAN_VAULT_PATH:-$HOME/ObsidianVault}" \
+     --apply-impact --json
+   ```
+2. **Failure Mode Isolation**: `wikiskill_eval.py` rejects candidate skills with invalid frontmatter, exceeded byte budgets, or `[[wiki/...]]` links inside `SKILL.md` (no background wiki cheating).
+3. **Asymmetric Decision**:
+   - **If `decision == "ACCEPTED"` (`exit 0`)**: Present the validated diff to the user for explicit approval before applying to the target `SKILL.md`; `--apply-impact` appends an `Accepted` ledger record to `wiki/skill-impact.md` via SHA-256 CAS.
+   - **If `decision == "REJECTED"` (`exit 1`)**: Discard the candidate patch (keeping baseline $S_{k-1}$ intact). `--apply-impact` appends a `Rejected` entry to `wiki/skill-impact.md` with the diff and regression reason. **The wiki record is never rolled back**.
 
 ### Step 5: Update Master Index & Vault Log
 1. Add new pattern notes to `${OBSIDIAN_VAULT_PATH:-~/ObsidianVault}/index.md`.

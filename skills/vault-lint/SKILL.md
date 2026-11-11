@@ -61,6 +61,13 @@ python3 <plugin_dir>/scripts/vault_lint.py "${OBSIDIAN_VAULT_PATH:-$HOME/Obsidia
 # Stamp explicit human verification onto a reviewed wiki/ note (Trust Tier: human-reviewed)
 python3 <plugin_dir>/scripts/vault_lint.py "${OBSIDIAN_VAULT_PATH:-$HOME/ObsidianVault}" \
   --approve-human wiki/concepts/MyNote.md --actor human:<username>
+
+# Detect synthesis drift & plain-text unlinked mentions (fail strictly on stale_syntheses via --strict-drift)
+python3 <plugin_dir>/scripts/vault_lint.py "${OBSIDIAN_VAULT_PATH:-$HOME/ObsidianVault}" --mentions --strict-drift
+
+# Two-phase deduplication: (1) generate read-only manifest, review & flip "approved": true, (2) apply with SHA-256 CAS
+python3 <plugin_dir>/scripts/vault_lint.py "${OBSIDIAN_VAULT_PATH:-$HOME/ObsidianVault}" --dedup-manifest /tmp/dedup_manifest.json
+python3 <plugin_dir>/scripts/vault_lint.py "${OBSIDIAN_VAULT_PATH:-$HOME/ObsidianVault}" --apply-manifest /tmp/dedup_manifest.json
 ```
 - Pass `--check-okf-upstream` whenever checking whether a newer version of the official Open Knowledge Format specification has been published at [`github.com/GoogleCloudPlatform/open-knowledge-format`](https://github.com/GoogleCloudPlatform/open-knowledge-format) (`SPEC.md`, currently `v0.2`).
 

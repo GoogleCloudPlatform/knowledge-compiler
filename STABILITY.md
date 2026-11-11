@@ -1,6 +1,6 @@
-# Knowledge Compiler `1.x` Stability & Compatibility Policy (`v1.0.0`)
+# Knowledge Compiler `1.x` Stability & Compatibility Policy (`v1.1.0`)
 
-This document defines the Semantic Versioning (`SemVer 2.0.0`) and backward-compatibility guarantees for **Knowledge Compiler** across the `1.x` release series, starting with `v1.0.0`.
+This document defines the Semantic Versioning (`SemVer 2.0.0`) and backward-compatibility guarantees for **Knowledge Compiler** across the `1.x` release series, starting with `v1.0.0` (updated for `v1.1.0`).
 
 Throughout `1.x`, patch releases (`1.0.z`) contain only bug fixes and security hardening, and minor releases (`1.y.0`) introduce backward-compatible features without breaking the frozen contracts documented below.
 
@@ -32,13 +32,16 @@ The following primary console scripts and their documented CLI flags are frozen 
 | :--- | :--- | :--- |
 | `vault-init` | `scripts.init_vault:main` | Scaffold an OKF v0.2 knowledge vault (`raw/`, `wiki/`, `index.md`, `log.md`, `.obsidian/`) |
 | `vault-extract` | `scripts.extract_source:main` | Extract `.pptx`, `.pdf`, `.docx`, `.xlsx`/`.xls`, `.csv`, and `http(s)` URLs into `raw/` with SHA-256 caching (plain-text/Markdown files are recognized as direct-read no-ops) |
-| `vault-lint` | `scripts.vault_lint:main` | Validate OKF v0.2 bundle conformance, wikilinks, table pipes, orphans, and freshness (`--fix`, `--strict`, `--json`) |
+| `vault-lint` | `scripts.vault_lint:main` | Validate OKF v0.2 bundle conformance, wikilinks, table pipes, synthesis drift, unlinked mentions, dedup manifests, and freshness (`--fix`, `--strict`, `--strict-drift`, `--mentions`, `--dedup-manifest`, `--apply-manifest`, `--json`) |
 | `vault-correct` | `scripts.vault_correct:main` | Execute Tri-State fact correction sweeps (`AUTHORITATIVE`, `RESTATEMENT`, `HISTORICAL`) with Plan-by-default preview |
 | `vault-query` | `scripts.vault_query:main` | Zero-dependency in-memory BM25 search, duplicate check (`--check-duplicate`), and raw fence retrieval (`--include-raw`) |
-| `vault-graph` | `scripts.vault_graph:main` | Serve or export the 2D/3D WebGL Knowledge Graph and local Search Hub (`127.0.0.1:8765`, `--export`, `--json`) |
-| `vault-sync-patterns` | `scripts.sync_patterns:main` | Audit, de-identify, share, and pull reusable patterns with a shared Git patterns repository (`audit`, `sanitize`, `share`, `pull`, `init-repo`) |
+| `vault-graph` | `scripts.vault_graph:main` | Serve or export the 2D/3D WebGL Knowledge Graph and local Search Hub (`127.0.0.1:8765`, `--export`, `--json`, `/api/note`) |
+| `vault-sync-patterns` | `scripts.sync_patterns:main` | Audit, de-identify, share (including isolated `--open-pr` worktree PRs), and pull reusable patterns with a shared Git patterns repository (`audit`, `sanitize`, `share`, `pull`, `init-repo`) |
 | `vault-sanitize-check` | `scripts.sanitize_check:main` | Enforce fail-closed DLP, secret, workstation path, and private entity link checks (`--strict`, `--fix`) |
-| `kc-install-plugin` | `scripts.install_plugin:main` | Install or synchronize the plugin manifest, hooks, rules, skills, and graph sidecar |
+| `vault-analyze-trace` | `scripts.analyze_trace:main` | Analyze conversation transcripts and telemetry into redacted out-of-vault candidate guardrail diffs (`--propose`) |
+| `vault-wikiskill-eval` | `scripts.wikiskill_eval:main` | Execute deterministic offline Asymmetric Rollback Evaluation for candidate `SKILL.md` patches (`--apply-impact`) |
+| `vault-hooks` | `scripts.vault_hooks:main` | Inspect, enable, or disable lifecycle hooks across writable plugins, read-only (`EROFS`) Marketplace mounts, and workspace scopes |
+| `kc-install-plugin` | `scripts.install_plugin:main` | Install or synchronize the plugin manifest, hooks (`--enable-hooks`, `--disable-hooks`, upgrade-safe), rules, skills, and graph sidecar |
 <!-- mdformat on -->
 
 ### Deterministic Exit Code Contract (`0` / `1` / `2`)
@@ -65,13 +68,15 @@ Across `vault-lint`, `vault-query`, and `vault-correct`, process exit codes are 
 Machine-readable `--json` outputs follow an **additive-only** evolution policy throughout `1.x` minor releases. Existing documented top-level keys (`vault_lint --json`, `vault-query --json`, `vault-correct --json`, `vault-graph --json`) will not be removed or incompatibly retyped in `1.x`:
 
 - **`vault-lint --json` (`vault_lint --json`)**:
-  - Preserves top-level keys: `success`, `vault_path`, `bundle_root`, `supported_okf_version`, `total_markdown_files`, `total_wiki_notes`, `broken_links`, `wanted_pages`, `table_invariant_violations`, `fixed_files`, `migrated_sources_files`, `orphan_notes`, `missing_from_index`, `missing_frontmatter`, `conformance_errors`, `legacy_sources_notes`, `dangling_footnotes`, `stale_notes`, `workspace_profile_warnings`, `trust_tier_counts`, `epistemic_edge_counts`, `is_healthy`, `strict`, `strict_passed`.
+  - Preserves top-level keys: `success`, `vault_path`, `bundle_root`, `supported_okf_version`, `total_markdown_files`, `total_wiki_notes`, `broken_links`, `wanted_pages`, `table_invariant_violations`, `fixed_files`, `migrated_sources_files`, `orphan_notes`, `missing_from_index`, `missing_frontmatter`, `conformance_errors`, `legacy_sources_notes`, `dangling_footnotes`, `stale_notes`, `stale_syntheses`, `workspace_profile_warnings`, `trust_tier_counts`, `epistemic_edge_counts`, `is_healthy`, `strict`, `strict_passed`, `strict_drift`, `strict_drift_passed` (plus `unlinked_mentions` when `--mentions` is passed).
 - **`vault-query --json`**:
   - Preserves top-level keys: `query`, `tokens`, `vault`, `include_raw`, `total_results`, `results` (or `query`, `create_safety`, `matches` when `--check-duplicate` is passed).
 - **`vault-correct --json`**:
   - Preserves top-level keys: `vault_path`, `fact`, `stale_claim`, `replacement`, `dry_run`, `applied`, `cas_conflict`, `cas_conflicts`, `authoritative_updated`, `restatements_refactored`, `historical_preserved`, `diffs`, `warnings`, `errors`.
 - **`vault-graph --json`**:
-  - Preserves top-level keys: `vaultPath`, `vaultName`, `categories`, `epistemicTypes`, `stats`, `tags`, `nodes`, `edges`.
+  - Preserves top-level keys: `vaultPath`, `vaultName`, `categories`, `epistemicTypes`, `stats`, `tags`, `nodes`, `edges`. Interactive HTTP mode serves slim initial HTML (`GET /`, with `lazyMarkdown: true`) and loads full per-node markdown on demand via `GET /api/note?id=...`, while `--export` and `--json` embed full markdown for offline portability.
+- **`vault-analyze-trace --json`**:
+  - Preserves top-level keys: `transcript_file`, `error_log_file`, `total_steps`, `tool_error_count`, `transcript_error_count`, `error_trace_count`, `user_correction_count`, `errors`, `error_traces`, `corrections`, `proposals`, `proposal_file`.
 
 ---
 
@@ -88,9 +93,9 @@ Machine-readable `--json` outputs follow an **additive-only** evolution policy t
 
 ---
 
-## 5. Experimental Surfaces (Exempt from `1.x` Freeze)
+## 5. Graduated Surfaces (`1.x` Frozen in `v1.1.0`)
 
-- **`/wikiskill` & `vault-analyze-trace` (`scripts/analyze_trace.py`) — Experimental**:
-  - The `/wikiskill` skill workflow and the `vault-analyze-trace` (`analyze-trace`) CLI tool are designated **Experimental** in `v1.0.0`.
-  - Their CLI arguments, heuristics, and JSON diagnostic output schemas may change in `1.x` minor releases without a major version bump.
-  - **Safety Invariant**: Even while experimental, zero code paths in `vault-analyze-trace` or any lifecycle hook automatically rewrite `SKILL.md`, `AGENTS.md`, or `GEMINI.md` files without explicit human review.
+- **`/wikiskill`, `vault-analyze-trace` (`scripts/analyze_trace.py`), & `vault-wikiskill-eval` (`scripts/wikiskill_eval.py`) — Stable**:
+  - Previously designated **Experimental** in `v1.0.0`, `/wikiskill`, `vault-analyze-trace`, and `vault-wikiskill-eval` graduated to **`Stable` (`1.x` Frozen)** in `v1.1.0`.
+  - Candidate guardrail proposals from `vault-analyze-trace --propose` are written strictly outside `$VAULT/` (`0700`/`0600` directories/files with secret redaction), and `vault-wikiskill-eval` enforces deterministic offline Asymmetric Rollback Gating with `wiki/skill-impact.md` SHA-256 CAS updates (`--apply-impact`).
+  - **Safety Invariant**: Zero code paths in `vault-analyze-trace`, `vault-wikiskill-eval`, or any lifecycle hook automatically rewrite `SKILL.md`, `AGENTS.md`, or `GEMINI.md` files unattended without explicit human review.

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "knowledge-compiler"
-version = "1.0.1"
+version = "1.1.0"
 description = "Compile PDFs, slides, docs, and agent sessions into a local Open Knowledge Format (OKF v0.2) Markdown wiki with a 2D/3D WebGL graph and linter."
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -57,6 +57,8 @@ vault-query = "scripts.vault_query:main"
 vault-sync-patterns = "scripts.sync_patterns:main"
 vault-sanitize-check = "scripts.sanitize_check:main"
 vault-analyze-trace = "scripts.analyze_trace:main"
+vault-wikiskill-eval = "scripts.wikiskill_eval:main"
+vault-hooks = "scripts.vault_hooks:main"
 vault-graph = "scripts.vault_graph:main"
 kc-install-plugin = "scripts.install_plugin:main"
 

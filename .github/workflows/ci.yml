@@ -20,6 +20,8 @@ on:
   pull_request:
     branches: [ main, master ]
 
+permissions: {}
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -28,20 +30,27 @@ jobs:
   test:
     name: Lint & Hermetic Unit Tests
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
           python-version: "3.12"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
 
       - name: Run Ruff Lint Checks
         run: uvx ruff check .
+
+      - name: Run Open Source License & Clean-Room Compliance Gate
+        run: python3 -m unittest tests/test_oss_cross_compliance.py -v
 
       - name: Run Hermetic Unit Test Suite
         run: python3 -m unittest discover tests -v

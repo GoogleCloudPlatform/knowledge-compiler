@@ -24,6 +24,7 @@ import argparse
 from collections import Counter
 import datetime
 import getpass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -115,7 +116,7 @@ def check_upstream_okf_version(timeout: float = 5.0) -> dict[str, Any]:
     }
 
     headers = {
-        "User-Agent": "knowledge-compiler-okf-checker/1.0.1",
+        "User-Agent": "knowledge-compiler-okf-checker/1.1.0",
         "Accept": "application/vnd.github.v3+json",
     }
 
@@ -850,6 +851,887 @@ def _build_wanted_pages(broken_links: list[dict[str, str]]) -> list[dict[str, An
     return wanted
 
 
+_LINKABLE_WIKI_PREFIXES = ("wiki/entities/", "wiki/concepts/", "wiki/patterns/")
+_MENTION_STOPWORDS = frozenset(
+    {
+        "overview",
+        "notes",
+        "summary",
+        "index",
+        "system",
+        "guide",
+        "pattern",
+        "concept",
+        "entity",
+        "concepts",
+        "patterns",
+        "entities",
+        "synthesis",
+        "workflow",
+        "readme",
+        "default",
+        "config",
+        "model",
+        "models",
+        "template",
+        "templates",
+        "example",
+        "examples",
+    }
+)
+_MD_HEADING_12_RE = re.compile(r"^[ \t]{0,3}#{1,2}[ \t]+(.+)$", re.MULTILINE)
+_INLINE_MD_LINK_MASK_RE = re.compile(r"!?\[[^\]\n]*\]\([^)\n]*\)")
+_URL_MASK_RE = re.compile(r"https?://\S+")
+
+
+def _extract_iso_date(val: Any) -> str | None:
+    """Return a validated YYYY-MM-DD prefix from a date, datetime, or string."""
+    if isinstance(val, datetime.datetime):
+        return val.date().isoformat()
+    if isinstance(val, datetime.date):
+        return val.isoformat()
+    if isinstance(val, str):
+        cand = val.strip()[:10]
+        if len(cand) == 10:
+            try:
+                return datetime.date.fromisoformat(cand).isoformat()
+            except ValueError:
+                return None
+    return None
+
+
+def _resolve_dep_path(
+    raw_ref: str,
+    src_rel: str,
+    name_to_rel: dict[str, str],
+    graph: dict[str, dict[str, Any]],
+) -> str | None:
+    """Resolve a wikilink, markdown path, or sources[].resource string to a vault-relative note."""
+    text = (raw_ref or "").strip()
+    if not text:
+        return None
+    if text.startswith("[[") and text.endswith("]]"):
+        text = text[2:-2].strip()
+    text = re.split(r"\\?\|", text)[0].strip()
+    if "#" in text:
+        text = text.split("#", 1)[0].strip()
+    if "?" in text:
+        text = text.split("?", 1)[0].strip()
+    if not text or text.startswith(("http://", "https://", "mailto:")):
+        return None
+
+    candidates = [text]
+    if not text.startswith("/"):
+        joined = os.path.normpath(str(Path(src_rel).parent / text)).replace("\\", "/")
+        if not joined.startswith(".."):
+            candidates.append(joined)
+    for cand in candidates:
+        resolved = _resolve_target(cand.lstrip("/"), name_to_rel, graph)
+        if resolved and resolved in graph and resolved.startswith("wiki/"):
+            return resolved
+    return None
+
+
+def _detect_stale_syntheses(
+    all_md_files: dict[str, dict[str, Any]],
+    graph: dict[str, dict[str, Any]],
+    name_to_rel: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Detect wiki/synthesis/*.md notes whose resolved wiki/ dependencies were updated later."""
+    stale_syntheses: list[dict[str, Any]] = []
+    for rel_path in sorted(all_md_files):
+        if (
+            not rel_path.startswith("wiki/synthesis/")
+            or not rel_path.endswith(".md")
+            or Path(rel_path).name.lower() in RESERVED_BUNDLE_FILENAMES
+        ):
+            continue
+        data = graph.get(rel_path) or {}
+        fm = data.get("frontmatter")
+        if not isinstance(fm, dict) or not data.get("has_fm"):
+            continue
+
+        synth_date: str | None = None
+        gen = fm.get("generated")
+        if isinstance(gen, dict):
+            synth_date = _extract_iso_date(gen.get("at"))
+        if not synth_date:
+            synth_date = _extract_iso_date(fm.get("updated"))
+        if not synth_date:
+            synth_date = _extract_iso_date(fm.get("created"))
+        if not synth_date:
+            continue
+
+        raw_refs: list[str] = list(data.get("outbound") or ()) + list(data.get("outbound_md") or ())
+        sources = fm.get("sources")
+        if isinstance(sources, list):
+            for item in sources:
+                if isinstance(item, dict):
+                    res = item.get("resource")
+                    if isinstance(res, str) and res.strip():
+                        raw_refs.append(res.strip())
+                elif isinstance(item, str) and item.strip():
+                    raw_refs.append(item.strip())
+
+        newer_deps: dict[str, str] = {}
+        for ref in raw_refs:
+            dep_rel = _resolve_dep_path(ref, rel_path, name_to_rel, graph)
+            if not dep_rel or dep_rel == rel_path:
+                continue
+            dep_fm = (graph.get(dep_rel) or {}).get("frontmatter")
+            if not isinstance(dep_fm, dict):
+                continue
+            dep_upd = _extract_iso_date(dep_fm.get("updated"))
+            if dep_upd and dep_upd > synth_date:
+                newer_deps[dep_rel] = dep_upd
+
+        if newer_deps:
+            stale_syntheses.append(
+                {
+                    "file": rel_path,
+                    "synthesis_date": synth_date,
+                    "newer_dependencies": [
+                        {"file": dep_rel, "updated": newer_deps[dep_rel]}
+                        for dep_rel in sorted(newer_deps)
+                    ],
+                }
+            )
+    return stale_syntheses
+
+
+def _scan_unlinked_mentions(
+    all_md_files: dict[str, dict[str, Any]],
+    graph: dict[str, dict[str, Any]],
+    name_to_rel: dict[str, str],
+    scan_meta: dict[str, tuple[int, str, Any, str, str, int]],
+) -> list[dict[str, Any]]:
+    """Scan living wiki/ prose for plain-text mentions of linkable entities/concepts/patterns."""
+    term_map: dict[str, tuple[str, str]] = {}
+    for rel_path in sorted(all_md_files):
+        if (
+            not rel_path.startswith(_LINKABLE_WIKI_PREFIXES)
+            or not rel_path.endswith(".md")
+            or Path(rel_path).name.lower() in RESERVED_BUNDLE_FILENAMES
+        ):
+            continue
+        candidates: list[str] = [all_md_files[rel_path]["base_name"]]
+        fm = (graph.get(rel_path) or {}).get("frontmatter")
+        if isinstance(fm, dict):
+            title = fm.get("title")
+            if isinstance(title, str) and title.strip():
+                candidates.append(title.strip())
+            aliases = fm.get("aliases")
+            if isinstance(aliases, list):
+                for alias in aliases:
+                    if isinstance(alias, str) and alias.strip():
+                        candidates.append(alias.strip())
+        for raw_term in candidates:
+            term = re.sub(r"\s+", " ", raw_term.strip())
+            if len(term) < 4 or term.lower() in _MENTION_STOPWORDS:
+                continue
+            if any(ch in term for ch in "[]()`\n\r"):
+                continue
+            term_map.setdefault(term.lower(), (term, rel_path))
+
+    if not term_map:
+        return []
+
+    compiled_terms = [
+        (
+            term,
+            target_rel,
+            re.compile(
+                rf"(?<![A-Za-z0-9_]){re.escape(term)}(?![A-Za-z0-9_])",
+                re.IGNORECASE,
+            ),
+        )
+        for _k, (term, target_rel) in sorted(
+            term_map.items(),
+            key=lambda kv: (-len(kv[1][0]), kv[1][0].lower(), kv[1][1]),
+        )
+    ]
+
+    mentions: list[dict[str, Any]] = []
+    for rel_path in sorted(all_md_files):
+        if (
+            not rel_path.startswith("wiki/")
+            or not rel_path.endswith(".md")
+            or Path(rel_path).name.lower() in RESERVED_BUNDLE_FILENAMES
+            or _is_protected_from_lint_fix(rel_path)
+        ):
+            continue
+        meta = scan_meta.get(rel_path)
+        if meta is None:
+            continue
+        fm_line_offset, masked_body, restore_body, open_ch, close_ch, digit_base = meta
+        digit_lo = re.escape(chr(digit_base))
+        digit_hi = re.escape(chr(digit_base + 15))
+        ph_re = re.compile(
+            rf"{re.escape(open_ch)}([{digit_lo}-{digit_hi}]+){re.escape(close_ch)}"
+        )
+
+        data = graph[rel_path]
+        resolved_outbound: set[str] = set()
+        for tgt in data["outbound"]:
+            resolved = _resolve_dep_path(tgt, rel_path, name_to_rel, graph)
+            if resolved:
+                resolved_outbound.add(resolved)
+        for href in data["outbound_md"]:
+            resolved = _resolve_dep_path(href, rel_path, name_to_rel, graph)
+            if resolved:
+                resolved_outbound.add(resolved)
+
+        extra_newlines = 0
+        for b_idx, masked_line in enumerate(masked_body.splitlines(), start=1):
+            actual_line = fm_line_offset + extra_newlines + b_idx
+            for ph_m in ph_re.finditer(masked_line):
+                ph_str = ph_m.group(0)
+                extra_newlines += max(
+                    0, restore_body(ph_str).count("\n") - ph_str.count("\n")
+                )
+
+            if not masked_line.strip() or _HEADING_RE.match(masked_line):
+                continue
+
+            # Replace existing wikilinks, markdown links, PUA sentinels, and URLs with spaces
+            line_for_scan = _WIKILINK_RE.sub(
+                lambda m: " " * len(m.group(0)), masked_line
+            )
+            line_for_scan = _INLINE_MD_LINK_MASK_RE.sub(
+                lambda m: " " * len(m.group(0)), line_for_scan
+            )
+            line_for_scan = ph_re.sub(
+                lambda m: " " * len(m.group(0)), line_for_scan
+            )
+            line_for_scan = _URL_MASK_RE.sub(
+                lambda m: " " * len(m.group(0)), line_for_scan
+            )
+            if not line_for_scan.strip():
+                continue
+
+            occupied_spans: list[tuple[int, int]] = []
+            seen_targets_on_line: set[str] = set()
+            for _term, target_rel, pattern in compiled_terms:
+                if target_rel == rel_path or target_rel in resolved_outbound:
+                    continue
+                if target_rel in seen_targets_on_line:
+                    continue
+                for m in pattern.finditer(line_for_scan):
+                    s, e = m.span()
+                    if any(not (e <= os_s or s >= os_e) for os_s, os_e in occupied_spans):
+                        continue
+                    occupied_spans.append((s, e))
+                    seen_targets_on_line.add(target_rel)
+                    mentions.append(
+                        {
+                            "file": rel_path,
+                            "target": target_rel,
+                            "matched_term": m.group(0),
+                            "line": actual_line,
+                        }
+                    )
+                    break
+
+    mentions.sort(key=lambda item: (item["file"], item["line"], item["target"]))
+    return mentions
+
+
+def _compact_norm(value: str) -> str:
+    """Normalize a note stem, title, or alias for collision detection."""
+    return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
+
+
+def _semantic_tokens(value: str) -> set[str]:
+    """Extract normalized multi-character tokens for similarity comparison."""
+    return {
+        tok
+        for tok in re.split(r"[^a-z0-9]+", (value or "").lower())
+        if len(tok) >= 2 and tok not in _MENTION_STOPWORDS
+    }
+
+
+def generate_dedup_manifest(vault_root: Path, out_path: Path | str) -> dict[str, Any]:
+    """Read-only scan for duplicate entity/concept/pattern notes; writes review manifest JSON."""
+    raw_vault = Path(vault_root)
+    if not raw_vault.exists() or not raw_vault.is_dir():
+        return {"success": False, "error": f"Vault directory not found: {raw_vault}"}
+    v_root = raw_vault.resolve()
+    wiki_dir = v_root / "wiki"
+    if wiki_dir.is_symlink() or not wiki_dir.is_dir():
+        return {"success": False, "error": f"Vault wiki directory not found at {wiki_dir}"}
+
+    dest = Path(out_path)
+    if dest.is_symlink():
+        return {"success": False, "error": f"Refusing symlink manifest path: {dest}"}
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.parent.is_symlink():
+        return {"success": False, "error": f"Refusing symlink manifest parent: {dest.parent}"}
+
+    # Compute inbound reference counts so canonical keep_target selection is deterministic
+    inbound_counts: Counter[str] = Counter()
+    all_notes_for_links: list[Path] = []
+    for root, dirs, files in os.walk(v_root, followlinks=False):
+        root_p = Path(root)
+        dirs[:] = sorted(
+            d for d in dirs if d not in IGNORED_DIR_NAMES and not (root_p / d).is_symlink()
+        )
+        for fname in sorted(files):
+            if fname.endswith(".md"):
+                fp = root_p / fname
+                if not fp.is_symlink():
+                    all_notes_for_links.append(fp)
+
+    records: list[dict[str, Any]] = []
+    stem_lookup: dict[str, list[str]] = {}
+    for prefix_rel in _LINKABLE_WIKI_PREFIXES:
+        base_dir = v_root / prefix_rel.rstrip("/")
+        if not base_dir.is_dir() or base_dir.is_symlink():
+            continue
+        for root, dirs, files in os.walk(base_dir, followlinks=False):
+            root_p = Path(root)
+            dirs[:] = sorted(
+                d for d in dirs if d not in IGNORED_DIR_NAMES and not (root_p / d).is_symlink()
+            )
+            for fname in sorted(files):
+                if not fname.endswith(".md") or fname.lower() in RESERVED_BUNDLE_FILENAMES:
+                    continue
+                fp = root_p / fname
+                if fp.is_symlink():
+                    continue
+                rel = fp.relative_to(v_root).as_posix()
+                if _is_protected_from_lint_fix(rel):
+                    continue
+                raw_bytes = fp.read_bytes()
+                sha256 = hashlib.sha256(raw_bytes).hexdigest()
+                text = raw_bytes.decode("utf-8", errors="replace")
+                _prefix, yaml_text, raw_body = okf.split_frontmatter(text)
+                body = raw_body if yaml_text is not None else text
+                fm = okf.parse_frontmatter(yaml_text, strict=False) if yaml_text else {}
+                title = str(fm.get("title") or "").strip() if isinstance(fm, dict) else ""
+                aliases = (
+                    [str(a).strip() for a in (fm.get("aliases") or []) if isinstance(a, str) and str(a).strip()]
+                    if isinstance(fm, dict) and isinstance(fm.get("aliases"), list)
+                    else []
+                )
+                masked_body, _restore, _unclosed = _mask_markdown_code(body)
+                headings = [m.group(1).strip() for m in _MD_HEADING_12_RE.finditer(masked_body)]
+                primary_keys = {
+                    k for k in (_compact_norm(fp.stem), _compact_norm(title)) if k
+                }
+                alias_keys = {_compact_norm(a) for a in aliases if _compact_norm(a)}
+                sem_tokens = _semantic_tokens(" ".join([title or fp.stem, *aliases, *headings]))
+                records.append(
+                    {
+                        "rel": rel,
+                        "stem": fp.stem,
+                        "sha256": sha256,
+                        "bytes_len": len(raw_bytes),
+                        "primary_keys": primary_keys,
+                        "alias_keys": alias_keys,
+                        "sem_tokens": sem_tokens,
+                    }
+                )
+                stem_lookup.setdefault(fp.stem.lower(), []).append(rel)
+
+    record_rels = {r["rel"] for r in records}
+    for note_fp in all_notes_for_links:
+        note_rel = note_fp.relative_to(v_root).as_posix()
+        txt, ok_utf8 = _read_text_preserve_eol(note_fp)
+        if not ok_utf8:
+            continue
+        for m in _WIKILINK_RE.finditer(txt):
+            tgt = re.split(r"\\?\|", m.group(1).strip())[0].split("#", 1)[0].strip()
+            tgt_clean = tgt.removesuffix(".md").lower()
+            matched_rel: str | None = None
+            cand_paths = [
+                f"{tgt_clean}.md",
+                f"wiki/{tgt_clean}.md",
+            ]
+            for cp in cand_paths:
+                for rec_rel in record_rels:
+                    if rec_rel.lower() == cp:
+                        matched_rel = rec_rel
+                        break
+                if matched_rel:
+                    break
+            if not matched_rel and len(stem_lookup.get(tgt_clean.split("/")[-1], [])) == 1:
+                matched_rel = stem_lookup[tgt_clean.split("/")[-1]][0]
+            if matched_rel and matched_rel != note_rel:
+                inbound_counts[matched_rel] += 1
+
+    records.sort(key=lambda r: r["rel"])
+    raw_proposals: list[dict[str, Any]] = []
+    for i in range(len(records)):
+        rec_a = records[i]
+        for j in range(i + 1, len(records)):
+            rec_b = records[j]
+            reason = ""
+            similarity = 0.0
+            if rec_a["primary_keys"] & rec_b["primary_keys"]:
+                reason = "normalized_stem_or_title_collision"
+                similarity = 1.0
+            elif (
+                (rec_a["alias_keys"] & rec_b["alias_keys"])
+                or (rec_a["alias_keys"] & rec_b["primary_keys"])
+                or (rec_b["alias_keys"] & rec_a["primary_keys"])
+            ):
+                reason = "shared_alias"
+                similarity = 1.0
+            elif len(rec_a["sem_tokens"]) >= 2 and len(rec_b["sem_tokens"]) >= 2:
+                union = rec_a["sem_tokens"] | rec_b["sem_tokens"]
+                if union:
+                    jaccard = len(rec_a["sem_tokens"] & rec_b["sem_tokens"]) / len(union)
+                    if jaccard >= 0.75:
+                        reason = "high_title_heading_similarity"
+                        similarity = round(jaccard, 4)
+            if not reason:
+                continue
+
+            score_a = (-inbound_counts[rec_a["rel"]], -rec_a["bytes_len"], rec_a["rel"])
+            score_b = (-inbound_counts[rec_b["rel"]], -rec_b["bytes_len"], rec_b["rel"])
+            keep_rec, merge_rec = (rec_a, rec_b) if score_a <= score_b else (rec_b, rec_a)
+            raw_proposals.append(
+                {
+                    "keep_target": keep_rec["rel"],
+                    "merge_source": merge_rec["rel"],
+                    "reason": reason,
+                    "similarity": similarity,
+                    "approved": False,
+                    "keep_sha256": keep_rec["sha256"],
+                    "merge_sha256": merge_rec["sha256"],
+                }
+            )
+
+    raw_proposals.sort(
+        key=lambda p: (-float(p["similarity"]), p["keep_target"], p["merge_source"])
+    )
+    proposals = [
+        {"id": f"dedup-{idx:03d}", **prop}
+        for idx, prop in enumerate(raw_proposals, start=1)
+    ]
+    manifest = {
+        "version": "1.0",
+        "vault_path": str(v_root),
+        "proposals": proposals,
+    }
+    _atomic_write_text(dest, json.dumps(manifest, indent=2) + "\n")
+    return {
+        "success": True,
+        "vault_path": str(v_root),
+        "manifest_path": str(dest),
+        "proposal_count": len(proposals),
+        "proposals": proposals,
+    }
+
+
+def _validate_dedup_note_rel(v_root: Path, wiki_root: Path, rel_str: Any) -> Path | None:
+    """Validate that `rel_str` resolves safely inside writable living `wiki/` with zero symlinks."""
+    if not isinstance(rel_str, str) or not rel_str.strip():
+        return None
+    clean = rel_str.replace("\\", "/").strip()
+    rel_p = Path(clean)
+    if rel_p.is_absolute() or ".." in rel_p.parts:
+        return None
+    if _is_protected_from_lint_fix(clean):
+        return None
+    if rel_p.name.lower() in RESERVED_BUNDLE_FILENAMES or rel_p.suffix.lower() != ".md":
+        return None
+    cand = v_root / rel_p
+    if _has_symlink_component(cand, v_root):
+        return None
+    try:
+        resolved = cand.resolve()
+        resolved.relative_to(wiki_root)
+    except (OSError, ValueError):
+        return None
+    if not resolved.is_file():
+        return None
+    return resolved
+
+
+def _update_merged_frontmatter(
+    keep_content: str,
+    keep_stem: str,
+    merge_content: str,
+    merge_stem: str,
+) -> str:
+    """Merge tags, aliases, sources, updated date, and non-duplicate body content into keep_content."""
+    bom = "\ufeff" if keep_content.startswith("\ufeff") else ""
+    text = keep_content[len(bom) :]
+    match = okf._FRONTMATTER_RE.match(text)
+    merge_prefix, merge_yaml, merge_raw_body = okf.split_frontmatter(merge_content)
+    merge_fm = (
+        okf.parse_frontmatter(merge_yaml, strict=False) if merge_yaml is not None else {}
+    )
+    if not isinstance(merge_fm, dict):
+        merge_fm = {}
+    merge_body = (merge_raw_body if merge_yaml is not None else merge_content).strip()
+    merge_title = str(merge_fm.get("title") or merge_stem).strip()
+
+    if match:
+        nl = match.group(1)
+        yaml_text = match.group(2) if match.group(2) is not None else ""
+        close_nl = match.group(3)
+        keep_body = match.group(4)
+        keep_fm = okf.parse_frontmatter(yaml_text, strict=False)
+        if not isinstance(keep_fm, dict):
+            keep_fm = {}
+    else:
+        nl = "\r\n" if "\r\n" in keep_content else "\n"
+        yaml_text = f"title: {okf._format_yaml_value(keep_stem)}{nl}type: concept{nl}status: draft"
+        close_nl = nl
+        keep_body = text
+        keep_fm = {"title": keep_stem, "type": "concept", "status": "draft"}
+
+    keep_title = str(keep_fm.get("title") or keep_stem).strip()
+    keep_ident_lower = {keep_title.lower(), keep_stem.lower()}
+
+    # Merge aliases
+    merged_aliases: list[str] = []
+    seen_alias_low: set[str] = set()
+    raw_alias_candidates: list[Any] = []
+    if isinstance(keep_fm.get("aliases"), list):
+        raw_alias_candidates.extend(keep_fm["aliases"])
+    if isinstance(merge_fm.get("aliases"), list):
+        raw_alias_candidates.extend(merge_fm["aliases"])
+    raw_alias_candidates.extend([merge_title, merge_stem])
+    for item in raw_alias_candidates:
+        if not isinstance(item, str):
+            continue
+        s = item.strip()
+        if not s or s.lower() in keep_ident_lower or s.lower() in seen_alias_low:
+            continue
+        seen_alias_low.add(s.lower())
+        merged_aliases.append(s)
+
+    # Merge tags
+    merged_tags: list[str] = []
+    seen_tag_low: set[str] = set()
+    for fm_obj in (keep_fm, merge_fm):
+        raw_tags = fm_obj.get("tags")
+        if isinstance(raw_tags, list):
+            for t in raw_tags:
+                if isinstance(t, str) and t.strip() and t.strip().lower() not in seen_tag_low:
+                    seen_tag_low.add(t.strip().lower())
+                    merged_tags.append(t.strip())
+
+    # Merge sources preserving existing OKF objects/strings
+    merged_sources: list[Any] = []
+    seen_sources: set[str] = set()
+    for fm_obj in (keep_fm, merge_fm):
+        raw_sources = fm_obj.get("sources")
+        if isinstance(raw_sources, list):
+            for src in raw_sources:
+                if isinstance(src, dict):
+                    key = f"dict:{src.get('resource') or ''}:{src.get('id') or ''}"
+                else:
+                    key = f"str:{str(src).strip()}"
+                if key in seen_sources or not key.rstrip(":"):
+                    continue
+                seen_sources.add(key)
+                merged_sources.append(src)
+
+    new_yaml = yaml_text
+    if merged_aliases or isinstance(keep_fm.get("aliases"), list):
+        new_yaml = okf._replace_top_level_key_block(
+            new_yaml, "aliases", f"aliases: {okf._format_yaml_value(merged_aliases)}", nl
+        )
+    if merged_tags:
+        new_yaml = okf._replace_top_level_key_block(
+            new_yaml, "tags", f"tags: {okf._format_yaml_value(merged_tags)}", nl
+        )
+    if merged_sources:
+        src_lines = ["sources:"]
+        for entry in merged_sources:
+            if isinstance(entry, dict):
+                first_kv = True
+                ordered = [k for k in ("id", "resource") if k in entry] + [
+                    k for k in entry if k not in ("id", "resource")
+                ]
+                for k in ordered:
+                    pfx = "  - " if first_kv else "    "
+                    src_lines.append(f"{pfx}{k}: {okf._format_yaml_value(entry[k])}")
+                    first_kv = False
+            else:
+                src_lines.append(f"  - {okf._format_yaml_value(str(entry))}")
+        new_yaml = okf._replace_top_level_key_block(
+            new_yaml, "sources", nl.join(src_lines), nl
+        )
+
+    today_iso = datetime.date.today().isoformat()
+    new_yaml = okf._replace_top_level_key_block(
+        new_yaml, "updated", f"updated: {okf._format_yaml_value(today_iso)}", nl
+    )
+
+    updated_body = keep_body
+    if merge_body and merge_body not in keep_body:
+        sep = "" if (not updated_body or updated_body.endswith(("\n\n", "\r\n\r\n"))) else (nl + nl)
+        if updated_body and not updated_body.endswith(("\n", "\r\n")):
+            sep = nl + nl
+        updated_body = (
+            f"{updated_body}{sep}## Merged from {merge_title}{nl}{nl}{merge_body}{nl}"
+        )
+
+    return f"{bom}---{nl}{new_yaml}{nl}---{close_nl}{updated_body}"
+
+
+def _rewrite_wikilinks_for_merge(
+    note_text: str,
+    merge_rel: str,
+    merge_stem: str,
+    merge_title: str,
+    keep_rel: str,
+    keep_stem: str,
+) -> tuple[str, bool]:
+    """Rewrite [[merge_source]] wikilinks to [[keep_stem]] outside frontmatter/code blocks."""
+    fm_prefix, yaml_text, raw_body = okf.split_frontmatter(note_text)
+    body = raw_body if yaml_text is not None else note_text
+    masked_body, restore_body, has_unclosed = _mask_markdown_code(body)
+    _o, _c, _b, sentinel_clean = _find_pua_sentinel_base(body)
+    if has_unclosed or not sentinel_clean:
+        return note_text, False
+
+    merge_aliases_lower = {
+        merge_stem.lower(),
+        merge_rel.lower(),
+        merge_rel.removesuffix(".md").lower(),
+    }
+    if merge_rel.startswith("wiki/"):
+        merge_aliases_lower.add(merge_rel[5:].lower())
+        merge_aliases_lower.add(merge_rel[5:].removesuffix(".md").lower())
+    if merge_title.strip():
+        merge_aliases_lower.add(merge_title.strip().lower())
+
+    changed = False
+
+    def _repl(match_obj: re.Match[str]) -> str:
+        nonlocal changed
+        inner = match_obj.group(1)
+        if "|" in inner:
+            left, right = inner.split("|", 1)
+            alias_part = f"|{right}"
+        else:
+            left, alias_part = inner, ""
+        if "#" in left:
+            tgt, sec = left.split("#", 1)
+            sec_part = f"#{sec}"
+        else:
+            tgt, sec_part = left, ""
+        tgt_norm = tgt.strip().removesuffix("\\").strip().lower()
+        tgt_norm_no_md = tgt_norm.removesuffix(".md")
+        if tgt_norm in merge_aliases_lower or tgt_norm_no_md in merge_aliases_lower:
+            changed = True
+            if tgt_norm.startswith("wiki/"):
+                new_ref = keep_rel.removesuffix(".md")
+            elif "/" in tgt_norm and keep_rel.startswith("wiki/"):
+                new_ref = keep_rel[5:].removesuffix(".md")
+            else:
+                new_ref = keep_stem
+            return f"[[{new_ref}{sec_part}{alias_part}]]"
+        return match_obj.group(0)
+
+    rewritten_masked = _WIKILINK_RE.sub(_repl, masked_body)
+    if not changed:
+        return note_text, False
+    rebuilt_body = restore_body(rewritten_masked)
+    updated_text = f"{fm_prefix}{rebuilt_body}" if yaml_text is not None else rebuilt_body
+    return updated_text, updated_text != note_text
+
+
+def apply_dedup_manifest(vault_root: Path, manifest_path: Path | str) -> dict[str, Any]:
+    """Apply ONLY approved proposals in a dedup manifest using strict SHA-256 CAS checks."""
+    raw_vault = Path(vault_root)
+    if not raw_vault.exists() or not raw_vault.is_dir():
+        return {"success": False, "error": f"Vault directory not found: {raw_vault}"}
+    v_root = raw_vault.resolve()
+    wiki_dir = v_root / "wiki"
+    if wiki_dir.is_symlink() or not wiki_dir.is_dir():
+        return {"success": False, "error": f"Vault wiki directory not found at {wiki_dir}"}
+    wiki_root = wiki_dir.resolve()
+
+    m_path = Path(manifest_path)
+    if m_path.is_symlink() or not m_path.is_file():
+        return {"success": False, "error": f"Dedup manifest not found: {m_path}"}
+    try:
+        manifest_obj = json.loads(m_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"success": False, "error": f"Invalid dedup manifest JSON: {exc}"}
+    if not isinstance(manifest_obj, dict) or not isinstance(manifest_obj.get("proposals"), list):
+        return {"success": False, "error": "Dedup manifest must contain a 'proposals' list"}
+
+    approved_props = [
+        p for p in manifest_obj["proposals"] if isinstance(p, dict) and p.get("approved") is True
+    ]
+    if not approved_props:
+        return {
+            "success": True,
+            "vault_path": str(v_root),
+            "applied_count": 0,
+            "skipped_count": len(manifest_obj["proposals"]),
+            "applied": [],
+        }
+
+    # Pre-verify containment, zero symlinks, and SHA-256 CAS on ALL approved proposals first
+    seen_merges: set[str] = set()
+    keep_rels: set[str] = set()
+    verified_ops: list[tuple[dict[str, Any], Path, Path]] = []
+    for prop in approved_props:
+        keep_rel = str(prop.get("keep_target") or "").strip()
+        merge_rel = str(prop.get("merge_source") or "").strip()
+        if not keep_rel or not merge_rel or keep_rel == merge_rel:
+            return {"success": False, "error": f"Invalid dedup proposal endpoints: {prop}"}
+        if merge_rel in seen_merges:
+            return {"success": False, "error": f"Duplicate merge_source in manifest: {merge_rel}"}
+        seen_merges.add(merge_rel)
+        keep_rels.add(keep_rel)
+
+        keep_resolved = _validate_dedup_note_rel(v_root, wiki_root, keep_rel)
+        merge_resolved = _validate_dedup_note_rel(v_root, wiki_root, merge_rel)
+        if keep_resolved is None or merge_resolved is None:
+            return {
+                "success": False,
+                "error": f"Proposal escapes writable wiki/ or hits symlink/protected path: {keep_rel} <- {merge_rel}",
+            }
+
+        exp_keep_sha = str(prop.get("keep_sha256") or "").strip()
+        exp_merge_sha = str(prop.get("merge_sha256") or "").strip()
+        cur_keep_sha = hashlib.sha256(keep_resolved.read_bytes()).hexdigest()
+        cur_merge_sha = hashlib.sha256(merge_resolved.read_bytes()).hexdigest()
+        if not exp_keep_sha or cur_keep_sha != exp_keep_sha:
+            return {
+                "success": False,
+                "cas_conflict": True,
+                "error": f"SHA-256 CAS conflict on keep_target '{keep_rel}'",
+            }
+        if not exp_merge_sha or cur_merge_sha != exp_merge_sha:
+            return {
+                "success": False,
+                "cas_conflict": True,
+                "error": f"SHA-256 CAS conflict on merge_source '{merge_rel}'",
+            }
+        verified_ops.append((prop, keep_resolved, merge_resolved))
+
+    if seen_merges & keep_rels:
+        return {
+            "success": False,
+            "error": f"Conflicting chain where note is both keep_target and merge_source: {sorted(seen_merges & keep_rels)}",
+        }
+
+    applied: list[dict[str, Any]] = []
+    log_entries: list[str] = []
+    today_iso = datetime.date.today().isoformat()
+
+    for prop, keep_resolved, merge_resolved in verified_ops:
+        keep_rel = str(prop["keep_target"]).strip()
+        merge_rel = str(prop["merge_source"]).strip()
+        keep_content, keep_utf8 = _read_text_preserve_eol(keep_resolved)
+        merge_content, merge_utf8 = _read_text_preserve_eol(merge_resolved)
+        if not keep_utf8 or not merge_utf8:
+            return {
+                "success": False,
+                "error": f"Refusing merge on non-UTF-8 note ({keep_rel} / {merge_rel})",
+            }
+
+        _, merge_yaml, _ = okf.split_frontmatter(merge_content)
+        merge_fm = okf.parse_frontmatter(merge_yaml, strict=False) if merge_yaml else {}
+        merge_title = (
+            str(merge_fm.get("title") or "").strip()
+            if isinstance(merge_fm, dict)
+            else ""
+        )
+
+        merged_text = _update_merged_frontmatter(
+            keep_content,
+            keep_resolved.stem,
+            merge_content,
+            merge_resolved.stem,
+        )
+        _atomic_write_text(keep_resolved, merged_text)
+
+        rewritten_files: list[str] = []
+        # Rewrite [[merge_source]] across living wiki/ notes and root index.md (never raw/, wiki/sources/, log.md, SKILL.md)
+        candidate_files: list[Path] = []
+        for root, dirs, files in os.walk(wiki_root, followlinks=False):
+            root_p = Path(root)
+            dirs[:] = sorted(
+                d for d in dirs if d not in IGNORED_DIR_NAMES and not (root_p / d).is_symlink()
+            )
+            for fname in sorted(files):
+                if fname.endswith(".md"):
+                    fp = root_p / fname
+                    if not fp.is_symlink():
+                        candidate_files.append(fp)
+        root_index = v_root / "index.md"
+        if root_index.is_file() and not root_index.is_symlink():
+            candidate_files.append(root_index)
+
+        for target_fp in candidate_files:
+            rel_t = target_fp.relative_to(v_root).as_posix()
+            if target_fp == merge_resolved:
+                continue
+            if rel_t != "index.md" and (
+                _is_protected_from_lint_fix(rel_t)
+                or Path(rel_t).name.lower() in RESERVED_BUNDLE_FILENAMES
+            ):
+                continue
+            orig_t, ok_u8 = _read_text_preserve_eol(target_fp)
+            if not ok_u8:
+                continue
+            new_t, did_rewrite = _rewrite_wikilinks_for_merge(
+                orig_t,
+                merge_rel,
+                merge_resolved.stem,
+                merge_title,
+                keep_rel,
+                keep_resolved.stem,
+            )
+            if did_rewrite:
+                _atomic_write_text(target_fp, new_t)
+                rewritten_files.append(rel_t)
+
+        merge_resolved.unlink()
+        applied.append(
+            {
+                "id": prop.get("id", ""),
+                "keep_target": keep_rel,
+                "merge_source": merge_rel,
+                "rewritten_files": rewritten_files,
+            }
+        )
+        log_entries.append(
+            f"## [{today_iso}] dedup | Merged [[{merge_resolved.stem}]] into [[{keep_resolved.stem}]]\n"
+            f"- Removed `{merge_rel}` into `{keep_rel}` and updated {len(rewritten_files)} referencing file(s).\n"
+        )
+
+    log_path = v_root / "log.md"
+    if not log_path.is_symlink():
+        nl = "\n"
+        if log_path.is_file():
+            existing_log, _ = _read_text_preserve_eol(log_path)
+            if "\r\n" in existing_log:
+                nl = "\r\n"
+        else:
+            existing_log = "# Audit Log\n\n"
+        entries_block = nl.join(log_entries).replace("\n", nl)
+        lines = existing_log.splitlines(keepends=True)
+        if lines and lines[0].lstrip().startswith("# "):
+            idx = 1
+            while idx < len(lines) and not lines[idx].strip():
+                idx += 1
+            new_log = "".join(lines[:idx]) + entries_block + nl + "".join(lines[idx:])
+        else:
+            new_log = f"# Audit Log{nl}{nl}{entries_block}{nl}{existing_log}"
+        _atomic_write_text(log_path, new_log)
+
+    return {
+        "success": True,
+        "vault_path": str(v_root),
+        "applied_count": len(applied),
+        "skipped_count": len(manifest_obj["proposals"]) - len(approved_props),
+        "applied": applied,
+    }
+
+
 def run_vault_lint(
     vault_root: Path,
     auto_fix: bool = False,
@@ -857,6 +1739,8 @@ def run_vault_lint(
     check_okf_upstream: bool = False,
     strict: bool = False,
     migrate_sources: bool = False,
+    strict_drift: bool = False,
+    include_mentions: bool = False,
 ) -> dict[str, Any]:
     """Audit a Knowledge Compiler vault against OKF v0.2 conformance and graph invariants."""
     raw_vault = Path(vault_root)
@@ -989,6 +1873,7 @@ def run_vault_lint(
     dangling_footnotes: list[dict[str, str]] = []
     stale_notes: list[dict[str, str]] = []
     workspace_profile_warnings: list[dict[str, str]] = []
+    scan_meta: dict[str, tuple[int, str, Any, str, str, int]] = {}
     trust_tier_counts = {
         "unverified": 0,
         "machine-confirmed": 0,
@@ -1026,8 +1911,9 @@ def run_vault_lint(
 
         fm_prefix, yaml_text, raw_body = okf.split_frontmatter(content)
         body_to_scan = raw_body if yaml_text is not None else content
-        sentinel_clean = _find_pua_sentinel_base(body_to_scan)[3]
+        pua_open, pua_close, pua_digit_base, sentinel_clean = _find_pua_sentinel_base(body_to_scan)
         masked_body, restore_body, has_unclosed_fence = _mask_markdown_code(body_to_scan)
+        fm_line_offset = fm_prefix.count("\n") if yaml_text is not None else 0
 
         if has_unclosed_fence:
             workspace_profile_warnings.append(
@@ -1088,7 +1974,9 @@ def run_vault_lint(
                     content = candidate_content
                     fm_prefix, yaml_text, raw_body = okf.split_frontmatter(content)
                     body_to_scan = raw_body if yaml_text is not None else content
+                    pua_open, pua_close, pua_digit_base, _ = _find_pua_sentinel_base(body_to_scan)
                     masked_body, restore_body, _ = _mask_markdown_code(body_to_scan)
+                    fm_line_offset = fm_prefix.count("\n") if yaml_text is not None else 0
 
         # 2. Opt-in deterministic migration of legacy string `sources:` inside wiki/
         if (
@@ -1181,6 +2069,14 @@ def run_vault_lint(
         fm = doc_info["frontmatter"] if doc_info["has_frontmatter"] else {}
         graph[rel_path]["frontmatter"] = fm if doc_info["has_frontmatter"] else None
         graph[rel_path]["has_fm"] = bool(doc_info["has_frontmatter"])
+        scan_meta[rel_path] = (
+            fm_line_offset,
+            masked_body,
+            restore_body,
+            pua_open,
+            pua_close,
+            pua_digit_base,
+        )
 
         if is_wiki_note:
             if is_reserved_wiki:
@@ -1362,6 +2258,13 @@ def run_vault_lint(
                 elif isinstance(val, str) and val.strip():
                     epistemic_edge_counts[ep_k.upper()] += 1
 
+    stale_syntheses = _detect_stale_syntheses(all_md_files, graph, name_to_rel)
+    unlinked_mentions = (
+        _scan_unlinked_mentions(all_md_files, graph, name_to_rel, scan_meta)
+        if include_mentions
+        else []
+    )
+
     is_healthy = (
         len(broken_links) == 0
         and len(table_invariant_violations) == 0
@@ -1377,6 +2280,7 @@ def run_vault_lint(
         or workspace_profile_warnings
     )
     strict_passed = is_healthy and (not has_strict_warnings)
+    strict_drift_passed = strict_passed and (not stale_syntheses)
 
     okf_upstream_report = check_upstream_okf_version() if check_okf_upstream else None
 
@@ -1408,12 +2312,16 @@ def run_vault_lint(
         "legacy_sources_notes": legacy_sources_notes,
         "dangling_footnotes": dangling_footnotes,
         "stale_notes": stale_notes,
+        "stale_syntheses": stale_syntheses,
+        "unlinked_mentions": unlinked_mentions,
         "workspace_profile_warnings": workspace_profile_warnings,
         "trust_tier_counts": trust_tier_counts,
         "epistemic_edge_counts": epistemic_edge_counts,
         "is_healthy": is_healthy,
         "strict": strict,
+        "strict_drift": strict_drift,
         "strict_passed": strict_passed,
+        "strict_drift_passed": strict_drift_passed,
     }
     if okf_upstream_report is not None:
         results["okf_upstream"] = okf_upstream_report
@@ -1528,6 +2436,24 @@ def _print_lint_report(results: dict[str, Any], *, auto_fix: bool, strict: bool)
             for mi in results["missing_from_index"]:
                 print(f"   • {mi}")
 
+    if results.get("stale_syntheses"):
+        label = "❌" if results.get("strict_drift") else "⚠️"
+        print(f"{label} Synthesis Drift Detected ({len(results['stale_syntheses'])}):")
+        for ss in results["stale_syntheses"]:
+            deps = ", ".join(
+                f"{d['file']} (updated {d['updated']})" for d in ss.get("newer_dependencies", [])
+            )
+            print(f"   • {ss['file']} (synthesis date {ss['synthesis_date']}): {deps}")
+
+    if results.get("unlinked_mentions"):
+        print(f"🔗 Unlinked Plain-Text Mentions ({len(results['unlinked_mentions'])}):")
+        for um in results["unlinked_mentions"][:50]:
+            print(
+                f"   • [{um['file']}:{um['line']}] '{um['matched_term']}' -> [[{Path(um['target']).stem}]]"
+            )
+        if len(results["unlinked_mentions"]) > 50:
+            print(f"   • ... and {len(results['unlinked_mentions']) - 50} more")
+
     if results.get("okf_upstream") is not None:
         print("-" * 60)
         _print_okf_upstream_report(results["okf_upstream"])
@@ -1610,6 +2536,28 @@ def main(argv: list[str] | None = None) -> None:
         help="Fail with exit code 1 on stale_notes, orphan_notes, missing_from_index, or legacy_sources_notes.",
     )
     parser.add_argument(
+        "--strict-drift",
+        action="store_true",
+        help="Fail with exit code 1 if stale_syntheses or strict warnings are present.",
+    )
+    parser.add_argument(
+        "--mentions",
+        action="store_true",
+        help="Scan living wiki/ prose for plain-text mentions of entities/concepts not yet [[wikilinked]].",
+    )
+    parser.add_argument(
+        "--dedup-manifest",
+        default=None,
+        metavar="OUT_JSON",
+        help="Read-only scan for duplicate entities/concepts; write review manifest JSON without modifying vault files.",
+    )
+    parser.add_argument(
+        "--apply-manifest",
+        default=None,
+        metavar="IN_JSON",
+        help="Apply ONLY approved entries in a dedup manifest using SHA-256 CAS verification.",
+    )
+    parser.add_argument(
         "--approve-human",
         default=None,
         metavar="NOTE_PATH",
@@ -1647,6 +2595,35 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     v_root = Path(args.vault) if args.vault else find_vault_root(Path.cwd())
+    if args.dedup_manifest is not None:
+        res = generate_dedup_manifest(v_root, Path(args.dedup_manifest))
+        if args.json:
+            print(json.dumps(res, indent=2))
+        elif res.get("success"):
+            print(
+                f"📋 Wrote {res['proposal_count']} dedup proposal(s) to {res['manifest_path']}"
+            )
+        else:
+            print(f"❌ Error: {res.get('error', 'Dedup scan failed')}", file=sys.stderr)
+        if not res.get("success"):
+            sys.exit(2)
+        return
+
+    if args.apply_manifest is not None:
+        res = apply_dedup_manifest(v_root, Path(args.apply_manifest))
+        if args.json:
+            print(json.dumps(res, indent=2))
+        elif res.get("success"):
+            print(
+                f"✅ Applied {res['applied_count']} approved dedup merge(s) "
+                f"(skipped {res['skipped_count']})."
+            )
+        else:
+            print(f"❌ Error: {res.get('error', 'Dedup apply failed')}", file=sys.stderr)
+        if not res.get("success"):
+            sys.exit(2)
+        return
+
     if args.check_okf_upstream and not (v_root / "wiki").exists() and not args.vault:
         report = check_upstream_okf_version()
         if args.json:
@@ -1664,6 +2641,8 @@ def main(argv: list[str] | None = None) -> None:
         check_okf_upstream=args.check_okf_upstream,
         strict=args.strict,
         migrate_sources=args.migrate_sources,
+        strict_drift=args.strict_drift,
+        include_mentions=args.mentions,
     )
 
     if not res.get("success", False):
@@ -1673,6 +2652,9 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(1)
 
     if args.strict and not res.get("strict_passed", False):
+        sys.exit(1)
+
+    if args.strict_drift and not res.get("strict_drift_passed", False):
         sys.exit(1)
 
 

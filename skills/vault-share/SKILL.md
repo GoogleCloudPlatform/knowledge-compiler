@@ -81,12 +81,9 @@ Before committing or opening a PR on the shared repository, run `sanitize_check.
 python3 <plugin_dir>/scripts/sanitize_check.py "${OKF_PATTERNS_PATH:-$HOME/shared-okf-patterns}" --vault ~/ObsidianVault --fix --strict
 ```
 
-### 5. Commit & Open a Pull Request
-Push to a feature branch and open a Pull Request for review:
+### 5. One-Command Isolated Worktree PR
+Use `--open-pr` to stage the sanitized pattern on an isolated temporary `git worktree` branch (leaving your primary checkout untouched), commit, push, and open a Pull Request via `gh`:
 ```bash
-git -C "${OKF_PATTERNS_PATH:-$HOME/shared-okf-patterns}" checkout -b feat/<pattern-slug>
-git -C "${OKF_PATTERNS_PATH:-$HOME/shared-okf-patterns}" add -A
-git -C "${OKF_PATTERNS_PATH:-$HOME/shared-okf-patterns}" commit -m "feat(patterns): share <Pattern> pattern"
-git -C "${OKF_PATTERNS_PATH:-$HOME/shared-okf-patterns}" push -u origin feat/<pattern-slug>
-gh pr create --head feat/<pattern-slug> --base main --title "feat(patterns): add <Pattern> pattern" --body "Sanitized OKF v0.2 pattern contribution."
+python3 <plugin_dir>/scripts/sync_patterns.py share \
+  "wiki/concepts/<Pattern>.md" --repo-dir "${OKF_PATTERNS_PATH:-$HOME/shared-okf-patterns}" --open-pr --base main
 ```

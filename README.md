@@ -1,6 +1,6 @@
 # Knowledge Compiler (`knowledge-compiler`)
 
-[![Version](https://img.shields.io/badge/version-1.0.1-1A73E8?style=flat-square)](https://github.com/GoogleCloudPlatform/knowledge-compiler)
+[![Version](https://img.shields.io/badge/version-1.1.0-1A73E8?style=flat-square)](https://github.com/GoogleCloudPlatform/knowledge-compiler)
 [![OKF Standard](https://img.shields.io/badge/Open_Knowledge_Format-OKF_v0.2-34A853?style=flat-square)](https://github.com/GoogleCloudPlatform/open-knowledge-format)
 [![License](https://img.shields.io/badge/license-Apache_2.0-FBBC04?style=flat-square)](LICENSE)
 
@@ -25,7 +25,8 @@
 | **2D/3D WebGL Knowledge Graph** | `/vault-graph` | `scripts/vault_graph.py` |
 | **Sanitized Pattern Sharing** | `/vault-share` & `/vault-pull` | `scripts/sync_patterns.py` |
 | **Strict DLP & Link Sanitizer** | `vault-sanitize-check` | `scripts/sanitize_check.py` |
-| **Closed-Loop Skill Evolution (Experimental)** | `/wikiskill` | `scripts/analyze_trace.py` |
+| **Lifecycle Hook Manager** | `vault-hooks` | `scripts/vault_hooks.py` |
+| **Closed-Loop Skill Evolution** | `/wikiskill` | `scripts/analyze_trace.py`, `scripts/wikiskill_eval.py` |
 <!-- mdformat on -->
 
 ---
@@ -35,8 +36,8 @@
 - **10 Agent Skills (`skills/*/SKILL.md`)**: `knowledge-compiler`, `ingest`, `distill-session`, `vault-correct`, `vault-query`, `vault-lint`, `vault-graph`, `vault-share`, `vault-pull`, and `wikiskill`.
 - **1 Workspace Rule (`rules/AGENTS.md`)**: Progressive disclosure and OKF v0.2 formatting guidelines.
 - **3 Lifecycle Hooks (`hooks.json`, all opt-in / disabled by default)**:
-  - `wikiskill-error-recorder` (`PostToolUse`, **disabled by default**): When enabled, captures redacted local tool failure diagnostics to `$XDG_STATE_HOME/knowledge-compiler/logs/error_traces.jsonl` (`~/.local/state/knowledge-compiler/logs/error_traces.jsonl`) to power `/wikiskill`.
-  - `vault-session-start` & `vault-stop-hook` (**disabled by default**): Optional Git pull/push synchronization hooks for users who explicitly opt in to backing their vault with a Git `origin` remote.
+  - `wikiskill-error-recorder` (`PostToolUse`, **disabled by default**): When enabled via `python3 -m scripts.vault_hooks enable --hooks wikiskill`, captures redacted local tool failure diagnostics to `$XDG_STATE_HOME/knowledge-compiler/logs/error_traces.jsonl` (`~/.local/state/knowledge-compiler/logs/error_traces.jsonl`) to power `/wikiskill`.
+  - `vault-session-start` & `vault-stop-hook` (**disabled by default**): Optional Git pull/push synchronization hooks enabled in one command via `python3 -m scripts.vault_hooks enable` for users who explicitly opt in to backing their vault with a Git `origin` remote.
 - **1 Interactive Sidecar (`sidecars/vault_graph`)**: Local loopback 2D/3D WebGL Knowledge Graph server (`127.0.0.1:8765`).
 
 ---
@@ -53,8 +54,9 @@ python3 -m pip install -e ".[extract]"
 # Initialize an OKF v0.2 Knowledge Vault
 python3 scripts/init_vault.py --target ~/ObsidianVault
 
-# Optional: manual install for Gemini CLI / non-Marketplace setups (Marketplace users skip this)
+# Optional: manual install & opt-in lifecycle hooks for non-Marketplace setups
 python3 scripts/install_plugin.py
+python3 scripts/vault_hooks.py enable
 ```
 
 ---
@@ -62,14 +64,14 @@ python3 scripts/install_plugin.py
 ## Hooks & Local Data Privacy
 
 - **100% Local Default Operation**: All compiled Markdown notes (`wiki/`, `index.md`, `log.md`), SHA-256 ingestion caches (`.ingest_cache.json`), and redacted error traces remain on your local filesystem.
-- **User-Initiated Network Calls Only**: Outbound HTTP requests occur only when you explicitly pass a web URL to `scripts/extract_source.py`, pass `--check-okf-upstream` to `scripts/vault_lint.py`, or manually enable the opt-in Git `origin` sync hooks in `hooks.json`.
+- **User-Initiated Network Calls Only**: Outbound HTTP requests occur only when you explicitly pass a web URL to `scripts/extract_source.py`, pass `--check-okf-upstream` to `scripts/vault_lint.py`, run `vault-sync-patterns share --open-pr`, or manually enable the opt-in Git `origin` sync hooks via `vault-hooks enable`.
 
 ---
 
 ## Troubleshooting, Feedback & Security
 
 - **Troubleshooting**: Run `python3 scripts/vault_lint.py --fix` to repair broken `[[wikilinks]]` or frontmatter formatting. If port `8765` is in use, pass `--port <PORT>` to `scripts/vault_graph.py`.
-- **Stability & Compatibility**: See [STABILITY.md](STABILITY.md) for the frozen `1.x` CLI surface (`vault-*`), exit code (`0`/`1`/`2`), JSON output, and OKF v0.2 bundle root guarantees (note: `/wikiskill` and `vault-analyze-trace` are marked **Experimental** in `v1.0.0`).
+- **Stability & Compatibility**: See [STABILITY.md](STABILITY.md) for the frozen `1.x` CLI surface (`vault-*`), exit code (`0`/`1`/`2`), JSON output, and OKF v0.2 bundle root guarantees (`/wikiskill`, `vault-analyze-trace`, and `vault-wikiskill-eval` graduated to `Stable` in `v1.1.0` while preserving zero unattended instruction-file edits).
 - **Feedback & Issues**: Report bugs or feature requests at [https://github.com/GoogleCloudPlatform/knowledge-compiler/issues](https://github.com/GoogleCloudPlatform/knowledge-compiler/issues).
 - **Security**: See [SECURITY.md](SECURITY.md) for vulnerability reporting instructions (`https://g.co/vulnz`).
 
@@ -77,8 +79,14 @@ python3 scripts/install_plugin.py
 
 ## Release History
 
-### **v1.0.1** (`Latest`)
-- **`1.x` Stability & Unified `vault-*` CLI Contract ([STABILITY.md](STABILITY.md))**: Freezes `wiki/` as the OKF v0.2 bundle root, standardizes `vault-init`, `vault-extract`, `vault-lint`, `vault-correct`, `vault-query`, `vault-graph`, `vault-sync-patterns`, `vault-sanitize-check`, and `kc-install-plugin` with deterministic exit codes (`0`/`1`/`2`), and marks `/wikiskill` (`vault-analyze-trace`) as Experimental.
+### **v1.1.0** (`Latest`)
+- **Opt-In Lifecycle Hook Manager (`vault-hooks`) & Upgrade Preservation**: Adds `scripts/vault_hooks.py` (`status`, `enable`, `disable`) handling both writable plugin directories and read-only (`EROFS`) Marketplace mounts via non-colliding `kc-user-*` entries in user config, while `install_plugin.py` preserves existing `"enabled"` booleans across upgrades.
+- **`/wikiskill` Graduated to `Stable` (`vault-wikiskill-eval` & `vault-analyze-trace --propose`)**: Adds deterministic offline Asymmetric Rollback Evaluation (`scripts/wikiskill_eval.py`) with SHA-256 CAS updates strictly limited to `wiki/skill-impact.md`, plus redacted out-of-vault proposal clustering (`0700`/`0600`) in `scripts/analyze_trace.py`.
+- **Graph Intelligence (`vault-lint` & `vault-graph`)**: Adds synthesis drift detection (`stale_syntheses`, `--strict-drift`), plain-text unlinked mention scanning (`--mentions`), two-phase CAS entity/concept deduplication (`--dedup-manifest` / `--apply-manifest`), one-command isolated worktree pattern PRs (`vault-sync-patterns share --open-pr`), and lazy `/api/note` markdown loading in `vault_graph.py`.
+- **Open Source Compliance CI Gate (`tests/test_oss_cross_compliance.py`)**: Enforces Apache-2.0 headers, UTF-8/LF endings, clean-room disclaimers, and zero secret/sensitive tokens on every CI run.
+
+### **v1.0.0**
+- **`1.x` Stability & Unified `vault-*` CLI Contract ([STABILITY.md](STABILITY.md))**: Freezes `wiki/` as the OKF v0.2 bundle root, standardizes `vault-init`, `vault-extract`, `vault-lint`, `vault-correct`, `vault-query`, `vault-graph`, `vault-sync-patterns`, `vault-sanitize-check`, and `kc-install-plugin` with deterministic exit codes (`0`/`1`/`2`).
 - **Zero-Dependency In-Memory BM25 Retrieval & Incremental Graph Cache**: Adds `vault-query` (`scripts/vault_query.py`) with identifier splitting, CJK bigrams, duplicate check (`--check-duplicate`), and raw fence isolation (`--include-raw`), plus `(mtime_ns, ctime_ns, size)` incremental caching in `vault-graph`.
 - **Pluggable Federation Architecture**: `FederationProvider` interface (`scripts/federation_provider.py`) supporting `LocalGitPatternProvider` for a Git-backed shared patterns repository.
 - **Marketplace Native Packaging**: Top-level `plugin.json`, `hooks.json`, `skills/`, `rules/`, and `sidecars/vault_graph` ready for one-click installation.

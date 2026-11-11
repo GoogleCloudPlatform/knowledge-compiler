@@ -1133,14 +1133,35 @@ def _escape_json_for_html_script(json_str: str) -> str:
 
 
 class _CachedGraphEntry:
-    __slots__ = ("fingerprint", "graph_data", "json_str", "json_bytes", "html_payload_json")
+    __slots__ = (
+        "fingerprint",
+        "graph_data",
+        "json_str",
+        "json_bytes",
+        "slim_json_bytes",
+        "html_payload_json",
+        "lazy_html_payload_json",
+    )
 
     def __init__(self, fingerprint: tuple[Any, ...], graph_data: dict[str, Any]) -> None:
         self.fingerprint = fingerprint
         self.graph_data = graph_data
         self.json_str: str | None = None
         self.json_bytes: bytes | None = None
+        self.slim_json_bytes: bytes | None = None
         self.html_payload_json: str | None = None
+        self.lazy_html_payload_json: str | None = None
+
+
+def _build_slim_graph_dict(graph_data: dict[str, Any]) -> dict[str, Any]:
+    """Return a shallow clone of `graph_data` with full node markdown stripped for lazy loading."""
+    slim_nodes = [
+        {**nd, "markdown": "", "lazyMarkdown": True}
+        for nd in (graph_data.get("nodes") or ())
+    ]
+    slim_graph = dict(graph_data)
+    slim_graph["nodes"] = slim_nodes
+    return slim_graph
 
 
 class VaultGraphCache:
@@ -1270,6 +1291,7 @@ class VaultGraphCache:
         ce_patterns_root: Path | None = None,
         *,
         include_remote_tier: bool = False,
+        slim: bool = False,
         **extra_kwargs: Any,
     ) -> bytes:
         """Return cached UTF-8 serialized JSON bytes for `/api/graph`."""
@@ -1279,6 +1301,14 @@ class VaultGraphCache:
             include_remote_tier=include_remote_tier,
             **extra_kwargs,
         )
+        if slim:
+            if entry.slim_json_bytes is None:
+                entry.slim_json_bytes = json.dumps(
+                    _build_slim_graph_dict(entry.graph_data),
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            return entry.slim_json_bytes
+
         cached_bytes = entry.json_bytes
         if cached_bytes is not None:
             return cached_bytes
@@ -1298,6 +1328,7 @@ class VaultGraphCache:
         include_remote_tier: bool = False,
         sidecar_mode: bool = False,
         csp_nonce: str | None = None,
+        lazy_markdown: bool = False,
         **extra_kwargs: Any,
     ) -> str:
         """Render the HTML visualizer using the cached pre-escaped JSON payload."""
@@ -1307,14 +1338,21 @@ class VaultGraphCache:
             include_remote_tier=include_remote_tier,
             **extra_kwargs,
         )
-        payload_json = entry.html_payload_json
-        if payload_json is None:
-            json_str = entry.json_str
-            if json_str is None:
-                json_str = json.dumps(entry.graph_data, ensure_ascii=False)
-                entry.json_str = json_str
-            payload_json = _escape_json_for_html_script(json_str)
-            entry.html_payload_json = payload_json
+        if lazy_markdown:
+            if entry.lazy_html_payload_json is None:
+                entry.lazy_html_payload_json = _serialize_graph_html_payload(
+                    _build_slim_graph_dict(entry.graph_data)
+                )
+            payload_json = entry.lazy_html_payload_json
+        else:
+            payload_json = entry.html_payload_json
+            if payload_json is None:
+                json_str = entry.json_str
+                if json_str is None:
+                    json_str = json.dumps(entry.graph_data, ensure_ascii=False)
+                    entry.json_str = json_str
+                payload_json = _escape_json_for_html_script(json_str)
+                entry.html_payload_json = payload_json
         return _render_graph_html_from_payload(
             payload_json, sidecar_mode=sidecar_mode, csp_nonce=csp_nonce
         )
@@ -4184,26 +4222,72 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       renderConnChips("list-inbound", inList);
       renderConnChips("list-outbound", outList);
 
-      // Markdown Preview
+      // Markdown Preview (lazy-loaded on demand via /api/note when slim initial HTML is active)
+      function bindInspectorWikilinks(mdEl) {
+        mdEl.querySelectorAll(".md-wikilink").forEach(linkEl => {
+          linkEl.addEventListener("click", e => {
+            e.preventDefault();
+            const rawTarget = (linkEl.getAttribute("data-wikilink") || "").toLowerCase();
+            const baseTarget = rawTarget.split("/").pop().replace(/\.md$/, "");
+            const resolvedId =
+              nameLookup.get(rawTarget) ||
+              nameLookup.get(rawTarget.replace(/\.md$/, "")) ||
+              nameLookup.get(baseTarget);
+            if (resolvedId && nodeById.has(resolvedId)) {
+              const targetNode = nodeById.get(resolvedId);
+              state.enabledGroups.add(targetNode.group);
+              renderCategoryFilters();
+              selectAndInspectNode(targetNode, true);
+            }
+          });
+        });
+      }
+
+      async function ensureNodeMarkdown(node) {
+        if (!node || !node.lazyMarkdown || (node.markdown && node.markdown.length > 0)) {
+          return node ? (node.markdown || "") : "";
+        }
+        if (node._markdownPromise) {
+          return node._markdownPromise;
+        }
+        const includeAce = state.aceBrainEnabled ? "1" : "0";
+        node._markdownPromise = fetch(
+          `/api/note?id=${encodeURIComponent(node.id)}&include_ace=${includeAce}`,
+          {
+            method: "GET",
+            credentials: "same-origin",
+            headers: { "X-KC-Request": "1" },
+          }
+        )
+          .then(res => (res.ok ? res.json() : null))
+          .then(payload => {
+            if (payload && typeof payload.markdown === "string") {
+              node.markdown = payload.markdown;
+              node.lazyMarkdown = false;
+              node._hubIndexed = false;
+            }
+            return node.markdown || "";
+          })
+          .catch(() => node.markdown || "")
+          .finally(() => {
+            delete node._markdownPromise;
+          });
+        return node._markdownPromise;
+      }
+
       const mdEl = document.getElementById("inspector-markdown");
-      mdEl.innerHTML = renderMarkdownWithWikilinks(node.markdown);
-      mdEl.querySelectorAll(".md-wikilink").forEach(linkEl => {
-        linkEl.addEventListener("click", e => {
-          e.preventDefault();
-          const rawTarget = (linkEl.getAttribute("data-wikilink") || "").toLowerCase();
-          const baseTarget = rawTarget.split("/").pop().replace(/\.md$/, "");
-          const resolvedId =
-            nameLookup.get(rawTarget) ||
-            nameLookup.get(rawTarget.replace(/\.md$/, "")) ||
-            nameLookup.get(baseTarget);
-          if (resolvedId && nodeById.has(resolvedId)) {
-            const targetNode = nodeById.get(resolvedId);
-            state.enabledGroups.add(targetNode.group);
-            renderCategoryFilters();
-            selectAndInspectNode(targetNode, true);
+      if (node.lazyMarkdown && !node.markdown) {
+        mdEl.innerHTML = "<p><em>Loading note content...</em></p>";
+        ensureNodeMarkdown(node).then(loadedMd => {
+          if (state.inspectedNode === node) {
+            mdEl.innerHTML = renderMarkdownWithWikilinks(loadedMd);
+            bindInspectorWikilinks(mdEl);
           }
         });
-      });
+      } else {
+        mdEl.innerHTML = renderMarkdownWithWikilinks(node.markdown);
+        bindInspectorWikilinks(mdEl);
+      }
     }
 
     // =========================================================================
@@ -4921,6 +5005,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       }
       promoteModal.classList.add("visible");
       promoteModalBody.innerHTML = `<div style="color:var(--text-muted);">Running 4-Gate Schema Gate Preflight &amp; DLP Isolation Audit on <code>${escapeHtml(node.id)}</code>...</div>`;
+      await ensureNodeMarkdown(node);
 
       const relPath = node.ceRelPath || node.id.replace(/^shared-okf-patterns:\/\/|^shared-okf-patterns\//, "");
       let payload = null;
@@ -6166,6 +6251,7 @@ def create_graph_request_handler(
                     include_remote_tier=False,
                     sidecar_mode=sidecar_mode,
                     csp_nonce=csp_nonce,
+                    lazy_markdown=True,
                 )
                 cleanup_script = (
                     f'<script nonce="{csp_nonce}">'
@@ -6200,9 +6286,66 @@ def create_graph_request_handler(
                     "true",
                     "yes",
                 )
+                slim = q_params.get("slim", ["0"])[0].lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                )
                 body = graph_cache.get_json_bytes(
+                    vault_root, include_remote_tier=include_ace, slim=slim
+                )
+                self.send_response(http.HTTPStatus.OK)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self._cors_headers()
+                self.end_headers()
+                self.wfile.write(body)
+            elif path == "/api/note":
+                q_params = urllib.parse.parse_qs(parsed.query)
+                note_id = (q_params.get("id") or [""])[0]
+                if not note_id:
+                    body = b'{"error": "Missing required id parameter"}'
+                    self.send_response(http.HTTPStatus.BAD_REQUEST)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self._cors_headers()
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                include_ace = q_params.get("include_ace", ["0"])[0].lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                )
+                graph_snapshot = graph_cache.get_or_build(
                     vault_root, include_remote_tier=include_ace
                 )
+                matched = next(
+                    (
+                        nd
+                        for nd in graph_snapshot.get("nodes", ())
+                        if nd.get("id") == note_id
+                    ),
+                    None,
+                )
+                if matched is None:
+                    body = b'{"error": "Note not found"}'
+                    self.send_response(http.HTTPStatus.NOT_FOUND)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self._cors_headers()
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                note_payload = {
+                    "id": matched.get("id", ""),
+                    "label": matched.get("label", ""),
+                    "markdown": matched.get("markdown", ""),
+                    "excerpt": matched.get("excerpt", ""),
+                    "updated": matched.get("updated", ""),
+                    "sourcePlane": matched.get("sourcePlane", ""),
+                }
+                body = json.dumps(note_payload, ensure_ascii=False).encode("utf-8")
                 self.send_response(http.HTTPStatus.OK)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))

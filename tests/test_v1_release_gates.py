@@ -76,6 +76,8 @@ EXPECTED_CONSOLE_SCRIPTS = (
     "vault-sync-patterns",
     "vault-sanitize-check",
     "vault-analyze-trace",
+    "vault-wikiskill-eval",
+    "vault-hooks",
     "kc-install-plugin",
 )
 
@@ -1436,34 +1438,36 @@ class TestV1ReleaseGates(unittest.TestCase):
             self.assertGreaterEqual(g_10k["stats"]["wikiNotes"], 10000)
 
     def test_gate7_version_entrypoints_and_clean_room_3p_gate(self) -> None:
-        """Gate 7: STABILITY.md, 1.0.0 version parity, 10 console entrypoints, and clean-room 3P gate."""
+        """Gate 7: STABILITY.md, 1.1.0 version parity, 12 console entrypoints, and clean-room 3P gate."""
         stability_path = REPO_ROOT / "STABILITY.md"
         self.assertTrue(stability_path.is_file(), "Missing STABILITY.md")
         stability_txt = stability_path.read_text(encoding="utf-8")
-        self.assertIn("Experimental", stability_txt)
+        self.assertIn("Graduated", stability_txt)
         self.assertIn("wikiskill", stability_txt)
         self.assertIn("analyze_trace", stability_txt)
+        self.assertIn("wikiskill_eval", stability_txt)
+        self.assertIn("vault_hooks", stability_txt)
 
-        # Version "1.0.1" parity across plugin.json, pyproject.toml, and scripts/__init__.py
+        # Version "1.1.0" parity across plugin.json, pyproject.toml, and scripts/__init__.py
         manifest = json.loads((REPO_ROOT / "plugin.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest.get("version"), "1.0.1")
+        self.assertEqual(manifest.get("version"), "1.1.0")
 
         py_ver, console_scripts = _parse_pyproject_v1_fields(REPO_ROOT / "pyproject.toml")
-        self.assertEqual(py_ver, "1.0.1")
+        self.assertEqual(py_ver, "1.1.0")
         pyproject_raw = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
         self.assertIn("Development Status :: 5 - Production/Stable", pyproject_raw)
         self.assertNotIn("Development Status :: 4 - Beta", pyproject_raw)
 
         scripts_pkg = importlib.import_module("scripts")
-        self.assertEqual(getattr(scripts_pkg, "__version__", None), "1.0.1")
+        self.assertEqual(getattr(scripts_pkg, "__version__", None), "1.1.0")
 
-        # All 10 primary vault-* / kc-* console script targets import & resolve to callable functions
+        # All 12 primary vault-* / kc-* console script targets import & resolve to callable functions
         for script_name in EXPECTED_CONSOLE_SCRIPTS:
             self.assertIn(script_name, console_scripts, msg=f"Missing console script {script_name}")
 
         if not IS_3P_BUNDLE:
-            # Verify all 18 scripts (10 primary + 8 legacy aliases) are retained and callable in 1P
-            self.assertEqual(len(console_scripts), 18)
+            # Verify all 20 scripts (12 primary + 8 legacy aliases) are retained and callable in 1P
+            self.assertEqual(len(console_scripts), 20)
             for legacy_name in (
                 "init-vault",
                 "extract-source",
@@ -1493,7 +1497,7 @@ class TestV1ReleaseGates(unittest.TestCase):
 
         import build_oss_release
 
-        oss_out = self.tmp_dir / "oss_release_v101"
+        oss_out = self.tmp_dir / "oss_release_v110"
         prev_skip = os.environ.get("_KC_SKIP_NESTED_GATE7")
         os.environ["_KC_SKIP_NESTED_GATE7"] = "1"
         try:
@@ -1501,7 +1505,7 @@ class TestV1ReleaseGates(unittest.TestCase):
                 output_dir=oss_out,
                 slug="knowledge-compiler",
                 display_name="Knowledge Compiler",
-                version="1.0.1",
+                version="1.1.0",
                 run_tests=True,
             )
         finally:
@@ -1510,12 +1514,12 @@ class TestV1ReleaseGates(unittest.TestCase):
             else:
                 os.environ["_KC_SKIP_NESTED_GATE7"] = prev_skip
 
-        self.assertEqual(summary["version"], "1.0.1")
+        self.assertEqual(summary["version"], "1.1.0")
         self.assertEqual(summary["leakage_violations"], 0)
         self.assertTrue((oss_out / "STABILITY.md").is_file())
         self.assertTrue((oss_out / "scripts" / "__init__.py").is_file())
         oss_manifest = json.loads((oss_out / "plugin.json").read_text(encoding="utf-8"))
-        self.assertEqual(oss_manifest.get("version"), "1.0.1")
+        self.assertEqual(oss_manifest.get("version"), "1.1.0")
 
 
 if __name__ == "__main__":

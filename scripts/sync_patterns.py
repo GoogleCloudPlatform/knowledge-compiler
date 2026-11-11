@@ -31,6 +31,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import unicodedata
 import urllib.parse
 from pathlib import Path
@@ -1779,6 +1780,213 @@ def share_pattern(
     }
 
 
+def open_pattern_pr(
+    pattern_file: Path,
+    target_repo_path: Path,
+    vault_root: Optional[Path] = None,
+    branch_name: Optional[str] = None,
+    base_branch: str = "main",
+    pr_title: Optional[str] = None,
+    dry_run: bool = False,
+) -> Dict:
+    """
+    Share a single sanitized pattern into an isolated temporary git worktree of
+    `target_repo_path`, commit, push, and open a Pull Request via `gh pr create`.
+    """
+    target_repo_path = Path(target_repo_path).resolve()
+    if not target_repo_path.is_dir():
+        raise ValueError(f"Target repository directory not found: {target_repo_path}")
+
+    git_check = subprocess.run(
+        ["git", "-C", str(target_repo_path), "rev-parse", "--git-dir"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if git_check.returncode != 0:
+        raise ValueError(
+            f"Target directory is not a Git repository: {target_repo_path}"
+        )
+
+    slug = re.sub(r"[^a-z0-9]+", "-", Path(pattern_file).stem.lower()).strip("-") or "pattern"
+    branch = (branch_name or f"docs/share-{slug}").strip()
+    if not branch or branch.startswith("-") or ".." in branch or any(c.isspace() for c in branch):
+        raise ValueError(f"Invalid Git branch name: {branch!r}")
+    base = (base_branch or "main").strip()
+    if not base or base.startswith("-") or ".." in base or any(c.isspace() for c in base):
+        raise ValueError(f"Invalid base branch name: {base!r}")
+
+    if dry_run:
+        dry_res = share_pattern(
+            pattern_file, target_repo_path, vault_root=vault_root, dry_run=True
+        )
+        return {
+            "success": True,
+            "dry_run": True,
+            "branch": branch,
+            "base": base,
+            "source": dry_res["source"],
+            "destination": dry_res["destination"],
+            "scrub_notes": dry_res["scrub_notes"],
+            "pr_url": None,
+        }
+
+    # Resolve start ref cleanly without modifying the caller's checked-out branch
+    start_ref = "HEAD"
+    for candidate_ref in (f"origin/{base}", base):
+        chk = subprocess.run(
+            ["git", "-C", str(target_repo_path), "rev-parse", "--verify", candidate_ref],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if chk.returncode == 0:
+            start_ref = candidate_ref
+            break
+
+    wt_parent = Path(tempfile.mkdtemp(prefix="kc_share_pr_"))
+    wt_dir = wt_parent / "wt"
+    try:
+        wt_add = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(target_repo_path),
+                "worktree",
+                "add",
+                "-B",
+                branch,
+                str(wt_dir),
+                start_ref,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if wt_add.returncode != 0:
+            raise ValueError(
+                f"Failed to create isolated git worktree: {(wt_add.stderr or wt_add.stdout).strip()}"
+            )
+
+        res = share_pattern(
+            pattern_file, wt_dir, vault_root=vault_root, dry_run=False
+        )
+
+        validator_script = wt_dir / "scripts" / "validate_patterns.py"
+        if validator_script.is_file():
+            val_proc = subprocess.run(
+                [sys.executable, str(validator_script)],
+                cwd=str(wt_dir),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if val_proc.returncode != 0:
+                raise SecurityException(
+                    f"Target repository validation failed:\n{(val_proc.stderr or val_proc.stdout).strip()}"
+                )
+
+        stage_candidates = [res["destination"], "index.md", "log.md"]
+        to_stage = [p for p in stage_candidates if (wt_dir / p).exists()]
+        subprocess.run(
+            ["git", "-C", str(wt_dir), "add", "--", *to_stage],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+        diff_chk = subprocess.run(
+            ["git", "-C", str(wt_dir), "diff", "--cached", "--quiet"],
+            capture_output=True,
+            check=False,
+        )
+        title = (pr_title or f"docs(patterns): share {Path(pattern_file).stem} pattern").strip()
+        if diff_chk.returncode != 0:
+            commit_proc = subprocess.run(
+                ["git", "-C", str(wt_dir), "commit", "-m", title],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if commit_proc.returncode != 0:
+                raise ValueError(
+                    f"git commit failed: {(commit_proc.stderr or commit_proc.stdout).strip()}"
+                )
+
+        push_proc = subprocess.run(
+            ["git", "-C", str(wt_dir), "push", "-u", "origin", branch],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if push_proc.returncode != 0:
+            raise ValueError(
+                f"git push failed for branch '{branch}': {(push_proc.stderr or push_proc.stdout).strip()}"
+            )
+
+        pr_body = (
+            f"Shares sanitized pattern `{res['destination']}` with full OKF v0.2 "
+            "compliance and zero private identifiers."
+        )
+        gh_proc = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "create",
+                "--base",
+                base,
+                "--head",
+                branch,
+                "--title",
+                title,
+                "--body",
+                pr_body,
+            ],
+            cwd=str(wt_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if gh_proc.returncode != 0:
+            raise ValueError(
+                f"gh pr create failed: {(gh_proc.stderr or gh_proc.stdout).strip()}"
+            )
+
+        pr_url = ""
+        for line in reversed(gh_proc.stdout.splitlines()):
+            cand = line.strip()
+            if cand.startswith(("https://", "http://")):
+                pr_url = cand
+                break
+        if not pr_url:
+            pr_url = gh_proc.stdout.strip()
+
+        return {
+            "success": True,
+            "dry_run": False,
+            "branch": branch,
+            "base": base,
+            "source": res["source"],
+            "destination": res["destination"],
+            "scrub_notes": res["scrub_notes"],
+            "pr_url": pr_url,
+        }
+    except subprocess.CalledProcessError as exc:
+        raise ValueError(f"Git operation failed: {(exc.stderr or exc.stdout or str(exc)).strip()}") from exc
+    finally:
+        subprocess.run(
+            ["git", "-C", str(target_repo_path), "worktree", "remove", "--force", str(wt_dir)],
+            capture_output=True,
+            check=False,
+        )
+        subprocess.run(
+            ["git", "-C", str(target_repo_path), "worktree", "prune"],
+            capture_output=True,
+            check=False,
+        )
+        shutil.rmtree(wt_parent, ignore_errors=True)
+
+
 def _extract_updated_date(text: str) -> str:
     """Extract ISO `updated: YYYY-MM-DD` frontmatter timestamp if present."""
     if not text.startswith("---"):
@@ -2165,6 +2373,26 @@ def main():
         action="store_true",
         help="Perform privacy checks and preview diff without writing.",
     )
+    p_share.add_argument(
+        "--open-pr",
+        action="store_true",
+        help="Stage the shared pattern on an isolated git worktree branch, push, and open a PR via gh.",
+    )
+    p_share.add_argument(
+        "--branch",
+        default=None,
+        help="Feature branch name for --open-pr (defaults to docs/share-<slug>).",
+    )
+    p_share.add_argument(
+        "--base",
+        default="main",
+        help="Base branch for --open-pr (default: main).",
+    )
+    p_share.add_argument(
+        "--pr-title",
+        default=None,
+        help="Custom commit & Pull Request title for --open-pr.",
+    )
 
     # Subcommand: pull
     p_pull = subparsers.add_parser(
@@ -2309,6 +2537,11 @@ def main():
                 )
                 sys.exit(1)
 
+            if args.open_pr and args.all_clean:
+                raise ValueError(
+                    "--open-pr requires a single pattern file (cannot be combined with --all-clean)."
+                )
+
             if args.all_clean:
                 audit_res = audit_vault(v_root)
                 clean_list = audit_res["clean"]
@@ -2340,12 +2573,33 @@ def main():
                 else:
                     f_path = f_path.resolve()
 
-                res = share_pattern(
-                    f_path, target_dir, vault_root=v_root, dry_run=args.dry_run
-                )
-                print(
-                    f"✅ Successfully shared '{res['source']}' -> '{res['destination']}'"
-                )
+                if args.open_pr:
+                    res = open_pattern_pr(
+                        f_path,
+                        target_dir,
+                        vault_root=v_root,
+                        branch_name=args.branch,
+                        base_branch=args.base,
+                        pr_title=args.pr_title,
+                        dry_run=args.dry_run,
+                    )
+                    if res.get("dry_run"):
+                        print(
+                            f"🧪 Dry-run PR preview for '{res['source']}' -> '{res['destination']}' "
+                            f"(branch: {res['branch']} -> {res['base']})"
+                        )
+                    else:
+                        print(
+                            f"🚀 Opened PR {res['pr_url']} for '{res['source']}' -> '{res['destination']}' "
+                            f"(branch: {res['branch']})"
+                        )
+                else:
+                    res = share_pattern(
+                        f_path, target_dir, vault_root=v_root, dry_run=args.dry_run
+                    )
+                    print(
+                        f"✅ Successfully shared '{res['source']}' -> '{res['destination']}'"
+                    )
                 if res["scrub_notes"]:
                     print("   Applied Sanitization:")
                     for n in res["scrub_notes"]:

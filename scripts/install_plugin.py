@@ -21,8 +21,10 @@ Knowledge Compiler plugin (`plugin.json`, `hooks.json`, `rules/AGENTS.md`,
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import shutil
+import sys
 from pathlib import Path
 
 _GLOBAL_PLUGIN_REL = ".agent/plugins/knowledge-compiler"
@@ -32,7 +34,7 @@ PLUGIN_MANIFEST = {
     "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
     "name": "knowledge-compiler",
     "displayName": "Knowledge Compiler",
-    "version": "1.0.1",
+    "version": "1.1.0",
     "description": (
         "Compile PDFs, slides, docs, and agent sessions into a local Open Knowledge Format "
         "(OKF v0.2) Markdown wiki with a 2D/3D WebGL graph and linter."
@@ -205,6 +207,9 @@ def install_global_plugin(
     repo_root: Path | None = None,
     target_plugin_dir: Path | None = None,
     home_dir: Path | None = None,
+    preserve_existing_hooks: bool = True,
+    enable_hooks: str | bool | None = None,
+    disable_hooks: str | bool | None = None,
 ) -> dict:
     """Install or update the global Knowledge Compiler plugin."""
     root = (repo_root or Path(__file__).resolve().parent.parent).resolve()
@@ -238,10 +243,23 @@ def install_global_plugin(
     else:
         (assets_dir / "logo.svg").write_text(LOGO_SVG, encoding="utf-8")
 
-    # 2. Write hooks.json at plugin root
+    # 2. Write hooks.json at plugin root (preserving user-enabled hook states across upgrades)
     hooks_path = plugin_dir / "hooks.json"
+    hooks_cfg = copy.deepcopy(GLOBAL_HOOKS_CONFIG)
+    if preserve_existing_hooks and hooks_path.is_file() and not hooks_path.is_symlink():
+        try:
+            prev_hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
+            if isinstance(prev_hooks, dict):
+                for h_id, h_entry in hooks_cfg.items():
+                    prev_entry = prev_hooks.get(h_id)
+                    if isinstance(prev_entry, dict) and isinstance(
+                        prev_entry.get("enabled"), bool
+                    ):
+                        h_entry["enabled"] = prev_entry["enabled"]
+        except Exception:
+            pass
     hooks_path.write_text(
-        json.dumps(GLOBAL_HOOKS_CONFIG, indent=2) + "\n", encoding="utf-8"
+        json.dumps(hooks_cfg, indent=2) + "\n", encoding="utf-8"
     )
 
     # 2b. Copy root STABILITY.md if present
@@ -382,12 +400,47 @@ def install_global_plugin(
     if legacy_sidecar_dir.exists() and legacy_sidecar_dir.resolve() != sidecar_dir.resolve():
         shutil.rmtree(legacy_sidecar_dir)
 
+    # 7. Apply optional --enable-hooks / --disable-hooks toggle via vault_hooks
+    hooks_result: dict | None = None
+    _scripts_parent = str(Path(__file__).resolve().parent)
+    if _scripts_parent not in sys.path:
+        sys.path.insert(0, _scripts_parent)
+    try:
+        import vault_hooks  # type: ignore[import-not-found]
+    except ImportError:
+        from scripts import vault_hooks  # type: ignore[no-redef]
+
+    if enable_hooks:
+        grp = enable_hooks if isinstance(enable_hooks, str) else "all"
+        hooks_result = vault_hooks.set_hooks_state(
+            "enable",
+            hooks_group=grp,
+            scope="auto",
+            plugin_dir=plugin_dir,
+            home_dir=home_resolved,
+        )
+    elif disable_hooks:
+        grp = disable_hooks if isinstance(disable_hooks, str) else "all"
+        hooks_result = vault_hooks.set_hooks_state(
+            "disable",
+            hooks_group=grp,
+            scope="auto",
+            plugin_dir=plugin_dir,
+            home_dir=home_resolved,
+        )
+    else:
+        hooks_result = vault_hooks.get_hooks_status(
+            plugin_dir=plugin_dir,
+            home_dir=home_resolved,
+        )
+
     return {
         "success": True,
         "plugin_dir": str(plugin_dir),
         "detection": detection,
         "copied_scripts": sorted(copied_scripts),
         "copied_skills": copied_skills,
+        "hooks_status": hooks_result,
     }
 
 
@@ -495,10 +548,31 @@ def main() -> None:
         action="store_true",
         help="Also populate root-level Marketplace bundle files (plugin.json, hooks.json, assets/, sidecars/, skills/).",
     )
+    hook_toggle = parser.add_mutually_exclusive_group()
+    hook_toggle.add_argument(
+        "--enable-hooks",
+        nargs="?",
+        const="all",
+        default=None,
+        choices=("all", "sync", "wikiskill"),
+        help="Enable lifecycle hooks after installing (all, sync, or wikiskill).",
+    )
+    hook_toggle.add_argument(
+        "--disable-hooks",
+        nargs="?",
+        const="all",
+        default=None,
+        choices=("all", "sync", "wikiskill"),
+        help="Disable lifecycle hooks after installing (all, sync, or wikiskill).",
+    )
     args = parser.parse_args()
 
     target = Path(args.target_dir) if args.target_dir else None
-    result = install_global_plugin(target_plugin_dir=target)
+    result = install_global_plugin(
+        target_plugin_dir=target,
+        enable_hooks=args.enable_hooks,
+        disable_hooks=args.disable_hooks,
+    )
     if args.sync_repo_bundle:
         sync_repo_marketplace_bundle()
     det = result["detection"]
@@ -512,7 +586,7 @@ def main() -> None:
         harnesses.append("Default (~/.gemini/config)")
 
     print("============================================================")
-    print(" Knowledge Compiler — Global Plugin Installer (v1.0.1)")
+    print(" Knowledge Compiler — Global Plugin Installer (v1.1.0)")
     print("============================================================")
     print(f" Detected Harnesses : {', '.join(harnesses)}")
     print(f" Plugin Directory   : {result['plugin_dir']}")
