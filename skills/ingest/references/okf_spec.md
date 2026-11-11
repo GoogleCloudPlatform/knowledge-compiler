@@ -20,19 +20,16 @@ tags:
 status: stable # draft | stable | deprecated
 stale_after: YYYY-MM-DDTHH:MM:SSZ # Optional ISO timestamp
 sources:
-  - "[[Source Note Link|Source Note Link]]"
-  - "/optional/filesystem/path"
-generated:
-  by: antigravity/gemini-pro
-  at: YYYY-MM-DDTHH:MM:SSZ
-verified:
-  - by: human:author
-    at: YYYY-MM-DDTHH:MM:SSZ
+  - id: source-slug
+    resource: "raw/DocumentName.md"
+generated: { by: knowledge-compiler/gemini-pro, at: YYYY-MM-DDTHH:MM:SSZ }
 aliases:
   - "Common Alias"
   - "Acronym"
 ---
 ```
+
+> **Trust-Tier Integrity (OKF v0.2 §5.3)**: Omit `verified:` on agent-authored notes until explicit human review (`vault-lint --approve-human <note>`).
 
 ---
 

@@ -75,7 +75,7 @@ Before writing or modifying any permanent wiki notes:
 ### 3. Pass 2: Compilation, Cross-Pollination & OKF Generation
 Consume the structured blueprint from Pass 1 to execute the changes:
 1. **Source Summary Note (`wiki/sources/<Title>.md`)**:
-   - Author complete OKF v0.2 YAML frontmatter (`type: source-summary`, `source_sha256`, `sources: [...]`, `tags: [...]`, `status: stable`, `generated.by`, `verified.by`).
+   - Author complete OKF v0.2 YAML frontmatter (`type: source-summary`, `source_sha256`, `sources: [{ id: "<slug>", resource: "<path_or_url>" }]`, `tags: [...]`, `status: stable`, `generated: { by: knowledge-compiler/gemini-pro, at: YYYY-MM-DDTHH:MM:SSZ }`). Omit `verified:` on agent-authored notes until human review (`vault-lint --approve-human <note>`).
    - Include executive summary, detailed topic breakdowns, comparison tables, and Mermaid architecture diagrams.
 2. **Entity & Concept Synthesis (`wiki/entities/` & `wiki/concepts/`)**:
    - Create or enrich corresponding entity and concept notes.

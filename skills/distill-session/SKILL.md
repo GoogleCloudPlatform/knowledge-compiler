@@ -59,7 +59,7 @@ Before or during note authoring:
 1. Determine if any newly established finding directly contradicts or supersedes a claim in existing notes (e.g., updated pricing metrics, corrected software versions, or revised customer architectures).
 2. If a superseded claim is detected, execute an automated correction sweep via:
    ```bash
-   python3 <plugin_dir>/scripts/vault_correct.py "<new fact>" --stale "<old claim>" --target "<authoritative note>" --auto
+   python3 <plugin_dir>/scripts/vault_correct.py "<new fact>" --stale "<old claim>" --target "<authoritative note>" --apply
    ```
 3. This strictly enforces the **Write-Correctness Laws**:
    - The single **AUTHORITATIVE** note is updated with the new fact and `updated:` timestamp.
@@ -81,17 +81,14 @@ For each identified node:
      - domain/topic
    status: stable
    sources:
-     - "https://..."
-   generated:
-     by: antigravity/gemini-pro
-     at: YYYY-MM-DDTHH:MM:SSZ
-   verified:
-     - by: human:<username>
-       at: YYYY-MM-DDTHH:MM:SSZ
+     - id: source-slug
+       resource: "https://..."
+   generated: { by: knowledge-compiler/gemini-pro, at: YYYY-MM-DDTHH:MM:SSZ }
    aliases:
      - "Alternative Name"
    ---
    ```
+   Omit `verified:` on agent-authored notes until explicit human review (`vault-lint --approve-human <note>`).
 4. **Linking Invariants**:
    - Connect all related concepts and entities using reciprocal `[[wikilinks]]`.
    - **Never escape the pipe character inside Markdown tables** (always `[[Target|Alias]]`, never `[[Target\|Alias]]`).

@@ -6,6 +6,8 @@ description: >-
 
 # 🧬 WikiSkill: Autonomous Agent Skill Evolution (`/wikiskill`)
 
+> **Status**: Experimental in v1.0 (see [STABILITY.md](../../STABILITY.md)).
+
 This skill implements the Google Research **WikiSkill** framework (Tang et al., 2026) to discover, compile, and evolve modular procedural skills (`SKILL.md`) using a **three-layer architecture**, **on-demand ReAct proposing**, and **asymmetric rollback gating**.
 
 ---

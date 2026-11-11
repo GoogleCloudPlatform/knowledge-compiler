@@ -31,8 +31,15 @@ import re
 import shutil
 import subprocess
 import sys
+import unicodedata
+import urllib.parse
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 
 def get_plugin_data_dir() -> Path:
@@ -77,8 +84,21 @@ BLOCKED_KEYWORD_PATTERNS = [
 
 # Sensitive local filesystem patterns to sanitize
 LOCAL_PATH_REGEX = re.compile(
-    r"/(?:usr/local/[a-zA-Z0-9._-]+/home|home|Users)/[a-zA-Z0-9._-]+(?:/[a-zA-Z0-9._-]+)*"
+    r"/(?:usr/local/[a-zA-Z0-9._-]+/home|home|Users|users)/[a-zA-Z0-9._-]+(?:/[^\s\"'`)\]>]*)?"
 )
+
+_INVISIBLE_CHARS_RE = re.compile(
+    r"[\u00ad\u034f\u061c\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff\U000e0000-\U000e007f]"
+)
+_HTML_COMMENT_RE = re.compile(r"<!--[\s\S]*?-->")
+
+
+def normalize_shadow_view(text: str) -> str:
+    """Normalize text (NFKC) and strip zero-width, bidi, tag characters, and HTML comments for DLP/secret detection."""
+    norm = unicodedata.normalize("NFKC", text)
+    no_comments = _HTML_COMMENT_RE.sub("", norm)
+    return _INVISIBLE_CHARS_RE.sub("", no_comments)
+
 
 # Known public technology, framework, and cloud service entities (never customer accounts)
 PUBLIC_TECH_ENTITIES: Set[str] = {
@@ -127,8 +147,18 @@ DEFAULT_CUSTOMER_ANONYMIZATIONS: Dict[str, str] = {
 
 # Optional SHA-256 hex digest prefixes (first 24 chars) loaded dynamically when
 # the optional 1P DLP hash module is present; falls back to empty dict in 3P OSS.
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+try:
+    import okf  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover
+    from . import okf  # type: ignore[import-not-found]
+
 HAS_1P_DLP_HASHES = False
 CUSTOMER_SHA256_ARCHETYPES: Dict[str, str] = {}
+_INTERNAL_1P_FORBIDDEN_REFS: list[str] = []
 
 _SHA256_TOKEN_RE = re.compile(r"[A-Za-zÀ-ÿ0-9.&/]+")
 
@@ -186,23 +216,37 @@ def scan_sha256_entities_in_text(
 
 
 def load_custom_denylist(vault_root: Optional[Path] = None) -> Dict[str, str]:
-    """Load optional per-vault or per-user plaintext customer archetype rules from `denylist.json`."""
+    """Load optional per-vault or per-user customer archetype rules from `denylist.json`."""
     merged: Dict[str, str] = {}
     candidates: List[Path] = [get_plugin_data_dir() / "denylist.json"]
     if vault_root and vault_root.is_dir():
         candidates.append(vault_root / ".knowledge-compiler" / "denylist.json")
+        candidates.append(vault_root / "denylist.json")
     for path in candidates:
         if path.is_file():
             try:
-                data = json.loads(path.read_text(encoding="utf-8"))
+                raw_text = path.read_text(encoding="utf-8")
+                # Handle possible trailing commas before JSON parsing
+                cleaned_text = re.sub(r",\s*([\]}])", r"\1", raw_text)
+                data = json.loads(cleaned_text)
                 if isinstance(data, dict):
                     ca = data.get("customer_archetypes")
                     if isinstance(ca, dict):
                         for k, v in ca.items():
-                            if k and v:
-                                merged[str(k)] = str(v)
-            except Exception:
-                pass
+                            if k:
+                                merged[str(k)] = str(v) if v else "Enterprise Account"
+                    for list_key in ("denylist", "blocked_customers", "customers", "blocked"):
+                        sub_list = data.get(list_key)
+                        if isinstance(sub_list, list):
+                            for item in sub_list:
+                                if item and isinstance(item, (str, int)):
+                                    merged[str(item)] = "Enterprise Account"
+                elif isinstance(data, list):
+                    for item in data:
+                        if item and isinstance(item, (str, int)):
+                            merged[str(item)] = "Enterprise Account"
+            except Exception as exc:
+                raise ValueError(f"Failed to parse denylist file '{path}': {exc}") from exc
     return merged
 
 EPISTEMIC_FRONTMATTER_KEYS = (
@@ -314,11 +358,8 @@ def build_entity_archetype_map(
             except Exception:
                 continue
 
-            fm_block = ""
-            if text.startswith("---"):
-                parts = text.split("---", 2)
-                if len(parts) >= 3:
-                    fm_block = parts[1]
+            _fm_raw, fm_opt, _body = okf.split_frontmatter(text)
+            fm_block = fm_opt or ""
 
             if stem in public_entities:
                 m_title = re.search(r"(?m)^title:\s*['\"]?([^'\"\n]+)['\"]?", fm_block)
@@ -356,25 +397,53 @@ def build_entity_archetype_map(
                 if t_val and t_val not in public_entities:
                     archetypes.setdefault(t_val, resolved_arch)
 
-            # Extract aliases list if present
-            in_aliases = False
-            for fm_line in fm_block.splitlines():
-                s_line = fm_line.strip()
-                if s_line.startswith("aliases:"):
-                    if s_line.endswith("[]"):
-                        in_aliases = False
-                    else:
-                        in_aliases = True
-                    continue
-                if in_aliases:
-                    if s_line.startswith("- "):
-                        al = s_line[2:].strip().strip("\"'")
-                        if len(al) >= 3 and al not in public_entities:
-                            archetypes.setdefault(al, resolved_arch)
-                    elif not fm_line.startswith((" ", "\t")) and ":" in s_line:
-                        in_aliases = False
+            # Extract aliases list if present (supporting scalar, list, and inline flow list)
+            for al in _extract_aliases_from_frontmatter(fm_block):
+                if al and al not in public_entities:
+                    archetypes.setdefault(al, resolved_arch)
 
     return archetypes, public_entities
+
+
+_HEX_KEY_ESCAPE_RE = re.compile(
+    r"\\(?:x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8})"
+)
+
+
+def _extract_aliases_from_frontmatter(fm_text: str) -> list[str]:
+    """Extract all alias strings from YAML frontmatter supporting scalar, list, and inline flow list."""
+    use_yaml = yaml is not None and sys.modules.get("yaml") is not None
+    out: list[str] = list(
+        okf.extract_string_list(fm_text, "aliases", use_pyyaml=use_yaml)
+    )
+    seen: set[str] = set(out)
+    has_hex_esc = "\\" in fm_text and bool(_HEX_KEY_ESCAPE_RE.search(fm_text))
+    checked_variants: set[str] = set()
+    for key_variant, pat in (
+        ("Aliases", "Aliases"),
+        ("ALIASES", "ALIASES"),
+        ("alias", "alias:"),
+        ("alias", "alias "),
+        ("alias", 'alias"'),
+        ("alias", "alias'"),
+        ("Alias", "Alias:"),
+        ("Alias", "Alias "),
+        ("Alias", 'Alias"'),
+        ("Alias", "Alias'"),
+        ("ALIAS", "ALIAS"),
+    ):
+        if key_variant in checked_variants:
+            continue
+        if not has_hex_esc and pat not in fm_text:
+            continue
+        checked_variants.add(key_variant)
+        for val in okf.extract_string_list(
+            fm_text, key_variant, use_pyyaml=use_yaml
+        ):
+            if val not in seen:
+                seen.add(val)
+                out.append(val)
+    return out
 
 
 def discover_customer_entities(vault_root: Path) -> Set[str]:
@@ -426,6 +495,10 @@ def discover_customer_entities(vault_root: Path) -> Set[str]:
                     customers.add(file.stem)
             except Exception:
                 continue
+
+    # 3. denylist.json
+    denylist_map = load_custom_denylist(vault_root)
+    customers.update(denylist_map.keys())
 
     return customers
 
@@ -519,6 +592,14 @@ def sanitize_markdown(
     4. Prunes private vault entries from YAML frontmatter `sources:` and 5-way epistemic lists.
     """
     scrub_notes: List[str] = []
+    if _HTML_COMMENT_RE.search(content):
+        scrub_notes.append("Stripped HTML comments")
+    content = _HTML_COMMENT_RE.sub("", content)
+
+    if _INVISIBLE_CHARS_RE.search(content):
+        scrub_notes.append("Stripped invisible bidi/tag control characters")
+    content = _INVISIBLE_CHARS_RE.sub("", content)
+
     archetypes, public_entities = build_entity_archetype_map(
         vault_root=vault_root, custom_anonymizations=custom_anonymizations
     )
@@ -527,12 +608,12 @@ def sanitize_markdown(
 
     # Split frontmatter vs body so YAML lists and prose links are each handled cleanly
     fm_prefix = ""
-    body_text = content
-    if content.startswith("---"):
-        parts = content.split("---", 2)
-        if len(parts) >= 3:
-            fm_prefix = f"---{parts[1]}---"
-            body_text = parts[2]
+    _fm_raw, fm_opt, body_after = okf.split_frontmatter(content)
+    if fm_opt is not None:
+        fm_prefix = f"---\n{fm_opt}\n---"
+        body_text = "\n" + body_after if not body_after.startswith("\n") else body_after
+    else:
+        body_text = content.lstrip("\ufeff")
 
     # Protect fenced code blocks and inline code spans in body_text during wikilink rewriting
     protected_tokens: List[str] = []
@@ -680,6 +761,8 @@ def sanitize_markdown(
     lines = sanitized.splitlines()
     in_frontmatter = False
     active_list_key: Optional[str] = None
+    active_id_list_key: Optional[str] = None
+    active_flow_id_list: bool = False
     buffered_list_header: Optional[str] = None
     buffered_list_items: List[str] = []
     new_lines: List[str] = []
@@ -740,6 +823,8 @@ def sanitize_markdown(
         if line.strip() == "---":
             if in_frontmatter:
                 _flush_list()
+                active_id_list_key = None
+                active_flow_id_list = False
             in_frontmatter = not in_frontmatter
             new_lines.append(line)
             continue
@@ -753,9 +838,63 @@ def sanitize_markdown(
                     break
             if matched_key:
                 _flush_list()
+                active_id_list_key = None
+                active_flow_id_list = False
                 active_list_key = matched_key
                 buffered_list_header = line
                 buffered_list_items = []
+                continue
+
+            # Multi-line or inline identity flow list e.g. authors: [jdoe, Jane Doe] or authors: [
+            if re.search(r'^\s*(?:author|authors|owner|owners|created_by|maintainer|reviewed_by|contributor|contributors):\s*\[', line):
+                if "]" in line:
+                    m_lead = re.match(r'(^\s*(?:author|authors|owner|owners|created_by|maintainer|reviewed_by|contributor|contributors):\s*)\[(.*)\]', line)
+                    if m_lead:
+                        prefix = m_lead.group(1)
+                        inner = m_lead.group(2).strip()
+                        if inner:
+                            items = [item.strip() for item in inner.split(",") if item.strip()]
+                            new_items = ['"human:cloud-ce"' for _ in items]
+                            subbed_line = f"{prefix}[{', '.join(new_items)}]"
+                        else:
+                            subbed_line = f"{prefix}[]"
+                        new_lines.append(subbed_line)
+                        scrub_notes.append("Sanitized inline identity list in frontmatter to 'human:cloud-ce'")
+                        active_id_list_key = None
+                        active_flow_id_list = False
+                        continue
+                else:
+                    active_flow_id_list = True
+                    new_lines.append(line)
+                    continue
+
+            if active_flow_id_list:
+                if "]" in line:
+                    active_flow_id_list = False
+                subbed_line = re.sub(r'([^,\[\]\s"\']+(?:\s+[^,\[\]\s"\']+)*)', r'human:cloud-ce', line)
+                new_lines.append(subbed_line)
+                scrub_notes.append("Sanitized multi-line flow identity item in frontmatter to 'human:cloud-ce'")
+                continue
+
+            matched_id_key = None
+            for ik in (
+                "author",
+                "authors",
+                "owner",
+                "owners",
+                "created_by",
+                "maintainer",
+                "reviewed_by",
+                "contributor",
+                "contributors",
+            ):
+                if stripped_l == f"{ik}:":
+                    matched_id_key = ik
+                    break
+            if matched_id_key:
+                _flush_list()
+                active_id_list_key = matched_id_key
+                new_lines.append(line)
                 continue
 
             if active_list_key is not None:
@@ -770,13 +909,62 @@ def sanitize_markdown(
                 elif not line.startswith((" ", "\t")) and ":" in stripped_l:
                     _flush_list()
 
-            # Sanitize author names in frontmatter verified/generated
-            if "by: human:" in line:
-                new_lines.append(
-                    re.sub(r"by:\s*human:[a-zA-Z0-9._-]+", "by: human:cloud-ce", line)
+            if active_id_list_key is not None:
+                if stripped_l.startswith("- ") or stripped_l == "-":
+                    subbed_item = re.sub(
+                        r'(-\s*)(["\']?)[^"\'\n]+(["\']?)',
+                        r'\1\2human:cloud-ce\3',
+                        line,
+                    )
+                    new_lines.append(subbed_item)
+                    scrub_notes.append(
+                        f"Sanitized identity in frontmatter list '{active_id_list_key}' to 'human:cloud-ce'"
+                    )
+                    continue
+                elif re.search(r'^\s+name:\s*["\']?[^"\'{\[\s][^"\'\n]*', line):
+                    subbed_line = re.sub(
+                        r'(^\s*name:\s*)(["\']?)[^"\'\n]+(["\']?)',
+                        r'\1\2Google Cloud CE\3',
+                        line,
+                    )
+                    new_lines.append(subbed_line)
+                    scrub_notes.append("Sanitized name under author/contributor in frontmatter to 'Google Cloud CE'")
+                    continue
+                elif not line.startswith((" ", "\t")) and ":" in stripped_l:
+                    active_id_list_key = None
+
+            # Sanitize author/owner/by names in frontmatter verified/generated/author
+            if re.search(r'\b(?:by|author|authors|owner|owners|created_by|maintainer|reviewed_by):\s*["\']?human:[^"\']+', line):
+                subbed_line = re.sub(
+                    r'(\b(?:by|author|authors|owner|owners|created_by|maintainer|reviewed_by):\s*)(["\']?)human:[^"\'}\],]+(["\']?)',
+                    r'\1\2human:cloud-ce\3',
+                    line,
                 )
+                new_lines.append(subbed_line)
                 scrub_notes.append(
-                    "Sanitized human author in frontmatter to 'human:cloud-ce'"
+                    "Sanitized human identity in frontmatter to 'human:cloud-ce'"
+                )
+                continue
+            if re.search(r'^\s*(?:author|authors|owner|owners|created_by|maintainer|reviewed_by|contributor|contributors):\s*["\']?[^"\'{\[\s\-][^"\'\n]*', line):
+                subbed_line = re.sub(
+                    r'(^\s*(?:author|authors|owner|owners|created_by|maintainer|reviewed_by|contributor|contributors):\s*)(["\']?)[^"\'\n]+(["\']?)',
+                    r'\1\2human:cloud-ce\3',
+                    line,
+                )
+                new_lines.append(subbed_line)
+                scrub_notes.append(
+                    "Sanitized identity in frontmatter to 'human:cloud-ce'"
+                )
+                continue
+            if re.search(r'\bby:\s*["\']?agent:[^"\'}\],]+', line):
+                subbed_line = re.sub(
+                    r'(\bby:\s*)(["\']?)agent:[^"\'}\],]+(["\']?)',
+                    r'\1\2agent:knowledge-compiler\3',
+                    line,
+                )
+                new_lines.append(subbed_line)
+                scrub_notes.append(
+                    "Sanitized agent identity in frontmatter to 'agent:knowledge-compiler'"
                 )
                 continue
 
@@ -868,6 +1056,276 @@ def audit_vault(vault_root: Path) -> Dict[str, List[Dict]]:
     return results
 
 
+# Secret / credential patterns for mandatory fail-closed egress check
+_EGRESS_SECRET_PATTERNS = [
+    (re.compile(r"AIza[0-9A-Za-z_-]{20,}"), "Google API Key"),
+    (re.compile(r"ya29\.[0-9A-Za-z_-]+"), "Google OAuth Token"),
+    (re.compile(r"(?:gh[pousr]_[0-9A-Za-z]{20,}|github_pat_[0-9A-Za-z_]{20,})"), "GitHub Token"),
+    (re.compile(r"AKIA[0-9A-Z]{16}"), "AWS Access Key ID"),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"), "Private Key Header"),
+]
+
+# Internal reference and infrastructure patterns for mandatory fail-closed egress check
+_EGRESS_INTERNAL_REF_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"gs://[a-z0-9._-]+"), "GCS Bucket URI"),
+    (re.compile(r"\bb/\d{6,}\b"), "Internal Bug Reference"),
+    (re.compile(r"\bcl/\d{6,}\b"), "Internal Changelist Reference"),
+    (re.compile(r"(?<![/.\w])go/(?!no-go\b)[a-z0-9_-]+\b"), "Internal Go Link"),
+]
+_UNBUCKETED_CURRENCY_RE = re.compile(r"\$(?:\d{1,3}(?:,\d{3})+|\d{4,})\.\d{2}\b")
+
+# Email regex (synthetic @example.com and @example.org stay allowed)
+_EMAIL_RE = re.compile(r"\b[a-zA-Z0-9._%+-]+@([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b")
+
+# Direction keywords used in Mermaid diagrams that must not be flagged when matching 2-letter customer acronyms
+_MERMAID_DIRECTIONS = frozenset({"TB", "TD", "BT", "LR", "RL"})
+
+
+def _build_customer_regex(cust: str) -> re.Pattern:
+    """Build a robust regex for a customer or entity name handling wraps, multi-spaces, and non-word endings."""
+    parts = cust.split()
+    if not parts:
+        return re.compile(r"$^")
+    escaped_parts = [re.escape(p) for p in parts]
+    pattern_body = r"\s+".join(escaped_parts)
+    pattern = r"(?<!\w)" + pattern_body + r"(?!\w)"
+    flags = 0 if len(cust) <= 3 else re.IGNORECASE
+    return re.compile(pattern, flags)
+
+
+def collect_egress_customer_names(vault_root: Optional[Path] = None) -> Set[str]:
+    """Collect customer and private entity names from tables/customers.md, wiki/entities/, and denylist.json."""
+    customers: Set[str] = set()
+    customers.update(DEFAULT_CUSTOMER_ANONYMIZATIONS.keys())
+
+    if vault_root and vault_root.is_dir():
+        # 1. tables/customers.md (supports both wikilinks and plain-text table rows)
+        cust_table = vault_root / "tables" / "customers.md"
+        if cust_table.is_file():
+            try:
+                content = cust_table.read_text(encoding="utf-8", errors="ignore")
+                for line in content.splitlines():
+                    line = line.strip()
+                    if (
+                        line.startswith("|")
+                        and not line.startswith("| :---")
+                        and not line.startswith("| Customer Account")
+                    ):
+                        cols = _split_markdown_table_row(line)
+                        if len(cols) > 1:
+                            first_col = cols[1].strip()
+                            wikilinks = list(
+                                re.finditer(r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]", first_col)
+                            )
+                            if wikilinks:
+                                for match in wikilinks:
+                                    target = (
+                                        match.group(1)
+                                        .strip()
+                                        .removeprefix("wiki/entities/")
+                                        .removeprefix("entities/")
+                                        .removesuffix(".md")
+                                    )
+                                    alias = match.group(2).strip() if match.group(2) else None
+                                    if target and target not in PUBLIC_TECH_ENTITIES:
+                                        customers.add(target)
+                                    if alias and alias not in PUBLIC_TECH_ENTITIES:
+                                        customers.add(alias)
+                            else:
+                                plain_val = first_col.strip("`*\"' ")
+                                if plain_val and plain_val not in PUBLIC_TECH_ENTITIES:
+                                    customers.add(plain_val)
+            except Exception:
+                pass
+
+        # 2. wiki/entities/ stems (excluding PUBLIC_TECH_ENTITIES)
+        entities_dir = vault_root / "wiki" / "entities"
+        if entities_dir.is_dir():
+            for file in entities_dir.rglob("*.md"):
+                stem = file.stem
+                if stem not in PUBLIC_TECH_ENTITIES:
+                    customers.add(stem)
+                    try:
+                        text = file.read_text(encoding="utf-8", errors="ignore")
+                        _fm_raw, fm_opt, _body = okf.split_frontmatter(text)
+                        if fm_opt is not None:
+                            for val in _extract_aliases_from_frontmatter(fm_opt):
+                                if val and val not in PUBLIC_TECH_ENTITIES:
+                                    customers.add(val)
+                    except Exception:
+                        pass
+
+        # 3. denylist.json
+        denylist_map = load_custom_denylist(vault_root)
+        customers.update(denylist_map.keys())
+
+    return customers
+
+
+def verify_pattern_egress_security(
+    content: str,
+    vault_root: Optional[Path] = None,
+    rel_path: str = "",
+) -> List[str]:
+    """Perform fail-closed egress check across frontmatter, body, code blocks, and note paths.
+
+    Scans both raw and normalize_shadow_view text for customer names, secrets,
+    credentials, forbidden emails, internal refs, workstation paths, and unbucketed currency.
+    """
+    findings: List[str] = []
+    shadow_content = normalize_shadow_view(content)
+    variants = [("raw", content)]
+    if shadow_content != content:
+        variants.append(("shadow_view", shadow_content))
+
+    customer_names = collect_egress_customer_names(vault_root)
+    explicit_denylist = set(load_custom_denylist(vault_root).keys())
+    active_sha_map = CUSTOMER_SHA256_ARCHETYPES
+
+    # 0. Scan note path, filename, stem, and directories against customer names, secrets, and internal refs
+    if rel_path:
+        p_obj = Path(rel_path)
+        path_targets = [str(rel_path), p_obj.stem, p_obj.name]
+        for part in p_obj.parts:
+            if part and part not in ("/", "\\", ".", "..") and part not in path_targets:
+                path_targets.append(part)
+
+        for p_target in path_targets:
+            p_unquote = urllib.parse.unquote(p_target)
+            p_norm = normalize_shadow_view(p_unquote)
+            p_space = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", p_norm)
+            p_space = re.sub(r"([a-zA-Z])([0-9])", r"\1 \2", p_space)
+            p_space = re.sub(r"[-_./\\]+", " ", p_space)
+            p_variants = [p_target]
+            for candidate in (p_unquote, p_norm, p_space):
+                if candidate not in p_variants:
+                    p_variants.append(candidate)
+
+            for pv in p_variants:
+                for _start, _end, span_txt, arch in scan_sha256_entities_in_text(pv, active_sha_map):
+                    findings.append(f"Forbidden customer entity detected via SHA-256 in note path/stem ({arch}): '{span_txt}'")
+                for cust in customer_names:
+                    if not cust:
+                        continue
+                    if cust in PUBLIC_TECH_ENTITIES and cust not in explicit_denylist:
+                        continue
+                    rgx = _build_customer_regex(cust)
+                    m = rgx.search(pv)
+                    if m:
+                        findings.append(f"Customer name detected in note path/stem: '{m.group(0)}'")
+                for pat, sec_label in _EGRESS_SECRET_PATTERNS:
+                    m = pat.search(pv)
+                    if m:
+                        findings.append(f"Secret/credential detected in note path/stem ({sec_label}): '{m.group(0)}'")
+                for pat, ref_label in _EGRESS_INTERNAL_REF_PATTERNS:
+                    m = pat.search(pv)
+                    if m:
+                        findings.append(f"Internal reference detected in note path/stem ({ref_label}): '{m.group(0)}'")
+                m_path = LOCAL_PATH_REGEX.search(pv)
+                if m_path:
+                    findings.append(f"Unredacted workstation path detected in note path/stem: '{m_path.group(0)}'")
+                for m in _UNBUCKETED_CURRENCY_RE.finditer(pv):
+                    findings.append(f"Unbucketed exact decimal currency figure detected in note path/stem: '{m.group(0)}'")
+
+    # Explicitly check parsed frontmatter fields if frontmatter is present
+    if content.startswith("---"):
+        parts = content.split("---", 2)
+        if len(parts) >= 3:
+            fm_text = parts[1]
+            in_target_list = False
+            for line in fm_text.splitlines():
+                s_line = line.strip()
+                matched_header = False
+                for fm_field in ("title:", "aliases:", "tags:"):
+                    if s_line.startswith(fm_field):
+                        val_part = s_line[len(fm_field):].strip().strip("\"'")
+                        matched_header = True
+                        in_target_list = (fm_field in ("aliases:", "tags:"))
+                        if val_part:
+                            for cust in customer_names:
+                                if not cust:
+                                    continue
+                                if cust in PUBLIC_TECH_ENTITIES and cust not in explicit_denylist:
+                                    continue
+                                rgx = _build_customer_regex(cust)
+                                if rgx.search(val_part):
+                                    findings.append(f"Customer name detected in frontmatter '{fm_field[:-1]}': '{cust}'")
+                        break
+                if not matched_header:
+                    if in_target_list and s_line.startswith("- "):
+                        item_val = s_line[2:].strip().strip("\"'")
+                        for cust in customer_names:
+                            if not cust:
+                                continue
+                            if cust in PUBLIC_TECH_ENTITIES and cust not in explicit_denylist:
+                                continue
+                            rgx = _build_customer_regex(cust)
+                            if rgx.search(item_val):
+                                findings.append(f"Customer name detected in frontmatter list item: '{cust}'")
+                    elif not line.startswith((" ", "\t")):
+                        in_target_list = False
+
+    for v_label, text_variant in variants:
+        # 1. SHA-256 Entities
+        for _start, _end, span_txt, arch in scan_sha256_entities_in_text(text_variant, active_sha_map):
+            findings.append(f"Forbidden customer entity detected via SHA-256 [{v_label}] ({arch}): '{span_txt}'")
+
+        # 2. Plaintext customer names
+        for cust in customer_names:
+            if not cust:
+                continue
+            if cust in PUBLIC_TECH_ENTITIES and cust not in explicit_denylist:
+                continue
+            rgx = _build_customer_regex(cust)
+            for m in rgx.finditer(text_variant):
+                if cust.upper() in _MERMAID_DIRECTIONS:
+                    start = m.start()
+                    prefix = text_variant[max(0, start - 15) : start]
+                    if re.search(r"\b(?:flowchart|graph|direction)\s+$", prefix, re.IGNORECASE):
+                        continue
+                findings.append(f"Customer name detected [{v_label}]: '{m.group(0)}'")
+
+        # 3. Secrets / credentials
+        for pat, sec_label in _EGRESS_SECRET_PATTERNS:
+            m = pat.search(text_variant)
+            if m:
+                findings.append(f"Secret/credential detected [{v_label}] ({sec_label}): '{m.group(0)}'")
+
+        # 4. Emails (except synthetic @example.com / @example.org)
+        for m in _EMAIL_RE.finditer(text_variant):
+            domain = m.group(1).lower()
+            if domain in ("example.com", "example.org") or domain.endswith((".example.com", ".example.org")):
+                continue
+            findings.append(f"Forbidden email address detected [{v_label}]: '{m.group(0)}'")
+
+        # 5. Internal refs
+        for pat, ref_label in _EGRESS_INTERNAL_REF_PATTERNS:
+            m = pat.search(text_variant)
+            if m:
+                findings.append(f"Internal reference detected [{v_label}] ({ref_label}): '{m.group(0)}'")
+
+        # 6. Unredacted workstation paths
+        m_path = LOCAL_PATH_REGEX.search(text_variant)
+        if m_path:
+            findings.append(f"Unredacted workstation path detected [{v_label}]: '{m_path.group(0)}'")
+
+        # 7. Unbucketed exact decimal currency figures
+        for m in _UNBUCKETED_CURRENCY_RE.finditer(text_variant):
+            findings.append(f"Unbucketed exact decimal currency figure detected [{v_label}]: '{m.group(0)}'")
+
+        # 8. Unscrubbed human author handles
+        for m in re.finditer(r"\bhuman:(?!cloud-ce\b)[a-zA-Z0-9._-]+", text_variant):
+            findings.append(f"Unscrubbed human author handle detected [{v_label}]: '{m.group(0)}'")
+
+    deduped: List[str] = []
+    seen: Set[str] = set()
+    for f in findings:
+        if f not in seen:
+            seen.add(f)
+            deduped.append(f)
+    return deduped
+
+
 def share_pattern(
     pattern_file: Path,
     target_repo_path: Path,
@@ -934,8 +1392,31 @@ def share_pattern(
         valid_shared_targets=shared_targets,
     )
 
-    # 4. Destination path in target repo
     dest_file = target_repo_path / rel_path
+    dest_rel_str = str(dest_file.relative_to(target_repo_path)).replace("\\", "/")
+
+    # 4. Mandatory fail-closed egress security check BEFORE any filesystem write
+    egress_violations = verify_pattern_egress_security(
+        content=sanitized_content,
+        vault_root=vault_root,
+        rel_path=rel_path,
+    )
+    dest_violations = verify_pattern_egress_security(
+        content="",
+        vault_root=vault_root,
+        rel_path=dest_rel_str,
+    )
+    for dv in dest_violations:
+        if dv not in egress_violations:
+            egress_violations.append(dv)
+
+    if egress_violations:
+        diag = "\n  - " + "\n  - ".join(egress_violations)
+        raise SecurityException(
+            f"Mandatory egress security check failed for '{rel_path}':{diag}"
+        )
+
+    # 5. Destination path in target repo (fail-closed: zero write if any gate failed)
     if not dry_run:
         dest_file.parent.mkdir(parents=True, exist_ok=True)
         dest_file.write_text(sanitized_content, encoding="utf-8")
@@ -1333,11 +1814,6 @@ def main():
         default=None,
         help="Local directory of the shared patterns clone.",
     )
-    p_share.add_argument(
-        "--repo-url",
-        default=None,
-        help="Remote GitHub repository (e.g. your-org/shared-okf-patterns).",
-    )
     p_share.add_argument("--vault", default=None, help="Path to local vault root.")
     p_share.add_argument(
         "--dry-run",
@@ -1362,7 +1838,6 @@ def main():
         action="store_true",
         help="Overwrite existing local vault files even if local `updated:` is newer.",
     )
-    p_pull.add_argument("--repo-url", default=None, help="Remote GitHub repository.")
     p_pull.add_argument("--vault", default=None, help="Path to local vault root.")
     p_pull.add_argument(
         "--dry-run",
@@ -1388,100 +1863,138 @@ def main():
         else find_vault_root()
     )
 
-    if args.command == "audit":
-        audit_res = audit_vault(v_root)
-        if args.json:
-            print(json.dumps(audit_res, indent=2))
-        else:
-            print("=" * 60)
-            print("🔍 OKF Pattern Exchange Privacy & Sanitization Audit")
-            print("=" * 60)
-            print(f"📁 Vault Root: {v_root}")
-            print(f"✅ Ready to Share ({len(audit_res['clean'])} clean patterns):")
-            for item in audit_res["clean"][:15]:
-                print(f"   • {item['title']} ({item['file']})")
-            if len(audit_res["clean"]) > 15:
-                print(f"   ... and {len(audit_res['clean']) - 15} more.")
-
-            print(
-                f"\n⚠️ Requires Scrubbing ({len(audit_res['scrub_needed'])} patterns with customer references/paths):"
-            )
-            for item in audit_res["scrub_needed"]:
-                print(f"   • {item['title']}: {'; '.join(item['reasons'])}")
-
-            if audit_res["blocked"]:
-                print(f"\n❌ Air-Gapped / Blocked ({len(audit_res['blocked'])} notes):")
-                for item in audit_res["blocked"]:
-                    print(f"   • {item['file']}: {item['reason']}")
-            print("=" * 60)
-
-    elif args.command == "sanitize":
-        f_path = Path(args.file).resolve()
-        content = f_path.read_text(encoding="utf-8")
-        sanitized, notes = sanitize_markdown(content, vault_root=v_root)
-        if args.output:
-            out_p = Path(args.output).resolve()
-            out_p.parent.mkdir(parents=True, exist_ok=True)
-            out_p.write_text(sanitized, encoding="utf-8")
-            print(f"✅ Sanitized file written to {out_p} ({len(notes)} redactions)")
-        else:
-            print(sanitized)
-
-    elif args.command == "share":
-        target_dir = Path(args.repo_dir).resolve() if args.repo_dir else None
-
-        if not target_dir:
-            env_pat = os.environ.get("OKF_PATTERNS_PATH")
-            candidate_dirs = [
-                Path(env_pat).expanduser() if env_pat else None,
-                Path.home() / "shared-okf-patterns",
-                (v_root.parent / "shared-okf-patterns") if v_root else None,
-                Path.home() / ".cache" / "knowledge-compiler" / "shared-okf-patterns",
-            ]
-            for cand in candidate_dirs:
-                if cand and cand.exists():
-                    target_dir = cand.resolve()
-                    break
-
-        if not target_dir:
-            print(
-                "❌ Target patterns repository directory not specified. Use --repo-dir or set OKF_PATTERNS_PATH.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-
-        if args.all_clean:
+    try:
+        if args.command == "audit":
             audit_res = audit_vault(v_root)
-            clean_list = audit_res["clean"]
-            if not clean_list:
-                print("ℹ️ No clean patterns ready to share.")
-                return
-            print(f"📦 Sharing {len(clean_list)} clean patterns to {target_dir}...")
-            shared_count = 0
-            for item in clean_list:
-                item_f = v_root / item["file"]
-                try:
-                    res = share_pattern(
-                        item_f, target_dir, vault_root=v_root, dry_run=args.dry_run
-                    )
-                    print(f"   + Shared '{item['title']}'")
-                    shared_count += 1
-                except SecurityException as e:
-                    print(f"   ⚠️ Skipped '{item['title']}': {e}")
-            print(f"🎉 Successfully shared {shared_count}/{len(clean_list)} patterns.")
-        else:
-            if not args.file:
+            if args.json:
+                print(json.dumps(audit_res, indent=2))
+            else:
+                print("=" * 60)
+                print("🔍 OKF Pattern Exchange Privacy & Sanitization Audit")
+                print("=" * 60)
+                print(f"📁 Vault Root: {v_root}")
+                print(f"✅ Ready to Share ({len(audit_res['clean'])} clean patterns):")
+                for item in audit_res["clean"][:15]:
+                    print(f"   • {item['title']} ({item['file']})")
+                if len(audit_res["clean"]) > 15:
+                    print(f"   ... and {len(audit_res['clean']) - 15} more.")
+
                 print(
-                    "❌ File path required when not using --all-clean.", file=sys.stderr
+                    f"\n⚠️ Requires Scrubbing ({len(audit_res['scrub_needed'])} patterns with customer references/paths):"
+                )
+                for item in audit_res["scrub_needed"]:
+                    print(f"   • {item['title']}: {'; '.join(item['reasons'])}")
+
+                if audit_res["blocked"]:
+                    print(f"\n❌ Air-Gapped / Blocked ({len(audit_res['blocked'])} notes):")
+                    for item in audit_res["blocked"]:
+                        print(f"   • {item['file']}: {item['reason']}")
+                print("=" * 60)
+
+        elif args.command == "sanitize":
+            f_path = Path(args.file).resolve()
+            content = f_path.read_text(encoding="utf-8")
+            sanitized, notes = sanitize_markdown(content, vault_root=v_root)
+            if args.output:
+                # Vault-relative input path if within vault_root, otherwise filename (avoids /home/user workstation false-positive)
+                try:
+                    input_rel = (
+                        str(f_path.relative_to(v_root)).replace("\\", "/")
+                        if v_root
+                        else f_path.name
+                    )
+                except ValueError:
+                    input_rel = f_path.name
+
+                egress_violations = verify_pattern_egress_security(
+                    content=sanitized,
+                    vault_root=v_root,
+                    rel_path=input_rel,
+                )
+
+                # Scan output path components (filename, stem, and directories) for customer names/secrets
+                out_p = Path(args.output)
+                out_targets = [out_p.name, out_p.stem] + [
+                    p for p in out_p.parts if p and p not in ("/", "\\", ".", "..")
+                ]
+                for ot in out_targets:
+                    ot_violations = verify_pattern_egress_security(
+                        content="",
+                        vault_root=v_root,
+                        rel_path=ot,
+                    )
+                    for v in ot_violations:
+                        if "workstation path" not in v.lower() and v not in egress_violations:
+                            egress_violations.append(v)
+
+                if egress_violations:
+                    print(
+                        f"❌ Egress security check failed for '{f_path.name}':\n  - "
+                        + "\n  - ".join(egress_violations),
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+                out_p = out_p.resolve()
+                out_p.parent.mkdir(parents=True, exist_ok=True)
+                out_p.write_text(sanitized, encoding="utf-8")
+                print(f"✅ Sanitized file written to {out_p} ({len(notes)} redactions)")
+            else:
+                print(sanitized)
+
+        elif args.command == "share":
+            target_dir = Path(args.repo_dir).resolve() if args.repo_dir else None
+
+            if not target_dir:
+                env_pat = os.environ.get("OKF_PATTERNS_PATH")
+                candidate_dirs = [
+                    Path(env_pat).expanduser() if env_pat else None,
+                    Path.home() / "shared-okf-patterns",
+                    (v_root.parent / "shared-okf-patterns") if v_root else None,
+                    Path.home() / ".cache" / "knowledge-compiler" / "shared-okf-patterns",
+                ]
+                for cand in candidate_dirs:
+                    if cand and cand.exists():
+                        target_dir = cand.resolve()
+                        break
+
+            if not target_dir:
+                print(
+                    "❌ Target patterns repository directory not specified. Use --repo-dir or set OKF_PATTERNS_PATH.",
+                    file=sys.stderr,
                 )
                 sys.exit(1)
-            f_path = Path(args.file)
-            if not f_path.is_absolute() and v_root and (v_root / f_path).exists():
-                f_path = (v_root / f_path).resolve()
-            else:
-                f_path = f_path.resolve()
 
-            try:
+            if args.all_clean:
+                audit_res = audit_vault(v_root)
+                clean_list = audit_res["clean"]
+                if not clean_list:
+                    print("ℹ️ No clean patterns ready to share.")
+                    return
+                print(f"📦 Sharing {len(clean_list)} clean patterns to {target_dir}...")
+                shared_count = 0
+                for item in clean_list:
+                    item_f = v_root / item["file"]
+                    try:
+                        res = share_pattern(
+                            item_f, target_dir, vault_root=v_root, dry_run=args.dry_run
+                        )
+                        print(f"   + Shared '{item['title']}'")
+                        shared_count += 1
+                    except SecurityException as e:
+                        print(f"   ⚠️ Skipped '{item['title']}': {e}")
+                print(f"🎉 Successfully shared {shared_count}/{len(clean_list)} patterns.")
+            else:
+                if not args.file:
+                    print(
+                        "❌ File path required when not using --all-clean.", file=sys.stderr
+                    )
+                    sys.exit(1)
+                f_path = Path(args.file)
+                if not f_path.is_absolute() and v_root and (v_root / f_path).exists():
+                    f_path = (v_root / f_path).resolve()
+                else:
+                    f_path = f_path.resolve()
+
                 res = share_pattern(
                     f_path, target_dir, vault_root=v_root, dry_run=args.dry_run
                 )
@@ -1492,49 +2005,53 @@ def main():
                     print("   Applied Sanitization:")
                     for n in res["scrub_notes"]:
                         print(f"   - {n}")
-            except SecurityException as e:
-                print(f"🚨 Security Violation: {e}", file=sys.stderr)
+
+        elif args.command == "pull":
+            source_dir = Path(args.repo_dir).resolve() if args.repo_dir else None
+            if not source_dir:
+                env_pat = os.environ.get("OKF_PATTERNS_PATH")
+                candidate_dirs = [
+                    Path(env_pat).expanduser() if env_pat else None,
+                    Path.home() / "shared-okf-patterns",
+                    (v_root.parent / "shared-okf-patterns") if v_root else None,
+                    Path.home() / ".cache" / "knowledge-compiler" / "shared-okf-patterns",
+                ]
+                for cand in candidate_dirs:
+                    if cand and cand.exists():
+                        source_dir = cand.resolve()
+                        break
+
+            if not source_dir:
+                print(
+                    "❌ Source patterns repository directory not specified. Use --repo-dir.",
+                    file=sys.stderr,
+                )
                 sys.exit(1)
 
-    elif args.command == "pull":
-        source_dir = Path(args.repo_dir).resolve() if args.repo_dir else None
-        if not source_dir:
-            env_pat = os.environ.get("OKF_PATTERNS_PATH")
-            candidate_dirs = [
-                Path(env_pat).expanduser() if env_pat else None,
-                Path.home() / "shared-okf-patterns",
-                (v_root.parent / "shared-okf-patterns") if v_root else None,
-                Path.home() / ".cache" / "knowledge-compiler" / "shared-okf-patterns",
-            ]
-            for cand in candidate_dirs:
-                if cand and cand.exists():
-                    source_dir = cand.resolve()
-                    break
-
-        if not source_dir:
-            print(
-                "❌ Source patterns repository directory not specified. Use --repo-dir.",
-                file=sys.stderr,
+            res = pull_patterns(
+                source_dir,
+                vault_root=v_root,
+                dry_run=args.dry_run,
+                overwrite=args.overwrite,
             )
-            sys.exit(1)
+            print(
+                f"✅ Pulled {res['pulled_count']} new/updated patterns into {v_root} "
+                f"({res.get('skipped_count', 0)} existing local notes already up to date)"
+            )
+            for p in res["pulled_files"]:
+                print(f"   + {p}")
 
-        res = pull_patterns(
-            source_dir,
-            vault_root=v_root,
-            dry_run=args.dry_run,
-            overwrite=args.overwrite,
-        )
-        print(
-            f"✅ Pulled {res['pulled_count']} new/updated patterns into {v_root} "
-            f"({res.get('skipped_count', 0)} existing local notes already up to date)"
-        )
-        for p in res["pulled_files"]:
-            print(f"   + {p}")
+        elif args.command == "init-repo":
+            t_dir = Path(args.dir)
+            init_patterns_repo(t_dir, init_git=not args.no_git)
+            print(f"🚀 Initialized OKF v0.2 shared-okf-patterns repository at: {t_dir}")
 
-    elif args.command == "init-repo":
-        t_dir = Path(args.dir)
-        init_patterns_repo(t_dir, init_git=not args.no_git)
-        print(f"🚀 Initialized OKF v0.2 shared-okf-patterns repository at: {t_dir}")
+    except SecurityException as e:
+        print(f"🚨 Security Violation: {e}", file=sys.stderr)
+        sys.exit(1)
+    except ValueError as e:
+        print(f"❌ Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -52,11 +52,24 @@ Follow these 4 mandatory steps:
 ### 1. Anchor Discovery & Federated Retrieval
 1. Consult `${OBSIDIAN_VAULT_PATH:-~/ObsidianVault}/purpose.md` to align the query context with active projects, architectural pillars, and open investigative theses.
 2. Open the master catalog at `${OBSIDIAN_VAULT_PATH:-~/ObsidianVault}/index.md` and, if present, `${OKF_PATTERNS_PATH:-~/shared-okf-patterns}/index.md`.
-3. Locate primary entry points across:
+3. **Stateless Multi-Field Okapi BM25 Retrieval (`vault_query.py`)**:
+   Run the pure-stdlib Okapi BM25 ranking engine (`title` 3.0x, `aliases` 2.5x, `tags` 2.0x, `headings` 1.5x, `body` 1.0x, zero `.sqlite`/index files written to the vault) to locate top-ranked anchor notes:
+   ```bash
+   python3 <plugin_dir>/scripts/vault_query.py "<query>" --vault "${OBSIDIAN_VAULT_PATH:-$HOME/ObsidianVault}" --json
+   ```
+   - To include the shared sanitized pattern repository (`$OKF_PATTERNS_PATH`) with automatic outbound DLP query scrubbing, pass `--federated`:
+     ```bash
+     python3 <plugin_dir>/scripts/vault_query.py "<query>" --vault "${OBSIDIAN_VAULT_PATH:-$HOME/ObsidianVault}" --federated --json
+     ```
+   - By default, `raw/` is excluded (`wiki/` only). When explicitly searching uncompiled raw intake (`--include-raw`), raw matches are down-weighted (`0.7x`) and wrapped in `<untrusted-snippet source="raw/...">...</untrusted-snippet>`.
+   - Before creating a new synthesis or concept note, run the pre-ingest duplicate check (`create_safety`: `exists` | `probable` | `unknown`):
+     ```bash
+     python3 <plugin_dir>/scripts/vault_query.py "<candidate_title_or_topic>" --vault "${OBSIDIAN_VAULT_PATH:-$HOME/ObsidianVault}" --check-duplicate --json
+     ```
+4. Locate primary entry points across:
    - `wiki/entities/`: Organization profiles, platforms, tools, people.
    - `wiki/concepts/`: Architecture blueprints, security patterns, algorithms, frameworks.
    - `wiki/sources/`: Distilled meeting notes, whitepapers, lecture decks.
-4. If targeted keyword matching is required, search across `${OBSIDIAN_VAULT_PATH:-~/ObsidianVault}/wiki`.
 
 ### 2. Associative Graph Traversal (Progressive Disclosure)
 1. Read the anchor note(s) using `view_file`.
@@ -84,16 +97,13 @@ If the query produces non-trivial cross-cutting analysis, customer comparisons, 
      - domain/topic
    status: stable
    sources:
-     - "[[wiki/sources/...]]"
-   generated:
-     by: antigravity/gemini-pro
-     at: YYYY-MM-DDTHH:MM:SSZ
-   verified:
-     - by: human:<username>
-       at: YYYY-MM-DDTHH:MM:SSZ
+     - id: source-slug
+       resource: "wiki/sources/..."
+   generated: { by: knowledge-compiler/gemini-pro, at: YYYY-MM-DDTHH:MM:SSZ }
    aliases: []
    ---
    ```
+   Omit `verified:` on agent-authored notes until explicit human review (`vault-lint --approve-human <note>`).
 3. Add the new synthesis note into `${OBSIDIAN_VAULT_PATH:-~/ObsidianVault}/index.md` under `## 📑 Synthesis & Research Analyses`.
 4. Append an entry to `${OBSIDIAN_VAULT_PATH:-~/ObsidianVault}/log.md`:
    `## [YYYY-MM-DD] query | <Topic Name>`

@@ -31,12 +31,25 @@ import hashlib
 import json
 import re
 import sys
+import unicodedata
 from pathlib import Path
 from typing import Any
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
+
+_INVISIBLE_CHARS_RE = re.compile(
+    r"[\u00ad\u034f\u061c\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff\U000e0000-\U000e007f]"
+)
+_HTML_COMMENT_RE = re.compile(r"<!--[\s\S]*?-->")
+
+
+def normalize_shadow_view(text: str) -> str:
+    """Normalize text (NFKC) and strip zero-width, bidi, tag characters, and HTML comments for DLP/secret detection."""
+    norm = unicodedata.normalize("NFKC", text)
+    no_comments = _HTML_COMMENT_RE.sub("", norm)
+    return _INVISIBLE_CHARS_RE.sub("", no_comments)
 
 from sync_patterns import (  # noqa: E402
     BLOCKED_KEYWORD_PATTERNS,
@@ -73,7 +86,7 @@ IDENTITY_SHA256_PREFIXES: dict[str, str] = {}
 WORKSTATION_AND_IDENTITY_PATTERNS: list[tuple[str, str]] = [
     (r"/usr/local/[a-zA-Z0-9._-]+/home/[a-zA-Z0-9._-]+", "Workstation home path"),
     (r"/home/[a-zA-Z0-9._-]+", "Local Linux /home/<user> path"),
-    (r"/Users/[a-zA-Z0-9._-]+", "Local macOS /Users/<user> path"),
+    (r"/(?:Users|users)/[a-zA-Z0-9._-]+", "Local macOS /Users/<user> path"),
     (r"\bhuman:(?!(?:cloud-ce|ce-name|author)\b)[a-zA-Z0-9._-]+\b", "Personal frontmatter verifier handle"),
 ]
 
@@ -589,93 +602,157 @@ def scan_markdown_file(
                     line_no,
                 )
 
-    # 2. Customer, PE Sponsor, and Partner Entity Checks
-    for pat, label in STRICT_ENTITY_PATTERNS:
-        for m in re.finditer(pat, content, re.IGNORECASE):
-            _add(
-                "customer_dlp",
-                f"Forbidden identifier detected ({label}): '{m.group(0)}'",
-                _line_of(m.start()),
-            )
-
-    for start_off, _end_off, span_txt, s_label in scan_sha256_entities_in_text(
-        content, sha_map=ENTITY_SHA256_PATTERNS
-    ):
-        _add(
-            "customer_dlp",
-            f"Forbidden identifier detected ({s_label}): '{span_txt}'",
-            _line_of(start_off),
-        )
-
-    for start_off, _end_off, span_txt, _arch in scan_sha256_entities_in_text(content):
-        _add(
-            "customer_dlp",
-            f"Customer entity detected: '{span_txt}'",
-            _line_of(start_off),
-        )
+    # 2. Customer, PE Sponsor, and Partner Entity Checks (over raw content and shadow view)
+    shadow_content = normalize_shadow_view(content)
+    text_variants = [content] if shadow_content == content else [content, shadow_content]
 
     all_customers = set(DEFAULT_CUSTOMER_ANONYMIZATIONS.keys())
     if dynamic_customers:
         all_customers.update(dynamic_customers)
-    for cust in sorted(all_customers):
-        # Skip 2-3 letter ambiguous acronyms unless exact case-sensitive match
-        if len(cust) <= 3:
-            for m in re.finditer(r"\b" + re.escape(cust) + r"\b", content):
+
+    raw_detected_signatures: set[str] = set()
+
+    for text_variant in text_variants:
+        is_shadow = (text_variant is shadow_content)
+        v_line = (lambda off: 1) if is_shadow else _line_of
+
+        for pat, label in STRICT_ENTITY_PATTERNS:
+            for m in re.finditer(pat, text_variant, re.IGNORECASE):
+                sig = f"entity:{m.group(0)}"
+                if not is_shadow:
+                    raw_detected_signatures.add(sig)
+                elif sig in raw_detected_signatures:
+                    continue
+                suffix = " [shadow_view evasion]" if is_shadow else ""
                 _add(
                     "customer_dlp",
-                    f"Customer acronym detected: '{m.group(0)}'",
-                    _line_of(m.start()),
+                    f"Forbidden identifier detected ({label}){suffix}: '{m.group(0)}'",
+                    v_line(m.start()),
                 )
-        else:
-            for m in re.finditer(r"\b" + re.escape(cust) + r"\b", content, re.IGNORECASE):
+
+        for start_off, _end_off, span_txt, s_label in scan_sha256_entities_in_text(
+            text_variant, sha_map=ENTITY_SHA256_PATTERNS
+        ):
+            sig = f"sha_strict:{span_txt}"
+            if not is_shadow:
+                raw_detected_signatures.add(sig)
+            elif sig in raw_detected_signatures:
+                continue
+            suffix = " [shadow_view evasion]" if is_shadow else ""
+            _add(
+                "customer_dlp",
+                f"Forbidden identifier detected ({s_label}){suffix}: '{span_txt}'",
+                v_line(start_off),
+            )
+
+        for start_off, _end_off, span_txt, _arch in scan_sha256_entities_in_text(text_variant):
+            sig = f"sha_entity:{span_txt}"
+            if not is_shadow:
+                raw_detected_signatures.add(sig)
+            elif sig in raw_detected_signatures:
+                continue
+            suffix = " [shadow_view evasion]" if is_shadow else ""
+            _add(
+                "customer_dlp",
+                f"Customer entity detected{suffix}: '{span_txt}'",
+                v_line(start_off),
+            )
+
+        for cust in sorted(all_customers):
+            # Skip 2-3 letter ambiguous acronyms unless exact case-sensitive match
+            if len(cust) <= 3:
+                for m in re.finditer(r"\b" + re.escape(cust) + r"\b", text_variant):
+                    sig = f"cust:{m.group(0)}"
+                    if not is_shadow:
+                        raw_detected_signatures.add(sig)
+                    elif sig in raw_detected_signatures:
+                        continue
+                    suffix = " [shadow_view evasion]" if is_shadow else ""
+                    _add(
+                        "customer_dlp",
+                        f"Customer acronym detected{suffix}: '{m.group(0)}'",
+                        v_line(m.start()),
+                    )
+            else:
+                for m in re.finditer(r"\b" + re.escape(cust) + r"\b", text_variant, re.IGNORECASE):
+                    sig = f"cust:{m.group(0).lower()}"
+                    if not is_shadow:
+                        raw_detected_signatures.add(sig)
+                    elif sig in raw_detected_signatures:
+                        continue
+                    suffix = " [shadow_view evasion]" if is_shadow else ""
+                    _add(
+                        "customer_dlp",
+                        f"Customer entity detected{suffix}: '{m.group(0)}'",
+                        v_line(m.start()),
+                    )
+
+        # 3. Cloud Account IDs, Project IDs & Private Workspace Doc IDs
+        for pat, label in STRICT_INFRA_PATTERNS:
+            for m in re.finditer(pat, text_variant, re.IGNORECASE):
+                sig = f"infra:{m.group(0)}"
+                if not is_shadow:
+                    raw_detected_signatures.add(sig)
+                elif sig in raw_detected_signatures:
+                    continue
+                _add("infra_dlp", f"{label}: '{m.group(0)}'", v_line(m.start()))
+
+        for m in re.finditer(r"\b([a-zA-Z0-9_-]{7,64})\b", text_variant):
+            tok = m.group(1)
+            sig = f"tok:{tok}"
+            if not is_shadow:
+                raw_detected_signatures.add(sig)
+            elif sig in raw_detected_signatures:
+                continue
+            exact_prefix = hashlib.sha256(tok.encode("utf-8")).hexdigest()[:24]
+            lower_prefix = hashlib.sha256(tok.lower().encode("utf-8")).hexdigest()[:24]
+            matched_label = INFRA_SHA256_PREFIXES.get(
+                exact_prefix
+            ) or INFRA_SHA256_PREFIXES.get(lower_prefix)
+            if matched_label:
+                _add("infra_dlp", f"{matched_label}: '{tok}'", v_line(m.start()))
+            elif is_wiki_pattern:
+                id_label = IDENTITY_SHA256_PREFIXES.get(lower_prefix)
+                if id_label:
+                    _add("identity_or_path", f"{id_label}: '{tok}'", v_line(m.start()))
+
+        for m in re.finditer(r"\b(\d{12})\b", text_variant):
+            acct_id = m.group(1)
+            sig = f"aws:{acct_id}"
+            if not is_shadow:
+                raw_detected_signatures.add(sig)
+            elif sig in raw_detected_signatures:
+                continue
+            if acct_id not in SYNTHETIC_AWS_ACCOUNT_ALLOWLIST:
                 _add(
-                    "customer_dlp",
-                    f"Customer entity detected: '{m.group(0)}'",
-                    _line_of(m.start()),
+                    "aws_account_id",
+                    f"Non-allowlisted 12-digit number (potential AWS Account ID): '{acct_id}'",
+                    v_line(m.start()),
                 )
 
-    # 3. Cloud Account IDs, Project IDs & Private Workspace Doc IDs
-    for pat, label in STRICT_INFRA_PATTERNS:
-        for m in re.finditer(pat, content, re.IGNORECASE):
-            _add("infra_dlp", f"{label}: '{m.group(0)}'", _line_of(m.start()))
+        # 4. Workstation Paths & Personal Handles
+        for pat, label in WORKSTATION_AND_IDENTITY_PATTERNS:
+            for m in re.finditer(pat, text_variant, re.IGNORECASE):
+                sig = f"path:{m.group(0)}"
+                if not is_shadow:
+                    raw_detected_signatures.add(sig)
+                elif sig in raw_detected_signatures:
+                    continue
+                _add("identity_or_path", f"{label}: '{m.group(0)}'", v_line(m.start()))
 
-    for m in re.finditer(r"\b([a-zA-Z0-9_-]{7,64})\b", content):
-        tok = m.group(1)
-        exact_prefix = hashlib.sha256(tok.encode("utf-8")).hexdigest()[:24]
-        lower_prefix = hashlib.sha256(tok.lower().encode("utf-8")).hexdigest()[:24]
-        matched_label = INFRA_SHA256_PREFIXES.get(
-            exact_prefix
-        ) or INFRA_SHA256_PREFIXES.get(lower_prefix)
-        if matched_label:
-            _add("infra_dlp", f"{matched_label}: '{tok}'", _line_of(m.start()))
-        elif is_wiki_pattern:
-            id_label = IDENTITY_SHA256_PREFIXES.get(lower_prefix)
-            if id_label:
-                _add("identity_or_path", f"{id_label}: '{tok}'", _line_of(m.start()))
-
-    for m in re.finditer(r"\b(\d{12})\b", content):
-        acct_id = m.group(1)
-        if acct_id not in SYNTHETIC_AWS_ACCOUNT_ALLOWLIST:
-            _add(
-                "aws_account_id",
-                f"Non-allowlisted 12-digit number (potential AWS Account ID): '{acct_id}'",
-                _line_of(m.start()),
-            )
-
-    # 4. Workstation Paths & Personal Handles (strictly enforced on wiki/ pattern notes;
-    #    root README.md may legitimately link to internal documentation portal paths)
-    for pat, label in WORKSTATION_AND_IDENTITY_PATTERNS:
-        for m in re.finditer(pat, content, re.IGNORECASE):
-            _add("identity_or_path", f"{label}: '{m.group(0)}'", _line_of(m.start()))
-
-    # 5. HR / Performance / Compensation Keywords
-    for pat in BLOCKED_KEYWORD_PATTERNS:
-        for m in re.finditer(pat, content, re.IGNORECASE):
-            _add(
-                "hr_sensitive_keyword",
-                f"Blocked HR/compensation keyword: '{m.group(0)}'",
-                _line_of(m.start()),
-            )
+        # 5. HR / Performance / Compensation Keywords
+        for pat in BLOCKED_KEYWORD_PATTERNS:
+            for m in re.finditer(pat, text_variant, re.IGNORECASE):
+                sig = f"hr:{m.group(0).lower()}"
+                if not is_shadow:
+                    raw_detected_signatures.add(sig)
+                elif sig in raw_detected_signatures:
+                    continue
+                _add(
+                    "hr_sensitive_keyword",
+                    f"Blocked HR/compensation keyword: '{m.group(0)}'",
+                    v_line(m.start()),
+                )
 
     # 6. Automated Detection of Private `wiki/entities/` Wikilinks (always active on shared wiki notes)
     if is_wiki_pattern or rel_display == "index.md":

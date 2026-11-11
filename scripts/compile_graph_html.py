@@ -26,7 +26,6 @@ import argparse
 import io
 import json
 import sys
-import tempfile
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -38,9 +37,14 @@ import vault_graph  # noqa: E402
 import vault_lint  # noqa: E402
 
 
-def compile_and_verify(vault_path: Path, output_html: Path) -> dict:
+def compile_and_verify(vault_path: Path, output_html: Path | None = None) -> dict:
     """Export standalone WebGL graph HTML and run OKF v0.2 lint verification."""
-    export_res = vault_graph.export_graph_html(vault_path, output_html)
+    target_html = (
+        output_html
+        if output_html is not None
+        else vault_graph.resolve_default_export_html_path()
+    )
+    export_res = vault_graph.export_graph_html(vault_path, target_html)
     buf = io.StringIO()
     with redirect_stdout(buf):
         lint_res = vault_lint.run_vault_lint(vault_path, auto_fix=False, as_json=True)
@@ -63,8 +67,11 @@ def main() -> int:
     parser.add_argument(
         "-o",
         "--output",
-        default=str(Path(tempfile.gettempdir()) / "Obsidian_Vault_WebGL_Graph.html"),
-        help="Output HTML path outside the vault root (default: /tmp/Obsidian_Vault_WebGL_Graph.html).",
+        default=None,
+        help=(
+            "Output HTML path outside the vault tree "
+            "(default: $XDG_CACHE_HOME/knowledge-compiler/exports/Obsidian_Vault_WebGL_Graph.html)."
+        ),
     )
     parser.add_argument(
         "--json",
@@ -74,14 +81,12 @@ def main() -> int:
     args = parser.parse_args()
 
     vault_root = vault_graph.resolve_default_vault(args.vault)
-    out_path = Path(args.output).expanduser().resolve()
-
-    # Enforce Vault Root Cleanliness Invariant: never write exported HTML inside the vault root
-    if out_path.parent == vault_root:
-        raise ValueError(
-            f"Vault Root Cleanliness Invariant violation: refusing to write '{out_path.name}' "
-            f"directly inside vault root '{vault_root}'. Choose /tmp or an artifact path."
-        )
+    raw_output = (
+        Path(args.output)
+        if args.output
+        else vault_graph.resolve_default_export_html_path()
+    )
+    out_path = vault_graph.validate_export_output_path(vault_root, raw_output)
 
     res = compile_and_verify(vault_root, out_path)
     st = res["export"]["stats"]

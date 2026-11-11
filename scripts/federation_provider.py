@@ -38,13 +38,25 @@ from sync_patterns import (  # noqa: E402
     BLOCKED_KEYWORD_PATTERNS,
     DEFAULT_CUSTOMER_ANONYMIZATIONS,
     SecurityException,
+    _build_customer_regex,
+    build_entity_archetype_map,
     check_content_security,
+    collect_egress_customer_names,
     discover_customer_entities,
     load_custom_denylist,
     scan_sha256_entities_in_text,
     share_pattern,
 )
 from vault_lint import find_vault_root, parse_simple_yaml  # noqa: E402
+from vault_query import (  # noqa: E402
+    _build_plain_excerpt,
+    expand_customer_anonymization_variants,
+    extract_note_fields,
+    iter_vault_markdown_files,
+    normalize_query_for_dlp,
+    score_notes_bm25,
+    tokenize_for_bm25,
+)
 
 DEFAULT_ALLOWLISTED_DOMAINS: tuple[str, ...] = (
     "cloud.google.com",
@@ -55,6 +67,11 @@ DEFAULT_ALLOWLISTED_DOMAINS: tuple[str, ...] = (
     "github.com",
     "arxiv.org",
     "okf.md",
+)
+
+# Unified sensitive local filesystem pattern to sanitize
+LOCAL_PATH_REGEX = re.compile(
+    r"/(?:usr/local/[a-zA-Z0-9._-]+/home|home|Users|users)/[a-zA-Z0-9._-]+(?:/[^\s\"'`)\]>]*)?"
 )
 
 CANONICAL_GCP_PRODUCTS: dict[str, str] = {
@@ -141,12 +158,7 @@ def list_ce_patterns_catalog(
                         fm = parsed
                     body = parts[2].strip()
             title = str(fm.get("title") or md_file.stem).strip()
-            plain = re.sub(r"```.*?```", "", body, flags=re.DOTALL)
-            plain = re.sub(r"^#+\s+.*$", "", plain, flags=re.MULTILINE)
-            plain = re.sub(r"\[\[([^\]|]+)\|([^\]]+)\]\]", r"\2", plain)
-            plain = re.sub(r"\[\[([^\]]+)\]\]", r"\1", plain)
-            plain = re.sub(r"[*_`>|#-]", " ", plain)
-            plain = re.sub(r"\s+", " ", plain).strip()
+            plain = _build_plain_excerpt(body, max_chars=260)
             rel_path = str(md_file.relative_to(ce_root)).replace("\\", "/")
             raw_tags = fm.get("tags", [])
             tags = (
@@ -262,8 +274,12 @@ def polish_markdown_for_okf_export(markdown_body: str) -> tuple[str, list[str]]:
             clean_target = raw_target.split("/")[-1].removesuffix(".md").strip()
             return clean_target
 
-        seg = re.sub(r"\[\[([^\]|\n]+)\\?\|([^\]\n]+)\]\]", _repl_aliased, segment)
-        seg = re.sub(r"\[\[([^\]\n]+)\]\]", _repl_plain, seg)
+        seg = re.sub(
+            r"\[\[([^\[\]|\n]{1,512})\\?\|([^\[\]\n]{1,512})\]\]",
+            _repl_aliased,
+            segment,
+        )
+        seg = re.sub(r"\[\[([^\[\]\n]{1,512})\]\]", _repl_plain, seg)
         return seg
 
     parts = re.split(r"(```[\s\S]*?```)", polished)
@@ -279,7 +295,7 @@ def polish_markdown_for_okf_export(markdown_body: str) -> tuple[str, list[str]]:
     return polished, polish_notes
 
 
-polish_markdown_for_ace_brain = polish_markdown_for_okf_export
+polish_markdown_for_remote_tier = polish_markdown_for_okf_export
 
 
 def resolve_caller_ldap() -> str:
@@ -302,21 +318,29 @@ def sanitize_query_for_federation(
     obsidian_vault_root: Path | None = None,
 ) -> dict[str, Any]:
     """Scrub customer names, local paths, and private keywords from an outbound federated search query."""
-    cleaned = query.strip()
+    cleaned = normalize_query_for_dlp(query).strip()
     redactions: list[str] = []
 
     anonymizations = dict(DEFAULT_CUSTOMER_ANONYMIZATIONS)
     if obsidian_vault_root and obsidian_vault_root.exists():
         anonymizations.update(load_custom_denylist(obsidian_vault_root))
+        entity_map, _ = build_entity_archetype_map(obsidian_vault_root)
+        for cust_name, archetype in entity_map.items():
+            if cust_name not in anonymizations:
+                anonymizations[cust_name] = archetype
         for cust in discover_customer_entities(obsidian_vault_root):
             if cust not in anonymizations:
                 anonymizations[cust] = "Enterprise Customer"
+        for cust in collect_egress_customer_names(obsidian_vault_root):
+            if cust not in anonymizations:
+                anonymizations[cust] = "Enterprise Customer"
+    anonymizations = expand_customer_anonymization_variants(anonymizations)
 
     fallback_industry = ""
     for cust_name in sorted(anonymizations.keys(), key=len, reverse=True):
-        if len(cust_name) < 3:
+        if len(cust_name) < 2:
             continue
-        pattern = re.compile(r"\b" + re.escape(cust_name) + r"\b", re.IGNORECASE)
+        pattern = _build_customer_regex(cust_name)
         if pattern.search(cleaned):
             replacement = anonymizations[cust_name]
             if not fallback_industry:
@@ -339,9 +363,8 @@ def sanitize_query_for_federation(
     if not cleaned and fallback_industry:
         cleaned = fallback_industry
 
-    path_pat = re.compile(r"/(?:usr/local/google/home|home|Users)/[a-zA-Z0-9._/-]+")
-    if path_pat.search(cleaned):
-        cleaned = path_pat.sub("", cleaned).strip()
+    if LOCAL_PATH_REGEX.search(cleaned):
+        cleaned = LOCAL_PATH_REGEX.sub("", cleaned).strip()
         redactions.append("Scrubbed local workstation path")
 
     violations = check_content_security(cleaned)
@@ -367,54 +390,61 @@ def _search_markdown_dir(
     plane_label: str,
     limit: int = 10,
 ) -> list[dict[str, Any]]:
-    """Rank markdown notes in `root_dir` matching `query` tokens."""
+    """Rank markdown notes in `root_dir` matching `query` tokens using Okapi BM25."""
     if not root_dir.exists():
         return []
-    tokens = [t.lower() for t in re.split(r"[^a-zA-Z0-9]+", query) if len(t) >= 2]
+    tokens = tokenize_for_bm25(query)
     results: list[dict[str, Any]] = []
 
-    for sub in subdirs:
-        target = root_dir / sub
-        if not target.is_dir():
-            continue
-        for md_file in sorted(target.rglob("*.md")):
-            raw = md_file.read_text(encoding="utf-8", errors="ignore")
-            fm: dict[str, Any] = {}
-            body = raw
-            if raw.startswith("---"):
-                parts = raw.split("---", 2)
-                if len(parts) >= 3:
-                    parsed = parse_simple_yaml(parts[1])
-                    if isinstance(parsed, dict):
-                        fm = parsed
-                    body = parts[2].strip()
-            title = str(fm.get("title") or md_file.stem).strip()
-            haystack = f"{title} {md_file.stem} {raw}".lower()
-            if not tokens:
-                score = 1.0
-            else:
-                matched = sum(1 for tok in tokens if tok in haystack)
-                title_hits = sum(2 for tok in tokens if tok in title.lower())
-                if matched == 0:
-                    continue
-                score = round((matched + title_hits) / (len(tokens) * 3), 3)
-
-            plain = re.sub(r"```[\s\S]*?```", "", body)
-            plain = re.sub(r"^#+\s+.*$", "", plain, flags=re.MULTILINE)
-            plain = re.sub(r"\s+", " ", plain).strip()
-            rel_id = str(md_file.relative_to(root_dir)).replace("\\", "/")
+    if tokens:
+        bm25_hits = score_notes_bm25(
+            root_dir,
+            query,
+            subdirs=subdirs,
+            include_raw=False,
+            limit=limit,
+        )
+        for hit in bm25_hits:
             results.append(
                 {
-                    "id": rel_id,
-                    "title": title,
+                    "id": hit["id"],
+                    "title": hit["title"],
                     "plane": plane_label,
-                    "score": score,
-                    "excerpt": plain[:240],
-                    "tags": fm.get("tags", []) if isinstance(fm.get("tags"), list) else [],
+                    "score": float(hit["score"]),
+                    "excerpt": str(hit.get("excerpt") or "")[:240],
+                    "tags": (
+                        hit.get("tags", [])
+                        if isinstance(hit.get("tags"), list)
+                        else []
+                    ),
                 }
             )
+        return results
 
-    results.sort(key=lambda r: float(r.get("score", 0.0)), reverse=True)
+    for full_path, rel_id, _is_raw in iter_vault_markdown_files(
+        root_dir, subdirs=subdirs, include_raw=False
+    ):
+        fields = extract_note_fields(full_path, rel_id)
+        if fields is None:
+            continue
+        plain = _build_plain_excerpt(str(fields["body"]), max_chars=240)
+        results.append(
+            {
+                "id": rel_id,
+                "title": str(fields["title"]),
+                "plane": plane_label,
+                "score": 1.0,
+                "excerpt": plain[:240],
+                "tags": (
+                    fields.get("tags", [])
+                    if isinstance(fields.get("tags"), list)
+                    else []
+                ),
+            }
+        )
+        if len(results) >= limit:
+            break
+
     return results[:limit]
 
 
@@ -489,7 +519,9 @@ class LocalGitPatternProvider:
 
     def query(self, query_text: str, *, limit: int = 10) -> list[dict[str, Any]]:
         dlp = sanitize_query_for_federation(query_text, self.vault_root)
-        q = dlp["sanitized_query"] or query_text
+        if dlp["dlp_triggered"] and not dlp["sanitized_query"]:
+            return []
+        q = dlp["sanitized_query"] if dlp["dlp_triggered"] else query_text
         return _search_markdown_dir(
             self.patterns_root,
             ("wiki/concepts", "wiki/patterns"),
@@ -503,8 +535,8 @@ class LocalGitPatternProvider:
     ) -> dict[str, Any]:
         target_repo = output_dir.expanduser().resolve() if output_dir else self.patterns_root
         return share_pattern(
-            note_path=note_path,
-            shared_repo_root=target_repo,
+            pattern_file=note_path,
+            target_repo_path=target_repo,
             vault_root=self.vault_root,
             dry_run=False,
         )
@@ -515,9 +547,17 @@ def run_portable_federated_query(
     obsidian_vault_root: Path | None = None,
     ce_patterns_root: Path | None = None,
     limit: int = 8,
+    include_local_vault: bool = True,
+    include_ce_patterns: bool = True,
+    ace_enabled: bool = False,
+    limit_per_source: int | None = None,
     **_kwargs: Any,
 ) -> dict[str, Any]:
     """Execute a 2-plane portable federated search across the local vault and shared patterns repo."""
+    del ace_enabled
+    effective_limit = (
+        int(limit_per_source) if limit_per_source is not None else int(limit)
+    )
     v_root = (
         obsidian_vault_root.expanduser().resolve()
         if obsidian_vault_root
@@ -526,29 +566,91 @@ def run_portable_federated_query(
     p_root = resolve_ce_patterns_root(ce_patterns_root)
     dlp_info = sanitize_query_for_federation(query, obsidian_vault_root=v_root)
 
-    local_hits = _search_markdown_dir(
-        v_root,
-        ("wiki/concepts", "wiki/patterns", "wiki/entities", "wiki/synthesis", "wiki/sources"),
-        query,
-        plane_label="local-vault",
-        limit=limit,
-    )
-    shared_hits = _search_markdown_dir(
-        p_root,
-        ("wiki/concepts", "wiki/patterns"),
-        dlp_info["sanitized_query"] or query,
-        plane_label="shared-patterns",
-        limit=limit,
-    )
+    local_hits: list[dict[str, Any]] = []
+    if include_local_vault:
+        local_hits = _search_markdown_dir(
+            v_root,
+            (
+                "wiki/concepts",
+                "wiki/patterns",
+                "wiki/entities",
+                "wiki/synthesis",
+                "wiki/sources",
+            ),
+            query,
+            plane_label="local-vault",
+            limit=effective_limit,
+        )
+
+    shared_hits: list[dict[str, Any]] = []
+    if include_ce_patterns:
+        sanitized_q = dlp_info["sanitized_query"]
+        if not (dlp_info["dlp_triggered"] and not sanitized_q):
+            shared_hits = _search_markdown_dir(
+                p_root,
+                ("wiki/concepts", "wiki/patterns"),
+                sanitized_q if dlp_info["dlp_triggered"] else query,
+                plane_label="shared-patterns",
+                limit=effective_limit,
+            )
+
+    local_ui_results: list[dict[str, Any]] = [
+        {
+            "id": h["id"],
+            "label": h["title"],
+            "title": h["title"],
+            "plane": h["plane"],
+            "source_plane": "local_vault",
+            "source_badge": "🔒 Local Vault (Air-Gapped)",
+            "can_promote_to_ace": False,
+            "score": float(h["score"]),
+            "excerpt": h["excerpt"],
+            "tags": h.get("tags", []),
+        }
+        for h in local_hits
+    ]
+    shared_ui_results: list[dict[str, Any]] = [
+        {
+            "id": (
+                h["id"]
+                if str(h["id"]).startswith("shared-patterns://")
+                else f"shared-patterns://{h['id']}"
+            ),
+            "rel_path": h["id"],
+            "concept_id": normalize_okf_concept_id(Path(str(h["id"])).stem),
+            "label": h["title"],
+            "title": h["title"],
+            "plane": h["plane"],
+            "source_plane": "ce_patterns",
+            "source_badge": "🛡️ Shared Patterns (Sanitized)",
+            "can_promote_to_ace": False,
+            "score": float(h["score"]),
+            "excerpt": h["excerpt"],
+            "tags": h.get("tags", []),
+        }
+        for h in shared_hits
+    ]
+    combined: list[dict[str, Any]] = local_ui_results + shared_ui_results
+    combined.sort(key=lambda r: float(r.get("score", 0.0)), reverse=True)
+
     return {
         "query": query,
         "sanitized_query": dlp_info["sanitized_query"],
         "dlp": dlp_info,
+        "dlp_guard": dlp_info,
+        "remote_tier_enabled": False,
+        "total_results": len(combined),
+        "results": combined,
         "planes": {
             "obsidian_vault": {
                 "path": str(v_root),
                 "count": len(local_hits),
                 "results": local_hits,
+            },
+            "local_vault": {
+                "path": str(v_root),
+                "count": len(local_hits),
+                "results": local_ui_results,
             },
             "ce_patterns": {
                 "path": str(p_root),

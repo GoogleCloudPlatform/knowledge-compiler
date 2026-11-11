@@ -66,16 +66,14 @@ tags:
   - domain/topic
 status: stable # draft | stable | deprecated
 sources:
-  - ""
-generated:
-  by: antigravity/gemini-pro
-  at: YYYY-MM-DDTHH:MM:SSZ
-verified:
-  - by: human:author
-    at: YYYY-MM-DDTHH:MM:SSZ
+  - id: source-slug
+    resource: "raw/source.md"
+generated: { by: knowledge-compiler/gemini-pro, at: YYYY-MM-DDTHH:MM:SSZ }
 aliases: []
 ---
 ```
+
+> **Trust-Tier Integrity (OKF v0.2 §5.3)**: Omit `verified:` on agent-authored notes until explicit human review (`vault-lint --approve-human <note>`).
 
 ### Linking Rules
 - Use Obsidian `[[wikilinks]]` generously for all concepts, entities, and source cross-references.
@@ -120,6 +118,15 @@ Welcome to the **Knowledge Compiler** index. This document provides a high-level
 
 | Synthesis Document | Focus Areas | Key Findings |
 | :--- | :--- | :--- |
+
+---
+
+## 🛠️ Evolution & Operations Ledgers (`wiki/`)
+
+| Ledger | Category | Purpose |
+| :--- | :--- | :--- |
+| [Vault Teleology & Strategic Anchors](purpose.md) | `meta/teleology` | Active engagements, architectural pillars, and open theses. |
+| [Skill Impact & Evolution Ledger](wiki/skill-impact.md) | `skill-evolution/ledger` | Tracks WikiSkill evolution proposals and validation outcomes. |
 """
 
 DEFAULT_LOG_MD = """---

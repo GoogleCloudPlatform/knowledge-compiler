@@ -25,14 +25,14 @@ import json
 import shutil
 from pathlib import Path
 
-_GLOBAL_PLUGIN_REL = "/".join((".gemini", "config", "plugins", "knowledge-compiler"))
+_GLOBAL_PLUGIN_REL = ".agent/plugins/knowledge-compiler"
 _LEGACY_HARNESS_KEY = "antigravity_cli"
 
 PLUGIN_MANIFEST = {
     "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
     "name": "knowledge-compiler",
     "displayName": "Knowledge Compiler",
-    "version": "0.9.0",
+    "version": "1.0.0",
     "description": (
         "Compile PDFs, slides, docs, and agent sessions into a local Open Knowledge Format "
         "(OKF v0.2) Markdown wiki with a 2D/3D WebGL graph and linter."
@@ -111,7 +111,7 @@ REPO_HOOKS_CONFIG = {
         ],
     },
     "wikiskill-error-recorder": {
-        "enabled": True,
+        "enabled": False,
         "PostToolUse": [
             {
                 "matcher": ".*",
@@ -156,7 +156,7 @@ GLOBAL_HOOKS_CONFIG = {
         ],
     },
     "wikiskill-error-recorder": {
-        "enabled": True,
+        "enabled": False,
         "PostToolUse": [
             {
                 "matcher": ".*",
@@ -243,6 +243,11 @@ def install_global_plugin(
     hooks_path.write_text(
         json.dumps(GLOBAL_HOOKS_CONFIG, indent=2) + "\n", encoding="utf-8"
     )
+
+    # 2b. Copy root STABILITY.md if present
+    stability_src = root / "STABILITY.md"
+    if stability_src.is_file():
+        shutil.copy2(stability_src, plugin_dir / "STABILITY.md")
 
     # 3. Sync rules/AGENTS.md
     rules_src = (
@@ -507,7 +512,7 @@ def main() -> None:
         harnesses.append("Default (~/.gemini/config)")
 
     print("============================================================")
-    print(" Knowledge Compiler — Global Plugin Installer (v0.9.0)")
+    print(" Knowledge Compiler — Global Plugin Installer (v1.0.0)")
     print("============================================================")
     print(f" Detected Harnesses : {', '.join(harnesses)}")
     print(f" Plugin Directory   : {result['plugin_dir']}")

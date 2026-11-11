@@ -27,7 +27,7 @@
     ]
   },
   "wikiskill-error-recorder": {
-    "enabled": true,
+    "enabled": false,
     "PostToolUse": [
       {
         "matcher": ".*",

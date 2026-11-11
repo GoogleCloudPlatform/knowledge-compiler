@@ -46,22 +46,38 @@ This skill performs automated graph validation, OKF v0.2 frontmatter schema veri
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 1. Run Automated Linter (and Optional Upstream OKF Spec Version Check)
-Execute the OKF vault linter script via `run_command`:
+### 1. Run Automated Linter, Strict Mode, Migration & Human Approval
+Execute the OKF v0.2 vault linter script via `run_command` (with `wiki/` as the strict OKF v0.2 bundle root):
 ```bash
+# Standard health & OKF conformance audit (plus optional upstream spec check)
 python3 <plugin_dir>/scripts/vault_lint.py "${OBSIDIAN_VAULT_PATH:-$HOME/ObsidianVault}" --check-okf-upstream
+
+# Strict CI / conformance mode (fails with exit 1 on stale_notes, orphan_notes, missing_from_index, legacy_sources_notes)
+python3 <plugin_dir>/scripts/vault_lint.py "${OBSIDIAN_VAULT_PATH:-$HOME/ObsidianVault}" --strict --json
+
+# Repair escaped table pipes AND opt-in migrate legacy string sources to OKF {id, resource} objects
+python3 <plugin_dir>/scripts/vault_lint.py "${OBSIDIAN_VAULT_PATH:-$HOME/ObsidianVault}" --fix --migrate-sources
+
+# Stamp explicit human verification onto a reviewed wiki/ note (Trust Tier: human-reviewed)
+python3 <plugin_dir>/scripts/vault_lint.py "${OBSIDIAN_VAULT_PATH:-$HOME/ObsidianVault}" \
+  --approve-human wiki/concepts/MyNote.md --actor human:<username>
 ```
 - Pass `--check-okf-upstream` whenever checking whether a newer version of the official Open Knowledge Format specification has been published at [`github.com/GoogleCloudPlatform/open-knowledge-format`](https://github.com/GoogleCloudPlatform/open-knowledge-format) (`SPEC.md`, currently `v0.2`).
 
+#### Exit Codes
+- `0`: Conformant (`is_healthy == True` and zero warnings when `--strict` is active).
+- `1`: Conformance errors (`missing_frontmatter`, missing `type`, `<= 16 KiB` or YAML anchor/alias violations, invalid `Attested Computation` or `sources` dict entries), `broken_links`, `table_invariant_violations`, or warnings under `--strict`.
+- `2`: Invalid or missing vault path, missing `wiki/` bundle root, or invalid `--approve-human` target (outside `wiki/`, symlink, traversal, `raw/`, or root file).
+
 ### 2. Inspect Audit Heuristics & Graph Intelligence
 The linter verifies critical health metrics and computes graph structural insights:
-1. **Broken Links (`🔗`)**: Unresolved `[[Target]]` wikilinks where the destination markdown file does not exist.
+1. **Broken Links (`🔗`) & `wanted_pages`**: Unresolved `[[Target]]` wikilinks where the destination markdown file does not exist, aggregated and ranked in `wanted_pages` by inbound reference count (`inbound_count` descending).
 2. **Table Pipe Invariants (`⚠️`)**: Verifies no escaped pipe characters exist inside tables (`[[Target|Alias]]` required).
 3. **Orphan Notes (`🏝️`)**: Notes with 0 inbound wikilinks from other notes or `index.md`.
 4. **Dead-End Notes (`🛑`)**: Notes with 0 outbound links.
-5. **Freshness & Stale Claims (`⏳`)**: Flags any notes where `current_time >= stale_after`.
+5. **Freshness & Stale Claims (`⏳`)**: Flags any notes in `stale_notes` where `current_time >= stale_after` (warning by default; fails under `--strict`).
 6. **Unindexed Wiki Notes (`📑`)**: Markdown notes in `wiki/` that are omitted from `index.md`.
-7. **OKF Schema Compliance (`📐`)**: Validates YAML frontmatter keys (`title`, `type`, `created`, `updated`, `tags`, `status`, `generated`, `verified`).
+7. **OKF v0.2 Bundle Compliance & Trust Tiers (`📐`)**: Validates every non-reserved note in `wiki/` (`type` required, YAML `<= 16 KiB` without `&`/`*` anchors/aliases, `sources` validation with `legacy_sources_notes` notice, footnote checks, and `Attested Computation` contracts) and computes `trust_tier_counts` (`unverified`, `machine-confirmed`, `human-reviewed`). Also validates root Workspace Profile files (`index.md`, `log.md`, `GEMINI.md`).
 8. **4-Signal Graph Relevance Engine (`🧠`)**:
    - **Bridge Hubs**: High-degree nodes bridging $\ge 2$ distinct knowledge domains.
    - **Cluster Cohesion**: Calculates subgraph density $\frac{2E}{V(V-1)}$ across directories to spot sparse conceptual clusters.
@@ -69,8 +85,10 @@ The linter verifies critical health metrics and computes graph structural insigh
 
 ### 3. Automated Remediation
 - **Missing Index Entries**: Automatically add missing notes into the appropriate section in `index.md`.
-- **Table Pipe Invariant Violations**: Fix any escaped pipe characters inside markdown table links (replace `[[Target\|Alias]]` with `[[Target|Alias]]`).
-- **Orphan Resolution**: Add reciprocal connections in corresponding concept or source summaries.
+- **Table Pipe Invariant Violations**: Run `--fix` to repair escaped pipe characters inside markdown table links (replace `[[Target\|Alias]]` with `[[Target|Alias]]`).
+- **Legacy Sources Migration**: Run `--fix --migrate-sources` to deterministically upgrade legacy string `sources:` entries into `{id, resource}` mappings.
+- **Human Trust-Tier Approval**: Run `--approve-human <wiki-note-path>` after manual review to stamp `verified: [{ by: human:<id>, at: <UTC> }]`.
+- **Orphan & Wanted Pages Resolution**: Add reciprocal connections in corresponding concept or source summaries, or create high-priority notes listed in `wanted_pages`.
 - **Cross-Synthesis Creation**: When recommended by the 4-signal engine, suggest or create `wiki/synthesis/` notes bridging high-affinity topics.
 
 ### 4. Append Audit Entry to `log.md`

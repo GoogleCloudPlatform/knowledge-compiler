@@ -50,11 +50,14 @@ for _p in (str(HOOKS_DIR), str(SCRIPTS_DIR)):
 from auto_sync_vault import (  # noqa: E402
     _check_and_mark_debounce,
     _run_vault_lint_fix,
+    _stage_vault_files,
+    acquire_vault_lock,
     detect_harness,
     get_active_branch,
     get_default_vault_path,
+    get_plugin_data_dir,
+    has_in_progress_git_operation,
     has_origin_remote,
-    is_rebase_in_progress,
     merge_index_markdown,
     merge_log_markdown,
     rebase_onto_origin,
@@ -116,8 +119,29 @@ def _sync_vault_on_session_start(vault_path: Path) -> tuple[dict, list[str]]:
     if not (vault_path / ".git").exists():
         return {"status": "not_git_repo", "path": str(vault_path)}, notices
 
-    if is_rebase_in_progress(vault_path):
-        run_cmd(["git", "rebase", "--abort"], cwd=vault_path, timeout=8)
+    with acquire_vault_lock(vault_path) as lock_acquired:
+        if not lock_acquired:
+            return {"status": "locked_skipped", "path": str(vault_path)}, notices
+
+        return _sync_vault_on_session_start_locked(vault_path, notices)
+
+
+def _sync_vault_on_session_start_locked(
+    vault_path: Path, notices: list[str]
+) -> tuple[dict, list[str]]:
+    # Never touch or abort a user's in-progress rebase, merge, cherry-pick, revert, or conflicts
+    active_op = has_in_progress_git_operation(vault_path)
+    if active_op:
+        status = (
+            "skipped_rebase_in_progress"
+            if active_op == "rebase"
+            else f"skipped_{active_op}_in_progress"
+        )
+        notices.append(
+            f"[Knowledge Compiler] Vault sync skipped for `{vault_path.name}` because a manual "
+            f"Git operation (`{active_op}`) is currently in progress."
+        )
+        return {"status": status, "path": str(vault_path)}, notices
 
     if not has_origin_remote(vault_path):
         return {"status": "local_only", "path": str(vault_path)}, notices
@@ -238,10 +262,16 @@ def _sync_vault_on_session_start(vault_path: Path) -> tuple[dict, list[str]]:
             run_cmd(["git", "status", "--porcelain"], cwd=vault_path, timeout=5).stdout.strip()
         )
         if post_lint_dirty:
-            run_cmd(["git", "add", "-A"], cwd=vault_path, timeout=5)
-            run_cmd(
-                ["git", "commit", "--amend", "--no-edit"], cwd=vault_path, timeout=5
-            )
+            _stage_vault_files(vault_path)
+            if (
+                run_cmd(
+                    ["git", "diff", "--cached", "--quiet"], cwd=vault_path, timeout=5
+                ).returncode
+                != 0
+            ):
+                run_cmd(
+                    ["git", "commit", "--amend", "--no-edit"], cwd=vault_path, timeout=5
+                )
         run_cmd(["git", "push", "origin", branch], cwd=vault_path, timeout=8)
 
     return {"status": sync_mode, "path": str(vault_path)}, notices
@@ -251,8 +281,24 @@ def _fast_forward_clean_shared_repo(repo_path: Path) -> dict:
     """Fast-forward a clean shared repository (`main` or `master`) from `origin`."""
     if not repo_path.exists() or not (repo_path / ".git").exists():
         return {"status": "missing"}
-    if not has_origin_remote(repo_path):
-        return {"status": "no_origin"}
+
+    with acquire_vault_lock(repo_path) as lock_acquired:
+        if not lock_acquired:
+            return {"status": "locked_skipped"}
+        active_op = has_in_progress_git_operation(repo_path)
+        if active_op:
+            status = (
+                "skipped_rebase_in_progress"
+                if active_op == "rebase"
+                else f"skipped_{active_op}_in_progress"
+            )
+            return {"status": status}
+        if not has_origin_remote(repo_path):
+            return {"status": "no_origin"}
+        return _fast_forward_clean_shared_repo_locked(repo_path)
+
+
+def _fast_forward_clean_shared_repo_locked(repo_path: Path) -> dict:
 
     branch = get_active_branch(repo_path)
     if branch not in ("main", "master"):
@@ -420,7 +466,15 @@ def check_startup_sync_gate(
     digest = hashlib.sha256(
         f"startup_sync:{target_path}".encode("utf-8")
     ).hexdigest()[:12]
-    base_dir = stamp_dir if stamp_dir is not None else Path(tempfile.gettempdir())
+    if stamp_dir is not None:
+        base_dir = stamp_dir
+    else:
+        base_dir = get_plugin_data_dir() / "stamps"
+        try:
+            base_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(base_dir, 0o700)
+        except OSError:
+            base_dir = Path(tempfile.gettempdir())
     stamp_file = base_dir / f"kc_startup_sync_{digest}.json"
     now = time.time()
 

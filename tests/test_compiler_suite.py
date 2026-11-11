@@ -16,11 +16,13 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 # Add scripts directory to path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
@@ -30,11 +32,13 @@ import analyze_trace  # noqa: E402
 import auto_sync_vault  # noqa: E402
 import compile_graph_html  # noqa: E402
 import extract_source  # noqa: E402
+import federation_provider  # noqa: E402
 import init_vault  # noqa: E402
 import install_plugin  # noqa: E402
 import log_tool_failure  # noqa: E402
 import sanitize_check  # noqa: E402
 import session_sync  # noqa: E402
+import sync_patterns  # noqa: E402
 import vault_graph  # noqa: E402
 import vault_lint  # noqa: E402
 
@@ -42,10 +46,48 @@ import vault_lint  # noqa: E402
 class TestKnowledgeCompilerSuite(unittest.TestCase):
     """Hermetic unit tests for Knowledge Compiler suite."""
 
+
     def setUp(self):
         self.test_dir = tempfile.mkdtemp(prefix="kc_test_")
+        self._orig_env = dict(os.environ)
+        iso_home = Path(self.test_dir) / "home"
+        iso_home.mkdir(parents=True, exist_ok=True)
+        iso_state = Path(self.test_dir) / "state"
+        iso_state.mkdir(parents=True, exist_ok=True)
+        iso_cache = Path(self.test_dir) / "cache"
+        iso_cache.mkdir(parents=True, exist_ok=True)
+        iso_plugin_data = Path(self.test_dir) / "plugin_data"
+        iso_plugin_data.mkdir(parents=True, exist_ok=True)
+        iso_patterns = Path(self.test_dir) / "empty_patterns"
+        iso_patterns.mkdir(parents=True, exist_ok=True)
+        iso_vault = Path(self.test_dir) / "empty_vault"
+        iso_vault.mkdir(parents=True, exist_ok=True)
+
+        os.environ["HOME"] = str(iso_home)
+        os.environ["XDG_STATE_HOME"] = str(iso_state)
+        os.environ["XDG_CACHE_HOME"] = str(iso_cache)
+        os.environ["PLUGIN_DATA"] = str(iso_plugin_data)
+        os.environ["OBSIDIAN_VAULT_PATH"] = str(iso_vault)
+        os.environ["OKF_PATTERNS_PATH"] = str(iso_patterns)
+
+        self._mock_patchers = [
+            mock.patch.object(
+                vault_graph,
+                "OWNER_TOKEN_PATH",
+                iso_plugin_data / ".vault_graph_token",
+            ),
+        ]
+        for p in self._mock_patchers:
+            p.start()
 
     def tearDown(self):
+        for p in reversed(getattr(self, "_mock_patchers", [])):
+            try:
+                p.stop()
+            except Exception:
+                pass
+        os.environ.clear()
+        os.environ.update(self._orig_env)
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def test_init_vault(self):
@@ -232,7 +274,9 @@ class TestKnowledgeCompilerSuite(unittest.TestCase):
             encoding="utf-8",
         )
 
-        graph = vault_graph.build_vault_graph(vault_path)
+        graph = vault_graph.build_vault_graph(
+            vault_path, ce_patterns_root=Path(self.test_dir) / "empty_patterns"
+        )
         self.assertGreaterEqual(graph["stats"]["wikiNotes"], 4)
         self.assertGreaterEqual(graph["stats"]["totalEdges"], 3)
         self.assertEqual(graph["stats"]["categoryCounts"]["pattern"], 1)
@@ -326,15 +370,20 @@ class TestKnowledgeCompilerSuite(unittest.TestCase):
             )
 
     def test_vault_graph_epistemic_edges_and_unified_hub(self):
-        """Test 5-way epistemic edge extraction and unified Search Hub HTML output."""
+        """Test explicit-only 5-way epistemic edge extraction and unified Search Hub HTML output."""
         vault_path = Path(self.test_dir) / "EpistemicVault"
         init_vault.init_vault(vault_path)
 
         note_a = vault_path / "wiki" / "concepts" / "Pattern A.md"
         note_a.write_text(
-            "---\ntitle: Pattern A\ntype: concept\n---\n"
+            "---\n"
+            "title: Pattern A\n"
+            "type: concept\n"
+            'corroborates: ["[[Pattern B]]"]\n'
+            "---\n"
             "# Pattern A\n\n"
-            "This pattern corroborates [[Pattern B]] and contradicts [[Legacy Pattern]].\n",
+            "contradicts::[[Legacy Pattern]]\n\n"
+            "Also references [[Pattern B]] in follow-up prose.\n",
             encoding="utf-8",
         )
         note_b = vault_path / "wiki" / "concepts" / "Pattern B.md"
@@ -347,11 +396,38 @@ class TestKnowledgeCompilerSuite(unittest.TestCase):
             "---\ntitle: Legacy Pattern\ntype: concept\n---\n# Legacy Pattern\n",
             encoding="utf-8",
         )
+        note_prose = vault_path / "wiki" / "concepts" / "Pattern Prose.md"
+        note_prose.write_text(
+            "---\ntitle: Pattern Prose\ntype: concept\n---\n"
+            "# Pattern Prose\n\n"
+            "Compare [[Pattern B]] vs [[Legacy Pattern]].\n",
+            encoding="utf-8",
+        )
 
-        graph = vault_graph.build_vault_graph(vault_path)
+        graph = vault_graph.build_vault_graph(
+            vault_path, ce_patterns_root=Path(self.test_dir) / "empty_patterns"
+        )
         edge_types = graph["stats"]["edgeTypeCounts"]
-        self.assertGreaterEqual(edge_types.get("CORROBORATES", 0), 1)
-        self.assertGreaterEqual(edge_types.get("CONTRADICTS", 0), 1)
+        self.assertEqual(edge_types.get("CORROBORATES", 0), 1)
+        self.assertEqual(edge_types.get("CONTRADICTS", 0), 1)
+        self.assertGreaterEqual(edge_types.get("LINKS_TO", 0), 2)
+        edge_map = {(e["source"], e["target"]): e["type"] for e in graph["edges"]}
+        self.assertEqual(
+            edge_map[("wiki/concepts/Pattern A.md", "wiki/concepts/Pattern B.md")],
+            "CORROBORATES",
+        )
+        self.assertEqual(
+            edge_map[("wiki/concepts/Pattern A.md", "wiki/concepts/Legacy Pattern.md")],
+            "CONTRADICTS",
+        )
+        self.assertEqual(
+            edge_map[("wiki/concepts/Pattern Prose.md", "wiki/concepts/Pattern B.md")],
+            "LINKS_TO",
+        )
+        self.assertEqual(
+            edge_map[("wiki/concepts/Pattern Prose.md", "wiki/concepts/Legacy Pattern.md")],
+            "LINKS_TO",
+        )
         self.assertIn("epistemicTypes", graph)
 
     def test_upstream_okf_version_checker(self):
@@ -1074,6 +1150,340 @@ class TestKnowledgeCompilerSuite(unittest.TestCase):
         self.assertTrue((repo_root / 'plugin.json').exists())
         self.assertTrue((repo_root / 'hooks.json').exists())
         self.assertFalse((repo_root / 'scripts' / 'build_oss_release.py').exists())
+
+    def test_local_git_pattern_provider_export_pattern(self):
+        """Verify LocalGitPatternProvider.export_pattern() keyword argument parity with share_pattern."""
+        vault_path = Path(self.test_dir) / "ExportVault"
+        init_vault.init_vault(vault_path)
+        target_repo = Path(self.test_dir) / "ExportTargetRepo"
+        target_repo.mkdir(parents=True)
+        (target_repo / "wiki" / "concepts").mkdir(parents=True)
+
+        note_file = vault_path / "wiki" / "concepts" / "Clean Design.md"
+        note_file.write_text(
+            "---\n"
+            "title: Clean Design\n"
+            "type: concept\n"
+            "tags:\n"
+            "  - architecture\n"
+            "---\n"
+            "# Clean Design\n\n"
+            "This is a generic concept note describing loosely-coupled architecture.\n",
+            encoding="utf-8",
+        )
+
+        provider = federation_provider.LocalGitPatternProvider(
+            patterns_root=target_repo, vault_root=vault_path
+        )
+        res = provider.export_pattern(note_file)
+        self.assertTrue(res["success"])
+        exported = target_repo / "wiki" / "concepts" / "Clean Design.md"
+        self.assertTrue(exported.is_file())
+        self.assertIn("Clean Design", exported.read_text(encoding="utf-8"))
+
+    def test_share_pattern_fail_closed_egress_gate(self):
+        """Verify mandatory in-code egress security gate in share_pattern() blocks leaks fail-closed."""
+        vault_path = Path(self.test_dir) / "SecurityVault"
+        init_vault.init_vault(vault_path)
+        target_repo = Path(self.test_dir) / "SecurityTargetRepo"
+        target_repo.mkdir(parents=True)
+
+        # Baseline clean note must succeed
+        clean_note = vault_path / "wiki" / "concepts" / "Safe Pattern.md"
+        clean_note.write_text(
+            "---\n"
+            "title: Safe Pattern\n"
+            "type: concept\n"
+            "tags:\n"
+            "  - gcp/compute\n"
+            "---\n"
+            "# Safe Pattern\n\n"
+            "Contact author@example.com for details.\n"
+            "Public unit rates like $0.046/vCPU-hr and $0.50 per query are allowed.\n",
+            encoding="utf-8",
+        )
+        res = sync_patterns.share_pattern(
+            pattern_file=clean_note, target_repo_path=target_repo, vault_root=vault_path
+        )
+        self.assertTrue(res["success"])
+
+        # Test cases that MUST be rejected fail-closed
+        leak_cases = [
+            # Frontmatter title customer leak
+            ("---\ntitle: Migration for AcmeCorp\ntype: concept\n---\n# Architecture\n", "title customer"),
+            # Frontmatter aliases customer leak
+            ("---\ntitle: High Availability\ntype: concept\naliases:\n  - Northwind\n---\n# Arch\n", "alias customer"),
+            # Frontmatter tags customer leak
+            ("---\ntitle: Resiliency\ntype: concept\ntags:\n  - customer-contoso\n---\n# Arch\n", "tags customer"),
+            # Body customer leak
+            ("---\ntitle: Scalability\ntype: concept\n---\n# Arch\nBuilt for Fabrikam.\n", "body customer"),
+            # Code block customer leak
+            ("---\ntitle: Pipeline\ntype: concept\n---\n```python\n# client = AcmeCorp()\n```\n", "code block customer"),
+            # Google API key (constructed dynamically to avoid static git-secrets false positives)
+            (f"---\ntitle: Keys\ntype: concept\n---\napi_key = '{'AIza'}{'SyD12345678901234567890'}'\n", "API key"),
+            # OAuth access token
+            (f"---\ntitle: Auth\ntype: concept\n---\ntoken = '{'ya29'}.{'a0AfH6SMAAAAAA1234567890'}'\n", "OAuth token"),
+            # Private key block
+            (f"---\ntitle: TLS\ntype: concept\n---\n-----BEGIN {'RSA PRIVATE'} KEY-----\nMIIEowIBAAKCAQEA0\n", "private key"),
+            # GCS bucket path
+            ("---\ntitle: Storage\ntype: concept\n---\nUpload to gs://my-secret-bucket-data.\n", "GCS bucket"),
+            # Exact unbucketed decimal currency
+            ("---\ntitle: Spend\ntype: concept\n---\nTotal spend was $12,345.67 per month.\n", "unbucketed currency"),
+            # Shadow-view evasion: zero-width character in secret
+            ("---\ntitle: ZeroWidth\ntype: concept\n---\nAI\u200bzaSyD12345678901234567890\n", "zero-width evasion"),
+            # Shadow-view evasion: HTML comment in customer name
+            ("---\ntitle: CommentEvasion\ntype: concept\n---\nAc<!-- comment -->meCorp architecture.\n", "comment evasion"),
+        ]
+
+
+        for content, label in leak_cases:
+            bad_note = vault_path / "wiki" / "concepts" / "LeakTest.md"
+            bad_note.write_text(content, encoding="utf-8")
+            with self.assertRaises(sync_patterns.SecurityException, msg=f"Failed to reject {label}"):
+                sync_patterns.share_pattern(
+                    pattern_file=bad_note, target_repo_path=target_repo, vault_root=vault_path
+                )
+            # Verify fail-closed zero write
+            self.assertFalse(
+                (target_repo / "wiki" / "concepts" / "LeakTest.md").exists(),
+                f"Leaked destination file written for {label}",
+            )
+
+        # 1. Note with customer name in stem/filename MUST be rejected before any write
+        denylist_file = vault_path / "denylist.json"
+        denylist_file.write_text(json.dumps({"customers": ["Initech", "Hooli (EMEA)"]}), encoding="utf-8")
+        cust_stem_note = vault_path / "wiki" / "concepts" / "Initech Landing Zone.md"
+        cust_stem_note.write_text(
+            "---\ntitle: Clean Title\ntype: concept\n---\n# Architecture\nClean body.\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(sync_patterns.SecurityException):
+            sync_patterns.share_pattern(
+                pattern_file=cust_stem_note, target_repo_path=target_repo, vault_root=vault_path
+            )
+        self.assertFalse((target_repo / "wiki" / "concepts" / "Initech Landing Zone.md").exists())
+
+        # 2. Customer names from tables/customers.md (wikilink and plain text rows)
+        cust_tbl = vault_path / "tables" / "customers.md"
+        cust_tbl.parent.mkdir(parents=True, exist_ok=True)
+        cust_tbl.write_text(
+            "| Customer Account | Segment |\n| :--- | :--- |\n| [[wiki/entities/Cyberdyne|Cyberdyne Systems]] | Enterprise |\n| Massive Dynamic | Tech |\n",
+            encoding="utf-8",
+        )
+        tbl_leak = vault_path / "wiki" / "concepts" / "TblLeak.md"
+        tbl_leak.write_text(
+            "---\ntitle: TblLeak\ntype: concept\n---\nConsulted with Cyberdyne Systems on deployment.\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(sync_patterns.SecurityException):
+            sync_patterns.share_pattern(
+                pattern_file=tbl_leak, target_repo_path=target_repo, vault_root=vault_path
+            )
+        self.assertFalse((target_repo / "wiki" / "concepts" / "TblLeak.md").exists())
+
+        # 3. Multi-word customer name across line wrap
+        wrap_leak = vault_path / "wiki" / "concepts" / "WrapLeak.md"
+        wrap_leak.write_text(
+            "---\ntitle: WrapLeak\ntype: concept\n---\nDeployed Massive\nDynamic enterprise setup.\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(sync_patterns.SecurityException):
+            sync_patterns.share_pattern(
+                pattern_file=wrap_leak, target_repo_path=target_repo, vault_root=vault_path
+            )
+        self.assertFalse((target_repo / "wiki" / "concepts" / "WrapLeak.md").exists())
+
+        # 4. Customer name ending with non-word character
+        hooli_leak = vault_path / "wiki" / "concepts" / "HooliLeak.md"
+        hooli_leak.write_text(
+            "---\ntitle: HooliLeak\ntype: concept\n---\nMigrating Hooli (EMEA) to GKE clusters.\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(sync_patterns.SecurityException):
+            sync_patterns.share_pattern(
+                pattern_file=hooli_leak, target_repo_path=target_repo, vault_root=vault_path
+            )
+        self.assertFalse((target_repo / "wiki" / "concepts" / "HooliLeak.md").exists())
+
+        # 5. Quoted author handle gets sanitized to human:cloud-ce without leaking handle
+        author_note = vault_path / "wiki" / "concepts" / "AuthorNote.md"
+        author_note.write_text(
+            "---\n"
+            "title: Author Note\n"
+            "type: concept\n"
+            "tags:\n  - gcp/compute\n"
+            "verified:\n"
+            '  by: "human:jdoe"\n'
+            "---\n"
+            "# Author Note\n\nClean architecture.\n",
+            encoding="utf-8",
+        )
+        auth_res = sync_patterns.share_pattern(
+            pattern_file=author_note, target_repo_path=target_repo, vault_root=vault_path
+        )
+        self.assertTrue(auth_res["success"])
+        shared_text = (target_repo / "wiki" / "concepts" / "AuthorNote.md").read_text(encoding="utf-8")
+        self.assertIn("human:cloud-ce", shared_text)
+        self.assertNotIn("jdoe", shared_text)
+
+        # 6. Obfuscated and underscore note stems rejected fail-closed
+        obf_cases = [
+            "Initech_LZ.md",
+            "Ini\u200btech LZ.md",
+            "Ｉｎｉｔｅｃｈ LZ.md",
+            "Ini\u00adtech LZ.md",
+            "Ini\u202etech LZ.md",
+        ]
+        for obf_name in obf_cases:
+            obf_note = vault_path / "wiki" / "concepts" / obf_name
+            obf_note.write_text(
+                "---\ntitle: Obf\ntype: concept\n---\n# Architecture\nClean body.\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(sync_patterns.SecurityException, msg=f"Failed to reject obf stem {obf_name!r}"):
+                sync_patterns.share_pattern(
+                    pattern_file=obf_note, target_repo_path=target_repo, vault_root=vault_path
+                )
+            self.assertFalse((target_repo / "wiki" / "concepts" / obf_name).exists())
+
+        # 7. Customer in parent directory rejected fail-closed
+        parent_cust_dir = vault_path / "wiki" / "concepts" / "Initech"
+        parent_cust_dir.mkdir(parents=True, exist_ok=True)
+        parent_cust_note = parent_cust_dir / "CleanNote.md"
+        parent_cust_note.write_text(
+            "---\ntitle: Clean\ntype: concept\n---\n# Architecture\nClean body.\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(sync_patterns.SecurityException):
+            sync_patterns.share_pattern(
+                pattern_file=parent_cust_note, target_repo_path=target_repo, vault_root=vault_path
+            )
+
+        # 8. Short entity alias (RBC <= 3 chars) blocks both prose and note stem
+        rbc_entity = vault_path / "wiki" / "entities" / "Royal Bank of Canada.md"
+        rbc_entity.parent.mkdir(parents=True, exist_ok=True)
+        rbc_entity.write_text(
+            "---\ntitle: Royal Bank of Canada\ntype: entity\naliases:\n  - RBC\n---\nEntity dossier.\n",
+            encoding="utf-8",
+        )
+        rbc_prose = vault_path / "wiki" / "concepts" / "RBCProse.md"
+        rbc_prose.write_text(
+            "---\ntitle: RBCProse\ntype: concept\n---\nClient RBC migrated to GCP.\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(sync_patterns.SecurityException):
+            sync_patterns.share_pattern(
+                pattern_file=rbc_prose, target_repo_path=target_repo, vault_root=vault_path
+            )
+        rbc_stem = vault_path / "wiki" / "concepts" / "RBC LZ.md"
+        rbc_stem.write_text(
+            "---\ntitle: Clean Title\ntype: concept\n---\nClean body.\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(sync_patterns.SecurityException):
+            sync_patterns.share_pattern(
+                pattern_file=rbc_stem, target_repo_path=target_repo, vault_root=vault_path
+            )
+
+        # 9. Extended frontmatter identity sanitization (author, owner, full name)
+        fm_ident_note = vault_path / "wiki" / "concepts" / "IdentNote.md"
+        fm_ident_note.write_text(
+            "---\n"
+            "title: Ident Note\n"
+            "name: hub-and-spoke-vpc\n"
+            "type: concept\n"
+            'author: "Jane Doe"\n'
+            'owner: "John Smith"\n'
+            "authors: [jdoe, Jane Doe]\n"
+            "contributor:\n"
+            '  name: "Alice Walker"\n'
+            "verified:\n"
+            '  by: "human:Jane Doe"\n'
+            "generated:\n"
+            '  by: "agent:jdoe-bot"\n'
+            "---\n"
+            "# Architecture\nClean body.\n",
+            encoding="utf-8",
+        )
+        ident_res = sync_patterns.share_pattern(
+            pattern_file=fm_ident_note, target_repo_path=target_repo, vault_root=vault_path
+        )
+        self.assertTrue(ident_res["success"])
+        ident_shared = (target_repo / "wiki" / "concepts" / "IdentNote.md").read_text(encoding="utf-8")
+        self.assertNotIn("Jane Doe", ident_shared)
+        self.assertNotIn("John Smith", ident_shared)
+        self.assertNotIn("Alice Walker", ident_shared)
+        self.assertNotIn("jdoe-bot", ident_shared)
+        self.assertIn("name: hub-and-spoke-vpc", ident_shared)
+        self.assertIn("Google Cloud CE", ident_shared)
+        self.assertIn("human:cloud-ce", ident_shared)
+        self.assertIn("agent:knowledge-compiler", ident_shared)
+
+        # 10. Robust alias parsing handles multi-line flow lists, null, ~, quoted commas, and YAML 1.1 bools (F2)
+        f2_multiline = "---\naliases: [\n  RBC,\n  Initech\n]\n---"
+        self.assertEqual(sync_patterns._extract_aliases_from_frontmatter(f2_multiline), ["RBC", "Initech"])
+        f2_null = "---\naliases: null\n---"
+        self.assertEqual(sync_patterns._extract_aliases_from_frontmatter(f2_null), [])
+        f2_tilde = "---\naliases: ~\n---"
+        self.assertEqual(sync_patterns._extract_aliases_from_frontmatter(f2_tilde), [])
+        f2_comma = '---\naliases: ["QCC, Inc", FinCorp]\n---'
+        self.assertEqual(sync_patterns._extract_aliases_from_frontmatter(f2_comma), ["QCC, Inc", "FinCorp"])
+        f2_bools = '---\naliases: [ON, Yes, "-"]\n---'
+        self.assertEqual(sync_patterns._extract_aliases_from_frontmatter(f2_bools), ["ON", "Yes"])
+
+        # Multi-line flow authors list sanitization
+        fm_multi_flow = (
+            "---\n"
+            "title: Flow Pattern\n"
+            "authors: [\n"
+            "  jdoe,\n"
+            '  "Jane Doe"\n'
+            "]\n"
+            "---\n"
+            "# Content\n"
+        )
+        sanitized_multi, _ = sync_patterns.sanitize_markdown(fm_multi_flow)
+        self.assertNotIn("Jane Doe", sanitized_multi)
+        self.assertNotIn("jdoe", sanitized_multi)
+        self.assertIn("human:cloud-ce", sanitized_multi)
+
+        # 11. Corrupt denylist fails closed with ValueError
+        corrupt_denylist = vault_path / "corrupt_denylist"
+        corrupt_denylist.mkdir(parents=True, exist_ok=True)
+        (corrupt_denylist / "denylist.json").write_text("{ corrupt json ", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            sync_patterns.load_custom_denylist(corrupt_denylist)
+
+        # Verify unredacted workstation path is detected directly by verify_pattern_egress_security
+        path_findings = sync_patterns.verify_pattern_egress_security(
+            "Reference path: /usr/local/google/home/jdoe/repo"
+        )
+        self.assertTrue(
+            any("workstation path" in f.lower() for f in path_findings),
+            f"Expected workstation path detection, got {path_findings}",
+        )
+
+    def test_pyproject_extract_extra_parity(self):
+        """Verify root pyproject.toml [extract] extra and dependencies match 3P release constraints."""
+        pyproject_path = Path(__file__).resolve().parent.parent / "pyproject.toml"
+        self.assertTrue(pyproject_path.is_file())
+        content = pyproject_path.read_text(encoding="utf-8")
+
+        self.assertIn("extract = [", content)
+        expected_pins = [
+            "python-pptx>=0.6.21,<2.0.0",
+            "pypdf>=4.0.0,<8.0.0",
+            "python-docx>=1.0.0,<2.0.0",
+            "openpyxl>=3.1.0,<4.0.0",
+        ]
+        for pin in expected_pins:
+            self.assertIn(f'"{pin}"', content, f"Missing expected extract pin: {pin}")
+
+        if "all = [" in content:
+            all_block = content.split("all = [")[1].split("]")[0]
+            for pin in expected_pins:
+                self.assertIn(f'"{pin}"', all_block, f"Missing extract pin from 'all': {pin}")
+
 
 if __name__ == "__main__":
     unittest.main()

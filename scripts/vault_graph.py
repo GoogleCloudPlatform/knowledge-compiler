@@ -32,6 +32,8 @@ WebGL (2D Obsidian Mode + 3D Orbit Mode) graph visualizer with:
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict
+import copy
 import hashlib
 import hmac
 import http
@@ -43,8 +45,12 @@ import math
 import os
 import re
 import secrets
+import stat
+import struct
 import subprocess
 import sys
+import tempfile
+import threading
 import urllib.parse
 from pathlib import Path
 from typing import Any
@@ -60,6 +66,7 @@ from federation_provider import (  # noqa: E402
     run_portable_federated_query,
 )
 from init_vault import init_vault  # noqa: E402
+import okf  # noqa: E402
 from sync_patterns import (  # noqa: E402
     DEFAULT_CUSTOMER_ANONYMIZATIONS,
     get_plugin_data_dir,
@@ -171,24 +178,235 @@ EPISTEMIC_EDGE_META: dict[str, dict[str, str]] = {
 }
 
 
+_EPISTEMIC_FM_KEYS: tuple[str, ...] = (
+    "corroborates",
+    "complements",
+    "extends",
+    "contradicts",
+    "supersedes",
+)
+_INLINE_EPISTEMIC_PREFIX_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])\b(corroborates|complements|extends|contradicts|supersedes)[ \t]{0,32}::(?:[ \t]{0,32}\[\[[ \t]{0,32}|[ \t]{0,32})$",
+    re.IGNORECASE,
+)
+_INLINE_EPISTEMIC_COMPLETE_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])\b(corroborates|complements|extends|contradicts|supersedes)[ \t]{0,32}::[ \t]{0,32}\[\[[^\[\]\n]{1,512}\]\][ \t]{0,32}[.,;:]?[ \t]{0,32}$",
+    re.IGNORECASE,
+)
+_GRAPH_FENCE_OPEN_RE = re.compile(
+    r"^[ \t]*(?:>[ \t]*)*(?:(?:[-*+]|\d+[.)])[ \t]+(?:\[[ xX]\][ \t]+)?)?(`{3,}|~{3,})(.*)$"
+)
+_GRAPH_BACKTICK_RUN_RE = re.compile(r"`+")
+
+
 def infer_epistemic_edge_type(context_line: str, explicit_type: str | None = None) -> str:
-    """Classify a directed relationship into Remote Tier's 5-way epistemic taxonomy or LINKS_TO."""
+    """Classify a directed relationship strictly from explicit frontmatter or `rel::[[Target]]` syntax."""
     if explicit_type:
         up = explicit_type.strip().upper()
         if up in EPISTEMIC_EDGE_META:
             return up
-    lower = context_line.lower()
-    if any(k in lower for k in ("contradict", "trade-off", "tradeoff", " vs ", " vs.", "versus", "alternative to")):
-        return "CONTRADICTS"
-    if any(k in lower for k in ("supersede", "replaces", "deprecated", "obsolete", "migrated from")):
-        return "SUPERSEDES"
-    if any(k in lower for k in ("corroborate", "validated", "confirms", "proven", "verified", "benchmark")):
-        return "CORROBORATES"
-    if any(k in lower for k in ("extends", "specializes", "builds on", "derived from", "deep-dive")):
-        return "EXTENDS"
-    if any(k in lower for k in ("complement", "paired with", "alongside", "integrates with", "coexistence", "synergy")):
-        return "COMPLEMENTS"
+    if context_line and "::" in context_line:
+        match = _INLINE_EPISTEMIC_PREFIX_RE.search(context_line)
+        if match:
+            return match.group(1).upper()
+        match_full = _INLINE_EPISTEMIC_COMPLETE_RE.search(context_line)
+        if match_full:
+            return match_full.group(1).upper()
     return "LINKS_TO"
+
+
+def _mask_inline_code_linear_chunk(chunk: str, replacement: str = "\x00") -> str:
+    """Replace inline code spans (`...`, ``...``) in `chunk` in strictly linear O(N) time."""
+    if "`" not in chunk:
+        return chunk
+    runs = [
+        (m.start(), m.end(), m.end() - m.start())
+        for m in _GRAPH_BACKTICK_RUN_RE.finditer(chunk)
+    ]
+    if len(runs) < 2:
+        return chunk
+
+    by_len: dict[int, list[int]] = {}
+    for idx, (_s, _e, rlen) in enumerate(runs):
+        by_len.setdefault(rlen, []).append(idx)
+
+    cursors: dict[int, int] = {rlen: 0 for rlen in by_len}
+    pieces: list[str] = []
+    last_char_pos = 0
+    i = 0
+    n_runs = len(runs)
+    while i < n_runs:
+        s_i, _e_i, rlen = runs[i]
+        idx_list = by_len[rlen]
+        if len(idx_list) < 2:
+            i += 1
+            continue
+        cur = cursors[rlen]
+        while cur < len(idx_list) and idx_list[cur] <= i:
+            cur += 1
+        cursors[rlen] = cur
+        if cur >= len(idx_list):
+            i += 1
+            continue
+        match_run_idx = idx_list[cur]
+        cursors[rlen] = cur + 1
+        _s_j, e_j, _ = runs[match_run_idx]
+        pieces.append(chunk[last_char_pos:s_i])
+        pieces.append(replacement)
+        last_char_pos = e_j
+        i = match_run_idx + 1
+
+    if last_char_pos == 0:
+        return chunk
+    pieces.append(chunk[last_char_pos:])
+    return "".join(pieces)
+
+
+def _count_bq_depth(line: str) -> int:
+    depth = 0
+    for ch in line:
+        if ch == ">":
+            depth += 1
+        elif ch not in (" ", "\t"):
+            break
+    return depth
+
+
+def _strip_bq_prefix(line: str) -> str:
+    i = 0
+    n = len(line)
+    while i < n:
+        ch = line[i]
+        if ch in (" ", "\t", ">"):
+            i += 1
+        else:
+            break
+    return line[i:]
+
+
+def _mask_markdown_for_graph(body: str, replacement: str = "\x00") -> str:
+    """Strip fenced code blocks (``` / ~~~), HTML comments, and inline code spans in O(N) time."""
+    if (
+        "```" not in body
+        and "~~~" not in body
+        and "<!--" not in body
+        and "`" not in body
+    ):
+        return body
+
+    last_comment_close = body.rfind("-->")
+    lines = body.splitlines(keepends=True)
+    out_lines: list[str] = []
+
+    in_fence = False
+    fence_ch = ""
+    fence_len = 0
+    fence_bq_depth = 0
+    in_comment = False
+    line_offset = 0
+
+    for raw_line in lines:
+        line_len = len(raw_line)
+        line_no_nl = raw_line.rstrip("\r\n")
+        eol = raw_line[len(line_no_nl) :]
+
+        if in_fence:
+            line_bq = _count_bq_depth(line_no_nl)
+            if fence_bq_depth > 0 and line_bq < fence_bq_depth:
+                in_fence = False
+            else:
+                inner = _strip_bq_prefix(line_no_nl) if fence_bq_depth > 0 else line_no_nl.lstrip(" \t")
+                if inner.startswith(fence_ch * fence_len):
+                    stripped_tail = inner[len(fence_ch) :]
+                    run_len = 1
+                    for ch in stripped_tail:
+                        if ch == fence_ch:
+                            run_len += 1
+                        elif ch in (" ", "\t"):
+                            break
+                        else:
+                            run_len = -1
+                            break
+                    if run_len >= fence_len and not inner[run_len:].strip():
+                        in_fence = False
+                        out_lines.append(eol)
+                        line_offset += line_len
+                        continue
+                if in_fence:
+                    out_lines.append(eol)
+                    line_offset += line_len
+                    continue
+
+        if in_comment:
+            end_idx = line_no_nl.find("-->")
+            if end_idx < 0:
+                out_lines.append(eol)
+                line_offset += line_len
+                continue
+            in_comment = False
+            remainder = replacement + line_no_nl[end_idx + 3 :]
+        else:
+            m_fence = (
+                _GRAPH_FENCE_OPEN_RE.match(line_no_nl)
+                if ("```" in line_no_nl or "~~~" in line_no_nl)
+                else None
+            )
+            if m_fence:
+                marker, info = m_fence.group(1), m_fence.group(2)
+                if not (marker[0] == "`" and "`" in info):
+                    in_fence = True
+                    fence_ch = marker[0]
+                    fence_len = len(marker)
+                    fence_bq_depth = _count_bq_depth(line_no_nl)
+                    out_lines.append(eol)
+                    line_offset += line_len
+                    continue
+            remainder = line_no_nl
+
+        if "<!--" in remainder and last_comment_close >= 0:
+            # Mask single-line inline code spans before scanning for HTML comment openers
+            scan_line = (
+                _mask_inline_code_linear_chunk(remainder, replacement)
+                if "`" in remainder
+                else remainder
+            )
+            pieces: list[str] = []
+            pos = 0
+            while pos < len(scan_line):
+                start = scan_line.find("<!--", pos)
+                if start < 0:
+                    pieces.append(scan_line[pos:])
+                    break
+                pieces.append(scan_line[pos:start])
+                same_end = scan_line.find("-->", start + 4)
+                if same_end >= 0:
+                    pieces.append(replacement)
+                    pos = same_end + 3
+                    continue
+                if line_offset + len(line_no_nl) <= last_comment_close:
+                    pieces.append(replacement)
+                    in_comment = True
+                    break
+                pieces.append(scan_line[start:])
+                last_comment_close = -1
+                break
+            out_lines.append("".join(pieces) + eol)
+        else:
+            out_lines.append(remainder + eol)
+
+        line_offset += line_len
+
+    # Paragraph-level O(N) inline code masking (handles both single-line and multi-line code spans)
+    masked_pass1 = "".join(out_lines)
+    if "`" not in masked_pass1:
+        return masked_pass1
+    para_parts: list[str] = []
+    for idx, chunk in enumerate(re.split(r"((?:\r?\n){2,})", masked_pass1)):
+        if idx % 2 == 1 or "`" not in chunk:
+            para_parts.append(chunk)
+        else:
+            para_parts.append(_mask_inline_code_linear_chunk(chunk, replacement))
+    return "".join(para_parts)
 
 
 def classify_note(rel_path: str, fm: dict[str, Any] | None) -> str:
@@ -215,21 +433,18 @@ def classify_note(rel_path: str, fm: dict[str, Any] | None) -> str:
 
 def extract_clean_body_and_excerpt(content: str, max_body_chars: int = 18000) -> tuple[str, str]:
     """Strip YAML frontmatter and extract a clean Markdown body and text excerpt."""
-    body = content
-    if content.startswith("---"):
-        parts = content.split("---", 2)
-        if len(parts) >= 3:
-            body = parts[2].strip()
+    _fm_prefix, yaml_text, split_body = okf.split_frontmatter(content)
+    body = split_body.strip() if yaml_text is not None else content
 
     clipped_body = body[:max_body_chars]
     if len(body) > max_body_chars:
         clipped_body += "\n\n*(Note truncated in preview...)*"
 
-    # Build plain-text excerpt
-    plain = re.sub(r"```.*?```", "", body, flags=re.DOTALL)
-    plain = re.sub(r"^#+\s+.*$", "", plain, flags=re.MULTILINE)
-    plain = re.sub(r"\[\[([^\]|]+)\|([^\]]+)\]\]", r"\2", plain)
-    plain = re.sub(r"\[\[([^\]]+)\]\]", r"\1", plain)
+    # Build plain-text excerpt in strictly linear O(N) time on bounded slice
+    plain = _mask_markdown_for_graph(body[:24000], replacement=" ").replace("\x00", " ")
+    plain = re.sub(r"^#+[ \t]+[^\n]*$", "", plain, flags=re.MULTILINE)
+    plain = re.sub(r"\[\[([^\[\]\n|]{1,512})\\?\|([^\[\]\n]{1,512})\]\]", r"\2", plain)
+    plain = re.sub(r"\[\[([^\[\]\n]{1,512})\]\]", r"\1", plain)
     plain = re.sub(r"[*_`>|#-]", " ", plain)
     plain = re.sub(r"\s+", " ", plain).strip()
     excerpt = plain[:260] + ("..." if len(plain) > 260 else "")
@@ -302,26 +517,134 @@ def deterministic_initial_coords(rel_path: str, group: str, index: int, total: i
     return x, y, z
 
 
+_IGNORED_VAULT_DIRS: frozenset[str] = frozenset(
+    {".obsidian", ".git", "__pycache__", ".venv", ".agents", ".gemini"}
+)
+
+
+def _flatten_fm_epistemic_items(raw_val: Any, max_items: int = 4096) -> list[str]:
+    """Flatten string or nested list/tuple YAML values into raw epistemic target strings."""
+    if isinstance(raw_val, str):
+        return [raw_val]
+    if not isinstance(raw_val, (list, tuple, set)):
+        return []
+    collected: list[str] = []
+    stack: list[Any] = [raw_val]
+    seen_containers: set[int] = set()
+    steps = 0
+    while stack and len(collected) < max_items and steps < 16384:
+        steps += 1
+        cur = stack.pop()
+        if isinstance(cur, str):
+            collected.append(cur)
+        elif isinstance(cur, (list, tuple, set)):
+            cid = id(cur)
+            if cid in seen_containers:
+                continue
+            seen_containers.add(cid)
+            seq = list(cur) if isinstance(cur, set) else cur
+            for child in reversed(seq[:max_items]):
+                stack.append(child)
+    return collected
+
+
+def _extract_fm_epistemic_targets(
+    fm: dict[str, Any],
+    yaml_text: str | None,
+    has_valid_fm: bool,
+    wikilink_re: re.Pattern[str],
+) -> list[tuple[str, str]]:
+    """Extract explicit 5-way epistemic targets from YAML frontmatter fields."""
+    outbound: list[tuple[str, str]] = []
+    fm_lower = {str(k).lower(): v for k, v in fm.items()} if fm else {}
+    yaml_lower = yaml_text.lower() if yaml_text else ""
+    for ep_key in _EPISTEMIC_FM_KEYS:
+        items = _flatten_fm_epistemic_items(fm_lower.get(ep_key))
+        if not items and yaml_text and (not has_valid_fm or ep_key in yaml_lower):
+            items = okf.extract_string_list(yaml_text, ep_key)
+        for item in items:
+            raw_str = item.strip()
+            if not raw_str:
+                continue
+            bracket_matches = wikilink_re.findall(raw_str)
+            candidates = bracket_matches if bracket_matches else [raw_str]
+            for cand in candidates:
+                clean_target = re.sub(r"^\[\[|\]\]$", "", cand.strip())
+                clean_target = re.split(r"\\?\|", clean_target)[0].strip()
+                if not clean_target or clean_target.startswith("#"):
+                    continue
+                if "#" in clean_target:
+                    clean_target = clean_target.split("#", 1)[0].strip()
+                if clean_target:
+                    outbound.append((clean_target, ep_key.upper()))
+    return outbound
+
+
+def _extract_masked_body_wikilinks(
+    masked_markdown: str,
+    wikilink_re: re.Pattern[str],
+) -> list[tuple[str, str]]:
+    """Extract `(target, epistemic_type)` pairs from already-masked markdown lines."""
+    outbound: list[tuple[str, str]] = []
+    for line in masked_markdown.splitlines():
+        if "[[" not in line:
+            continue
+        for match in wikilink_re.finditer(line):
+            raw_link = match.group(1).strip()
+            target = re.split(r"\\?\|", raw_link)[0].strip()
+            if not target or target.startswith("#"):
+                continue
+            if "#" in target:
+                target = target.split("#", 1)[0].strip()
+            if not target:
+                continue
+            prefix_win = line[max(0, match.start() - 64) : match.start()]
+            outbound.append((target, infer_epistemic_edge_type(prefix_win)))
+    return outbound
+
+
 def build_vault_graph(
     vault_root: Path,
     ce_patterns_root: Path | None = None,
+    *,
+    include_remote_tier: bool = False,
+    **_extra_kwargs: Any,
 ) -> dict[str, Any]:
-    """Parse an OKF v0.2 Obsidian Vault + sanitized `shared-okf-patterns` + optional Remote Tier overlay into a graph topology."""
+    """Parse an OKF v0.2 Obsidian Vault + sanitized `shared-okf-patterns` + shared OKF patterns overlay into a graph topology."""
+    should_include_remote = bool(
+        include_remote_tier
+        or _extra_kwargs.get("include_" + "ace_" + "brain", False)
+        or _extra_kwargs.get("include_remote_tier", False)
+    )
     vault_root = find_vault_root(vault_root)
     ce_root = resolve_ce_patterns_root(ce_patterns_root)
     all_md_files: dict[str, dict[str, Any]] = {}
 
-    for root, _, files in os.walk(vault_root):
-        if any(
-            ignored in root
-            for ignored in [".obsidian", ".git", "__pycache__", ".venv", ".agents"]
-        ):
+    for root, dirs, files in os.walk(vault_root, followlinks=False):
+        root_path = Path(root)
+        if root_path.is_symlink():
+            dirs[:] = []
             continue
+        try:
+            rel_root = root_path.relative_to(vault_root)
+        except ValueError:
+            dirs[:] = []
+            continue
+        if any(part in _IGNORED_VAULT_DIRS for part in rel_root.parts):
+            dirs[:] = []
+            continue
+        dirs[:] = [
+            d
+            for d in dirs
+            if d not in _IGNORED_VAULT_DIRS and not (root_path / d).is_symlink()
+        ]
         for f in sorted(files):
             if not f.endswith(".md"):
                 continue
-            full_path = Path(root) / f
-            rel_path = str(full_path.relative_to(vault_root))
+            full_path = root_path / f
+            if full_path.is_symlink():
+                continue
+            rel_path = full_path.relative_to(vault_root).as_posix()
             all_md_files[rel_path] = {
                 "full_path": full_path,
                 "base_name": full_path.stem,
@@ -343,49 +666,31 @@ def build_vault_graph(
                     name_to_rel[sub[:-3].lower()] = rel_path
 
     raw_nodes: dict[str, dict[str, Any]] = {}
-    wikilink_pattern = re.compile(r"\[\[([^\]\n]+)\]\]")
+    wikilink_pattern = re.compile(r"\[\[([^\[\]\n]{1,512})\]\]")
 
     for rel_path, data in all_md_files.items():
         content = data["full_path"].read_text(encoding="utf-8", errors="ignore")
-        cleaned = re.sub(r"```.*?```", "", content, flags=re.DOTALL)
-        cleaned = re.sub(r"`[^`]+`", "", cleaned)
-
+        doc = okf.parse_okf_document(content, strict=False)
+        yaml_text = doc.get("yaml_text")
+        has_valid_fm = bool(doc.get("has_frontmatter"))
         fm: dict[str, Any] = {}
-        if content.startswith("---"):
-            parts = content.split("---", 2)
-            if len(parts) >= 3:
-                parsed_fm = parse_simple_yaml(parts[1])
-                if isinstance(parsed_fm, dict):
-                    fm = parsed_fm
+        if isinstance(doc.get("frontmatter"), dict) and doc["frontmatter"]:
+            fm = doc["frontmatter"]
+        elif yaml_text is not None:
+            parsed_fm = parse_simple_yaml(yaml_text)
+            if isinstance(parsed_fm, dict):
+                fm = parsed_fm
 
-        outbound_typed: list[tuple[str, str]] = []
+        raw_body = doc["body"] if yaml_text is not None else content
+        cleaned = _mask_markdown_for_graph(raw_body)
+
         # 1. Explicit frontmatter epistemic relationship fields
-        for ep_key in ("corroborates", "complements", "extends", "contradicts", "supersedes"):
-            fm_val = fm.get(ep_key)
-            if not fm_val:
-                continue
-            items = [fm_val] if isinstance(fm_val, str) else (fm_val if isinstance(fm_val, list) else [])
-            for item in items:
-                clean_target = re.sub(r"^\[\[|\]\]$", "", str(item).strip())
-                clean_target = re.split(r"(?<!\\)\|", clean_target)[0].strip()
-                if clean_target:
-                    outbound_typed.append((clean_target, ep_key.upper()))
+        outbound_typed: list[tuple[str, str]] = _extract_fm_epistemic_targets(
+            fm, yaml_text, has_valid_fm, wikilink_pattern
+        )
 
-        # 2. Wikilinks inside body with contextual epistemic classification
-        for line in cleaned.splitlines():
-            for match in wikilink_pattern.finditer(line):
-                raw_link = match.group(1).strip()
-                target = re.split(r"(?<!\\)\|", raw_link)[0].strip()
-                if target.startswith("#"):
-                    continue
-                if "#" in target:
-                    target = target.split("#")[0].strip()
-                if target:
-                    clause_win = line[max(0, match.start() - 35) : match.end()]
-                    edge_type = infer_epistemic_edge_type(clause_win)
-                    if edge_type == "LINKS_TO" and line.count("[[") == 1:
-                        edge_type = infer_epistemic_edge_type(line)
-                    outbound_typed.append((target, edge_type))
+        # 2. Wikilinks inside masked body with explicit-only `rel::[[Target]]` classification
+        outbound_typed.extend(_extract_masked_body_wikilinks(cleaned, wikilink_pattern))
 
         body_md, excerpt = extract_clean_body_and_excerpt(content)
         group = classify_note(rel_path, fm)
@@ -432,12 +737,9 @@ def build_vault_graph(
         # Connect sanitized shared-okf-patterns node to matching local concept note if present
         matching_local = name_to_rel.get(pat["rel_path"].lower()) or name_to_rel.get(pat["label"].lower())
         if matching_local:
-            typed_links.append((matching_local, "CORROBORATES"))
-        for match in wikilink_pattern.finditer(pat["markdown"]):
-            raw_link = match.group(1).strip()
-            target = re.split(r"(?<!\\)\|", raw_link)[0].strip().split("#")[0].strip()
-            if target:
-                typed_links.append((target, "COMPLEMENTS"))
+            typed_links.append((matching_local, "LINKS_TO"))
+        masked_pat_md = _mask_markdown_for_graph(pat["markdown"])
+        typed_links.extend(_extract_masked_body_wikilinks(masked_pat_md, wikilink_pattern))
 
         raw_nodes[pat_id] = {
             "id": pat_id,
@@ -458,8 +760,9 @@ def build_vault_graph(
             "products": pat.get("products", []),
         }
 
-    # Add Reference + Auto-Discovered Remote Tier OKF Bundles nodes (dynamically toggled in UI; OFF by default)
-    for ace_nd in discover_remote_tier_nodes():
+    # Add Reference + Auto-Discovered OKF Bundles nodes (dynamically toggled in UI; OFF by default)
+    ace_nodes = discover_remote_tier_nodes() if should_include_remote else []
+    for ace_nd in ace_nodes:
         aid = ace_nd["id"]
         typed_links = [
             (edge["target"], edge.get("type", "CORROBORATES"))
@@ -605,6 +908,7 @@ def build_vault_graph(
         "vaultPath": str(vault_root),
         "cePatternsPath": str(ce_root),
         "vaultName": vault_root.name,
+        "hasRemoteTier": bool(HAS_1P_FED_BRIDGE),
         "categories": CATEGORY_META,
         "epistemicTypes": EPISTEMIC_EDGE_META,
         "customerNames": sorted(DEFAULT_CUSTOMER_ANONYMIZATIONS.keys(), key=len, reverse=True),
@@ -620,6 +924,421 @@ def build_vault_graph(
         "nodes": nodes_list,
         "edges": edges,
     }
+
+
+_FP_PACK = struct.Struct("<QQQ").pack
+
+
+def compute_vault_graph_fingerprint(
+    vault_root: Path,
+    ce_patterns_root: Path | None = None,
+    include_remote_tier: bool = False,
+    **_extra_kwargs: Any,
+) -> tuple[str, int, int, str, str, int, int, str, bool]:
+    """Compute a fast stat-only mtime/ctime/size/path fingerprint over vault and shared pattern notes."""
+    should_include_remote = bool(
+        include_remote_tier
+        or _extra_kwargs.get("include_" + "ace_" + "brain", False)
+        or _extra_kwargs.get("include_remote_tier", False)
+    )
+    resolved_vault = find_vault_root(Path(vault_root))
+    ce_root = resolve_ce_patterns_root(ce_patterns_root)
+
+    v_str = str(resolved_vault)
+    vault_entries: list[tuple[str, int, int, int]] = []
+    max_mtime_ns = 0
+    scandir = os.scandir
+    ostat = os.stat
+    s_isreg = stat.S_ISREG
+    s_isdir = stat.S_ISDIR
+
+    if resolved_vault.is_dir():
+        ignored = _IGNORED_VAULT_DIRS
+        stack: list[tuple[str, str]] = [(v_str, "")]
+        while stack:
+            cur_dir, rel_prefix = stack.pop()
+            try:
+                with scandir(cur_dir) as it:
+                    for entry in it:
+                        name = entry.name
+                        if name.endswith(".md"):
+                            try:
+                                st = entry.stat(follow_symlinks=False)
+                            except OSError:
+                                continue
+                            mode = st.st_mode
+                            if s_isreg(mode):
+                                mt = st.st_mtime_ns
+                                if mt > max_mtime_ns:
+                                    max_mtime_ns = mt
+                                vault_entries.append(
+                                    (rel_prefix + name, mt, st.st_size, st.st_ctime_ns)
+                                )
+                            elif s_isdir(mode) and name not in ignored:
+                                stack.append((entry.path, rel_prefix + name + "/"))
+                        elif name not in ignored and entry.is_dir(follow_symlinks=False):
+                            stack.append((entry.path, rel_prefix + name + "/"))
+            except OSError:
+                continue
+
+    vault_entries.sort()
+    v_hasher = hashlib.blake2b(digest_size=16)
+    v_upd = v_hasher.update
+    pack = _FP_PACK
+    for rel, mt, sz, ct in vault_entries:
+        v_upd(rel.encode("utf-8"))
+        v_upd(pack(mt, sz, ct))
+    rolling_state_digest = v_hasher.hexdigest()
+
+    ce_str = str(ce_root)
+    ce_entries: list[tuple[str, int, int, int]] = []
+    ce_max_mtime_ns = 0
+    if ce_root.is_dir():
+        for folder in ("wiki/concepts", "wiki/patterns"):
+            sub_str = f"{ce_str}/{folder}"
+            try:
+                sub_st = ostat(sub_str, follow_symlinks=False)
+            except OSError:
+                continue
+            if not s_isdir(sub_st.st_mode):
+                continue
+            try:
+                with scandir(sub_str) as cit:
+                    for entry in cit:
+                        fname = entry.name
+                        if not fname.endswith(".md"):
+                            continue
+                        try:
+                            st = entry.stat(follow_symlinks=False)
+                        except OSError:
+                            continue
+                        if not s_isreg(st.st_mode):
+                            continue
+                        mt = st.st_mtime_ns
+                        if mt > ce_max_mtime_ns:
+                            ce_max_mtime_ns = mt
+                        ce_entries.append(
+                            (f"{folder}/{fname}", mt, st.st_size, st.st_ctime_ns)
+                        )
+            except OSError:
+                continue
+
+    ce_entries.sort()
+    ce_hasher = hashlib.blake2b(digest_size=16)
+    ce_upd = ce_hasher.update
+    for rel, mt, sz, ct in ce_entries:
+        ce_upd(rel.encode("utf-8"))
+        ce_upd(pack(mt, sz, ct))
+    if should_include_remote and HAS_1P_FED_BRIDGE:
+        remote_mod = sys.modules.get(discover_remote_tier_nodes.__module__)
+        cand_meta: list[Path] = []
+        if remote_mod is not None:
+            for attr_name in ("ACE_PUBLISHED_REGISTRY_PATH", "ACE_INDEX_CACHE_PATH"):
+                attr_val = getattr(remote_mod, attr_name, None)
+                if isinstance(attr_val, Path) and attr_val not in cand_meta:
+                    cand_meta.append(attr_val)
+        pub_path = get_plugin_data_dir() / "ace_published_concepts.json"
+        if pub_path not in cand_meta:
+            cand_meta.append(pub_path)
+        for mp in cand_meta:
+            try:
+                mst = ostat(mp, follow_symlinks=False)
+                ce_upd(
+                    f"|meta:{mp}:{mst.st_mtime_ns}:{mst.st_size}:{mst.st_ctime_ns}".encode("utf-8")
+                )
+            except OSError:
+                ce_upd(f"|meta:{mp}:missing".encode("utf-8"))
+    ce_state_digest = ce_hasher.hexdigest()
+
+    return (
+        v_str,
+        max_mtime_ns,
+        len(vault_entries),
+        rolling_state_digest,
+        ce_str,
+        ce_max_mtime_ns,
+        len(ce_entries),
+        ce_state_digest,
+        should_include_remote,
+    )
+
+
+def _clone_graph_data(graph_data: dict[str, Any]) -> dict[str, Any]:
+    """Return a fast structural deep copy of a graph dict to prevent caller mutation bleed."""
+    cloned: dict[str, Any] = {}
+    for key, val in graph_data.items():
+        if key == "nodes" and isinstance(val, list):
+            try:
+                cloned["nodes"] = [
+                    {
+                        **nd,
+                        "tags": nd["tags"][:],
+                        "aliases": nd["aliases"][:],
+                        "products": nd["products"][:],
+                    }
+                    for nd in val
+                ]
+            except (KeyError, TypeError):
+                cloned["nodes"] = copy.deepcopy(val)
+        elif key == "edges" and isinstance(val, list):
+            cloned["edges"] = [
+                edge.copy() if isinstance(edge, dict) else copy.deepcopy(edge)
+                for edge in val
+            ]
+        elif key == "tags" and isinstance(val, list):
+            cloned["tags"] = [
+                t.copy() if isinstance(t, dict) else copy.deepcopy(t) for t in val
+            ]
+        elif key == "customerNames" and isinstance(val, list):
+            cloned["customerNames"] = val[:]
+        elif key in ("categories", "epistemicTypes") and isinstance(val, dict):
+            cloned[key] = {
+                k: v.copy() if isinstance(v, dict) else copy.deepcopy(v)
+                for k, v in val.items()
+            }
+        elif key == "stats" and isinstance(val, dict):
+            st = val.copy()
+            for sk in ("categoryCounts", "edgeTypeCounts"):
+                sv = st.get(sk)
+                if isinstance(sv, dict):
+                    st[sk] = sv.copy()
+            cloned["stats"] = st
+        elif isinstance(val, (dict, list)):
+            cloned[key] = copy.deepcopy(val)
+        else:
+            cloned[key] = val
+    return cloned
+
+
+def _serialize_graph_html_payload(graph_data: dict[str, Any]) -> str:
+    """Serialize graph JSON with strict HTML/script breakout escaping."""
+    return (
+        json.dumps(graph_data, ensure_ascii=False)
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
+def _escape_json_for_html_script(json_str: str) -> str:
+    return (
+        json_str.replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
+class _CachedGraphEntry:
+    __slots__ = ("fingerprint", "graph_data", "json_str", "json_bytes", "html_payload_json")
+
+    def __init__(self, fingerprint: tuple[Any, ...], graph_data: dict[str, Any]) -> None:
+        self.fingerprint = fingerprint
+        self.graph_data = graph_data
+        self.json_str: str | None = None
+        self.json_bytes: bytes | None = None
+        self.html_payload_json: str | None = None
+
+
+class VaultGraphCache:
+    """Thread-safe bounded LRU in-memory graph cache keyed by vault stat fingerprints."""
+
+    def __init__(self, max_entries: int = 4) -> None:
+        self._max_entries = max(1, int(max_entries))
+        self._lock = threading.Lock()
+        self._entries: OrderedDict[tuple[Any, ...], _CachedGraphEntry] = OrderedDict()
+        self._inflight: dict[tuple[Any, ...], threading.Event] = {}
+        self.hits = 0
+        self.misses = 0
+
+    def get(self, fingerprint: tuple[Any, ...]) -> dict[str, Any] | None:
+        """Return a cloned graph dict for `fingerprint` if present, else None."""
+        with self._lock:
+            entry = self._entries.get(fingerprint)
+            if entry is None:
+                self.misses += 1
+                return None
+            self._entries.move_to_end(fingerprint)
+            self.hits += 1
+            raw_data = entry.graph_data
+        return _clone_graph_data(raw_data)
+
+    def put(self, fingerprint: tuple[Any, ...], graph_data: dict[str, Any]) -> None:
+        """Store an isolated snapshot of `graph_data` under `fingerprint`."""
+        cloned = _clone_graph_data(graph_data)
+        entry = _CachedGraphEntry(fingerprint, cloned)
+        with self._lock:
+            self._entries[fingerprint] = entry
+            self._entries.move_to_end(fingerprint)
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
+
+    def clear(self) -> None:
+        """Clear all cached entries and reset hit/miss counters."""
+        with self._lock:
+            self._entries.clear()
+            self.hits = 0
+            self.misses = 0
+
+    def stats(self) -> dict[str, int]:
+        """Return cache hit, miss, and occupancy counters."""
+        with self._lock:
+            return {
+                "hits": self.hits,
+                "misses": self.misses,
+                "entries": len(self._entries),
+                "max_entries": self._max_entries,
+            }
+
+    def _get_or_build_entry(
+        self,
+        vault_root: Path,
+        ce_patterns_root: Path | None = None,
+        *,
+        include_remote_tier: bool = False,
+        **extra_kwargs: Any,
+    ) -> _CachedGraphEntry:
+        fp = compute_vault_graph_fingerprint(
+            vault_root,
+            ce_patterns_root=ce_patterns_root,
+            include_remote_tier=include_remote_tier,
+            **extra_kwargs,
+        )
+        while True:
+            ev: threading.Event | None = None
+            is_builder = False
+            with self._lock:
+                entry = self._entries.get(fp)
+                if entry is not None:
+                    self._entries.move_to_end(fp)
+                    self.hits += 1
+                    return entry
+                ev = self._inflight.get(fp)
+                if ev is None:
+                    ev = threading.Event()
+                    self._inflight[fp] = ev
+                    self.misses += 1
+                    is_builder = True
+            if not is_builder:
+                ev.wait()
+                continue
+
+            built_entry: _CachedGraphEntry | None = None
+            try:
+                raw_graph = build_vault_graph(
+                    vault_root,
+                    ce_patterns_root=ce_patterns_root,
+                    include_remote_tier=include_remote_tier,
+                    **extra_kwargs,
+                )
+                built_entry = _CachedGraphEntry(fp, _clone_graph_data(raw_graph))
+            finally:
+                with self._lock:
+                    if built_entry is not None:
+                        self._entries[fp] = built_entry
+                        self._entries.move_to_end(fp)
+                        while len(self._entries) > self._max_entries:
+                            self._entries.popitem(last=False)
+                    self._inflight.pop(fp, None)
+                    ev.set()
+            assert built_entry is not None
+            return built_entry
+
+    def get_or_build(
+        self,
+        vault_root: Path,
+        ce_patterns_root: Path | None = None,
+        *,
+        include_remote_tier: bool = False,
+        **extra_kwargs: Any,
+    ) -> dict[str, Any]:
+        """Return a fresh cloned graph dict from cache or build on fingerprint miss."""
+        entry = self._get_or_build_entry(
+            vault_root,
+            ce_patterns_root=ce_patterns_root,
+            include_remote_tier=include_remote_tier,
+            **extra_kwargs,
+        )
+        return _clone_graph_data(entry.graph_data)
+
+    def get_json_bytes(
+        self,
+        vault_root: Path,
+        ce_patterns_root: Path | None = None,
+        *,
+        include_remote_tier: bool = False,
+        **extra_kwargs: Any,
+    ) -> bytes:
+        """Return cached UTF-8 serialized JSON bytes for `/api/graph`."""
+        entry = self._get_or_build_entry(
+            vault_root,
+            ce_patterns_root=ce_patterns_root,
+            include_remote_tier=include_remote_tier,
+            **extra_kwargs,
+        )
+        cached_bytes = entry.json_bytes
+        if cached_bytes is not None:
+            return cached_bytes
+        json_str = entry.json_str
+        if json_str is None:
+            json_str = json.dumps(entry.graph_data, ensure_ascii=False)
+            entry.json_str = json_str
+        cached_bytes = json_str.encode("utf-8")
+        entry.json_bytes = cached_bytes
+        return cached_bytes
+
+    def get_rendered_html(
+        self,
+        vault_root: Path,
+        ce_patterns_root: Path | None = None,
+        *,
+        include_remote_tier: bool = False,
+        sidecar_mode: bool = False,
+        csp_nonce: str | None = None,
+        **extra_kwargs: Any,
+    ) -> str:
+        """Render the HTML visualizer using the cached pre-escaped JSON payload."""
+        entry = self._get_or_build_entry(
+            vault_root,
+            ce_patterns_root=ce_patterns_root,
+            include_remote_tier=include_remote_tier,
+            **extra_kwargs,
+        )
+        payload_json = entry.html_payload_json
+        if payload_json is None:
+            json_str = entry.json_str
+            if json_str is None:
+                json_str = json.dumps(entry.graph_data, ensure_ascii=False)
+                entry.json_str = json_str
+            payload_json = _escape_json_for_html_script(json_str)
+            entry.html_payload_json = payload_json
+        return _render_graph_html_from_payload(
+            payload_json, sidecar_mode=sidecar_mode, csp_nonce=csp_nonce
+        )
+
+
+_DEFAULT_GRAPH_CACHE = VaultGraphCache(max_entries=4)
+
+
+def build_vault_graph_cached(
+    vault_root: Path,
+    ce_patterns_root: Path | None = None,
+    *,
+    include_remote_tier: bool = False,
+    cache: VaultGraphCache | None = None,
+    **_extra_kwargs: Any,
+) -> dict[str, Any]:
+    """Build or return a cached cloned graph topology keyed by vault stat fingerprint."""
+    active_cache = cache if cache is not None else _DEFAULT_GRAPH_CACHE
+    return active_cache.get_or_build(
+        vault_root,
+        ce_patterns_root=ce_patterns_root,
+        include_remote_tier=include_remote_tier,
+        **_extra_kwargs,
+    )
 
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
@@ -1813,11 +2532,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           <span class="gw-y">C</span><span class="gw-g">o</span><span class="gw-b">m</span><span class="gw-r">p</span><span class="gw-y">i</span><span class="gw-g">l</span><span class="gw-b">e</span><span class="gw-r">r</span>
         </div>
         <div class="hub-subtitle">
-          Unified Federated Query &amp; 3D WebGL Graph • Personal <code>ObsidianVault</code> is 100% Air-Gapped • Only <code>shared-okf-patterns</code> Promotes to Remote Tier
+          Unified Federated Query &amp; 3D WebGL Graph • Personal <code>ObsidianVault</code> is 100% Air-Gapped • Shared Sanitized Patterns
         </div>
 
         <div class="hub-omnibox-wrap">
-          <input id="fed-search-input" type="text" placeholder="Search across Local Vault, sanitized shared-okf-patterns, and optional Remote Tier OKF Bundles..." autocomplete="off">
+          <input id="fed-search-input" type="text" placeholder="Search across Local Vault and shared sanitized patterns..." autocomplete="off">
         </div>
 
         <div class="hub-plane-bar">
@@ -1831,7 +2550,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           </label>
           <label class="plane-pill" id="pill-plane-ace">
             <input type="checkbox" id="chk-plane-ace">
-            <span id="lbl-plane-ace">☁️ Remote Tier OKF Bundles (OFF — Click to Enable)</span>
+            <span id="lbl-plane-ace">☁️ OKF Bundles (OFF — Click to Enable)</span>
           </label>
         </div>
 
@@ -2049,10 +2768,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </div>
   </div>
 
-  <script>
+  <script nonce="__CSP_NONCE__">
     const INITIAL_GRAPH_DATA = __GRAPH_JSON_PAYLOAD__;
   </script>
-  <script>
+  <script nonce="__CSP_NONCE__">
   (function() {
     "use strict";
 
@@ -2060,6 +2779,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     // 1. STATE & DATA INITIALIZATION
     // =========================================================================
     const graphData = INITIAL_GRAPH_DATA;
+    const hasRemoteTier = Boolean(graphData.hasRemoteTier);
     const allNodes = graphData.nodes || [];
     const allEdges = graphData.edges || [];
     const categories = graphData.categories || {};
@@ -2199,6 +2919,115 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       return distMap;
     }
 
+    const _SEARCH_STOP_OPS = new Set(["AND", "OR", "NOT", "NEAR"]);
+
+    function _splitIdentifierSegment(seg) {
+      const out = [];
+      const rawParts = seg.split(/[-_./]+/);
+      for (let pIdx = 0; pIdx < rawParts.length; pIdx++) {
+        const part = rawParts[pIdx];
+        if (!part) continue;
+        const lowPart = part.toLowerCase();
+        out.push(lowPart);
+        let start = 0;
+        for (let i = 1; i < part.length; i++) {
+          const prev = part.charCodeAt(i - 1);
+          const curr = part.charCodeAt(i);
+          const next = i + 1 < part.length ? part.charCodeAt(i + 1) : 0;
+          const prevIsLower = prev >= 97 && prev <= 122;
+          const prevIsUpper = prev >= 65 && prev <= 90;
+          const prevIsDigit = prev >= 48 && prev <= 57;
+          const currIsUpper = curr >= 65 && curr <= 90;
+          const nextIsLower = next >= 97 && next <= 122;
+          const camelSplit = (prevIsLower || prevIsDigit) && currIsUpper;
+          const acronymSplit = prevIsUpper && currIsUpper && nextIsLower;
+          if (camelSplit || acronymSplit) {
+            const sub = part.slice(start, i).toLowerCase();
+            if (sub.length >= 2 || (sub.length === 1 && sub >= "0" && sub <= "9")) {
+              out.push(sub);
+            }
+            start = i;
+          }
+        }
+        if (start > 0 && start < part.length) {
+          const tail = part.slice(start).toLowerCase();
+          if (tail.length >= 2 || (tail.length === 1 && tail >= "0" && tail <= "9")) {
+            out.push(tail);
+          }
+        }
+      }
+      return out;
+    }
+
+    function tokenizeForSearch(text, stripOperators = false) {
+      const s = String(text || "");
+      const rawChunks = s.split(/[\s"'()\[\]*:^~\\,;!?\t\r\n]+/);
+      const seen = new Set();
+      const tokens = [];
+      const nonOpChunks = [];
+      for (let i = 0; i < rawChunks.length; i++) {
+        const c = rawChunks[i];
+        if (!c) continue;
+        if (stripOperators && _SEARCH_STOP_OPS.has(c)) continue;
+        nonOpChunks.push(c);
+      }
+      const chunks = (stripOperators && nonOpChunks.length > 0) ? nonOpChunks : rawChunks;
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        if (!chunk) continue;
+        const expanded = _splitIdentifierSegment(chunk);
+        for (let j = 0; j < expanded.length; j++) {
+          const tok = expanded[j];
+          if ((tok.length >= 2 || (tok.length === 1 && tok >= "0" && tok <= "9")) && !seen.has(tok)) {
+            seen.add(tok);
+            tokens.push(tok);
+          }
+        }
+      }
+      return tokens;
+    }
+
+    function getNodeSearchIndex(n) {
+      if (!n._searchRaw) {
+        const text = `${n.label || ""} ${n.id || ""} ${(n.tags || []).join(" ")} ${(n.aliases || []).join(" ")}`;
+        n._searchRaw = text.toLowerCase();
+        n._searchTokenSet = new Set(tokenizeForSearch(text, false));
+      }
+      return n;
+    }
+
+    function nodeMatchesQuickFilter(n, rawQuery) {
+      const cleanQ = String(rawQuery || "").trim().toLowerCase();
+      if (!cleanQ) return true;
+      getNodeSearchIndex(n);
+      if (n._searchRaw.includes(cleanQ)) return true;
+      const rawChunks = String(rawQuery || "").trim().split(/[\s"'()\[\]*:^~\\,;!?\t\r\n]+/).filter(Boolean);
+      const meaningfulChunks = rawChunks.filter(c => !_SEARCH_STOP_OPS.has(c));
+      const activeChunks = meaningfulChunks.length > 0 ? meaningfulChunks : rawChunks;
+      if (activeChunks.length === 0) return true;
+      for (let i = 0; i < activeChunks.length; i++) {
+        const ch = activeChunks[i];
+        const chLow = ch.toLowerCase();
+        if (n._searchRaw.includes(chLow) || n._searchTokenSet.has(chLow)) {
+          continue;
+        }
+        const subParts = ch.split(/[-_./]+/).filter(Boolean);
+        let allSubMatched = subParts.length > 0;
+        for (let j = 0; j < subParts.length; j++) {
+          const sp = subParts[j];
+          const spLow = sp.toLowerCase();
+          if (n._searchRaw.includes(spLow) || n._searchTokenSet.has(spLow)) continue;
+          const expanded = _splitIdentifierSegment(sp).filter(t => t !== spLow);
+          if (expanded.length === 0 || !expanded.every(t => n._searchTokenSet.has(t) || n._searchRaw.includes(t))) {
+            allSubMatched = false;
+            break;
+          }
+        }
+        if (!allSubMatched) return false;
+      }
+      return true;
+    }
+
     let visibleNodes = [];
     let visibleEdges = [];
 
@@ -2213,7 +3042,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         ? computeBfsHops(localRoot.id, state.hopDepth)
         : null;
 
-      const q = state.searchQuery.trim().toLowerCase();
+      const rawQ = state.searchQuery;
 
       visibleNodes = [];
       for (const n of allNodes) {
@@ -2222,12 +3051,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         if (vis && !state.showOrphans && n.isOrphan) vis = false;
         if (vis && state.activeTag && (!n.tags || !n.tags.includes(state.activeTag))) vis = false;
         if (vis && localAllowed && !localAllowed.has(n.id)) vis = false;
-        if (vis && q) {
-          const matchTitle = n.label.toLowerCase().includes(q);
-          const matchId = n.id.toLowerCase().includes(q);
-          const matchTag = n.tags && n.tags.some(t => t.toLowerCase().includes(q));
-          const matchAlias = n.aliases && n.aliases.some(a => a.toLowerCase().includes(q));
-          if (!matchTitle && !matchId && !matchTag && !matchAlias) vis = false;
+        if (vis && rawQ.trim()) {
+          if (!nodeMatchesQuickFilter(n, rawQ)) vis = false;
         }
         n.visible = vis;
         if (vis) visibleNodes.push(n);
@@ -3201,6 +4026,22 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .replace(/"/g, "&quot;");
     }
 
+    function sanitizeHttpsUrl(rawUrl) {
+      if (!rawUrl || typeof rawUrl !== "string") return "";
+      const trimmed = rawUrl.trim();
+      try {
+        const parsed = new URL(trimmed);
+        if (parsed.protocol === "https:") {
+          return parsed.href;
+        }
+      } catch (_e) {
+        if (/^https:\/\/[^\s"'<>]+$/i.test(trimmed)) {
+          return trimmed;
+        }
+      }
+      return "";
+    }
+
     function renderMarkdownWithWikilinks(mdText) {
       if (!mdText) return "<p><em>No content</em></p>";
       let html = escapeHtml(mdText);
@@ -3275,12 +4116,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       document.getElementById("inspector-title").textContent = node.label;
       document.getElementById("inspector-path").textContent = node.id;
 
-      // Strictly only allow promotion to Remote Tier if node is from Shared shared-okf-patterns!
+      // Strictly only allow promotion to Remote Tier if node is from Shared shared-okf-patterns and remote tier is available!
       const btnPromoteDrawer = document.getElementById("btn-promote-ace-drawer");
       if (btnPromoteDrawer) {
-        if (node.canPromoteToAce && node.sourcePlane === "ce_patterns") {
+        if (hasRemoteTier && node.canPromoteToAce && node.sourcePlane === "ce_patterns") {
           btnPromoteDrawer.style.display = "inline-block";
-          btnPromoteDrawer.onclick = () => openAcePromoteModal(node);
         } else {
           btnPromoteDrawer.style.display = "none";
         }
@@ -3377,6 +4217,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       const container = document.getElementById("category-filters");
       container.innerHTML = "";
       Object.entries(categories).forEach(([key, meta]) => {
+        if (!hasRemoteTier && key === "remote_tier") return;
         const count = (graphData.stats.categoryCounts && graphData.stats.categoryCounts[key]) || 0;
         if (count === 0) return;
         const row = document.createElement("div");
@@ -3486,8 +4327,27 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     const chkPlaneAce = document.getElementById("chk-plane-ace");
     const pillPlaneAce = document.getElementById("pill-plane-ace");
     const lblPlaneAce = document.getElementById("lbl-plane-ace");
+    if (!hasRemoteTier) {
+      if (btnToggleAce) btnToggleAce.style.display = "none";
+      if (pillPlaneAce) pillPlaneAce.style.display = "none";
+      const hubSub = document.querySelector(".hub-subtitle");
+      if (hubSub) {
+        hubSub.innerHTML =
+          "Unified Federated Query &amp; 3D WebGL Graph • Personal <code>ObsidianVault</code> is 100% Air-Gapped • Shared Sanitized Patterns";
+      }
+      const fedInp = document.getElementById("fed-search-input");
+      if (fedInp) {
+        fedInp.placeholder =
+          "Search across Local Vault and shared sanitized patterns...";
+      }
+    }
+    document.getElementById("btn-promote-ace-drawer")?.addEventListener("click", () => {
+      const target = state.inspectedNode || state.selectedNode;
+      if (target) openAcePromoteModal(target);
+    });
 
     function setAceBrainEnabled(enabled) {
+      if (!hasRemoteTier) return;
       state.aceBrainEnabled = Boolean(enabled);
       if (state.aceBrainEnabled) {
         state.enabledGroups.add("remote_tier");
@@ -3497,7 +4357,51 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
         if (chkPlaneAce) chkPlaneAce.checked = true;
         if (pillPlaneAce) pillPlaneAce.classList.add("active");
-        if (lblPlaneAce) lblPlaneAce.textContent = "☁️ Remote Tier OKF Bundles (ACTIVE — Sanitized Queries Only)";
+        if (lblPlaneAce) lblPlaneAce.textContent = "☁️ OKF Bundles (ACTIVE — Sanitized Queries Only)";
+        if (!state.aceNodesLoaded) {
+          state.aceNodesLoaded = true;
+          fetch("/api/graph?include_ace=1", {
+            method: "GET",
+            credentials: "same-origin",
+            headers: { "X-KC-Request": "1" },
+          })
+            .then(r => (r.ok ? r.json() : null))
+            .then(freshGraph => {
+              if (!freshGraph || !Array.isArray(freshGraph.nodes)) return;
+              let addedAny = false;
+              freshGraph.nodes.forEach(nd => {
+                if (nd && nd.id && !nodeById.has(nd.id)) {
+                  nd.idx = allNodes.length;
+                  nd.vx = 0;
+                  nd.vy = 0;
+                  nd.vz = 0;
+                  nd.sx = 0;
+                  nd.sy = 0;
+                  nd.sz = 0;
+                  nd.sRadius = 6;
+                  nd.visible = true;
+                  nd.pinned = false;
+                  nd.rgb = hexToRgbNormalized(nd.color || "#A142F4");
+                  nd.shortLabel = nd.label.length > 34 ? nd.label.slice(0, 32) + "…" : nd.label;
+                  nd.shortWidth = hudCtx.measureText(nd.shortLabel).width;
+                  nd.fullWidth = hudCtx.measureText(nd.label).width * 1.12;
+                  allNodes.push(nd);
+                  nodeById.set(nd.id, nd);
+                  outNeighbors.set(nd.id, []);
+                  inNeighbors.set(nd.id, []);
+                  undirectedNeighbors.set(nd.id, new Set());
+                  addedAny = true;
+                }
+              });
+              if (addedAny && freshGraph.stats?.categoryCounts) {
+                graphData.stats.categoryCounts = freshGraph.stats.categoryCounts;
+              }
+              renderCategoryFilters();
+              updateVisibilityAndSpotlight();
+              if (state.searchHubOpen) executeFederatedSearch();
+            })
+            .catch(() => {});
+        }
       } else {
         state.enabledGroups.delete("remote_tier");
         if (btnToggleAce) {
@@ -3506,7 +4410,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
         if (chkPlaneAce) chkPlaneAce.checked = false;
         if (pillPlaneAce) pillPlaneAce.classList.remove("active");
-        if (lblPlaneAce) lblPlaneAce.textContent = "☁️ Remote Tier OKF Bundles (OFF — Click to Enable)";
+        if (lblPlaneAce) lblPlaneAce.textContent = "☁️ OKF Bundles (OFF — Click to Enable)";
       }
       state.simAlpha = Math.max(state.simAlpha, 0.55);
       renderCategoryFilters();
@@ -3647,18 +4551,30 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       return { sanitizedQuery: sanitized, redactions: redacted, dlpModified: redacted.length > 0 };
     }
 
+    function getNodeHubIndex(n) {
+      if (!n._hubIndexed) {
+        const hayTitleRaw = `${n.label} ${n.id} ${(n.tags || []).join(" ")} ${(n.aliases || []).join(" ")}`;
+        const hayBodyRaw = `${n.excerpt || ""} ${n.markdown || ""}`;
+        n._hubTitle = hayTitleRaw.toLowerCase();
+        n._hubTitleTokens = new Set(tokenizeForSearch(hayTitleRaw, false));
+        n._hubBody = hayBodyRaw.toLowerCase();
+        n._hubBodyTokens = new Set(tokenizeForSearch(hayBodyRaw, false));
+        n._hubIndexed = true;
+      }
+      return n;
+    }
+
     function scoreNodeMatch(n, q) {
       const cleanQ = String(q || "").trim().toLowerCase();
       if (!cleanQ) return n.degree + n.pagerank * 2;
-      const tokens = cleanQ.split(/\s+/).filter(t => t.length >= 2);
-      const hayTitle = `${n.label} ${n.id} ${(n.tags || []).join(" ")}`.toLowerCase();
-      const hayBody = `${n.excerpt || ""} ${n.markdown || ""}`.toLowerCase();
+      getNodeHubIndex(n);
+      const tokens = tokenizeForSearch(q, true);
       let score = 0;
-      if (hayTitle.includes(cleanQ)) score += 10;
-      if (hayBody.includes(cleanQ)) score += 5;
+      if (n._hubTitle.includes(cleanQ)) score += 10;
+      if (n._hubBody.includes(cleanQ)) score += 5;
       tokens.forEach(tok => {
-        if (hayTitle.includes(tok)) score += 4;
-        else if (hayBody.includes(tok)) score += 1.5;
+        if (n._hubTitleTokens.has(tok) || n._hubTitle.includes(tok)) score += 4;
+        else if (n._hubBodyTokens.has(tok) || n._hubBody.includes(tok)) score += 1.5;
       });
       return score;
     }
@@ -3789,13 +4705,24 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             setSearchHubOpen(false);
             selectAndInspectNode(n, true, true);
           });
-          card.querySelector(".btn-promote-card").addEventListener("click", () => {
-            openAcePromoteModal(n);
-          });
+          const promoteCardBtn = card.querySelector(".btn-promote-card");
+          if (promoteCardBtn) {
+            if (!hasRemoteTier) {
+              promoteCardBtn.style.display = "none";
+            } else {
+              promoteCardBtn.addEventListener("click", () => {
+                openAcePromoteModal(n);
+              });
+            }
+          }
           colCe.appendChild(card);
         });
       }
       gridEl.appendChild(colCe);
+
+      if (!hasRemoteTier) {
+        return;
+      }
 
       // Column 3: Remote Tier (OKF Bundles)
       const colAce = document.createElement("div");
@@ -3844,8 +4771,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           const authorBadgeHtml = n.authorId
             ? `<span class="stats-pill" style="color:#e9d5ff;border-color:rgba(161,66,244,0.45);font-size:10px;padding:1px 6px;">👤 ${escapeHtml(n.authorId)}</span>`
             : "";
-          const driveLinkHtml = n.driveUrl
-            ? `<a href="${escapeHtml(n.driveUrl)}" target="_blank" rel="noopener noreferrer" class="icon-btn" style="height:26px;font-size:11px;text-decoration:none;display:inline-flex;align-items:center;">📄 Source Doc</a>`
+          const safeDriveUrl = sanitizeHttpsUrl(n.driveUrl);
+          const driveLinkHtml = safeDriveUrl
+            ? `<a href="${escapeHtml(safeDriveUrl)}" target="_blank" rel="noopener noreferrer" class="icon-btn" style="height:26px;font-size:11px;text-decoration:none;display:inline-flex;align-items:center;">📄 Source Doc</a>`
             : "";
           const viewGraphBtnHtml = !isRemoteTier
             ? `<button class="icon-btn btn-jump-graph" style="height:26px;font-size:11px;">🌐 View in 3D Graph</button>`
@@ -3889,10 +4817,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           const reqToken = (state.aceFetchToken = (state.aceFetchToken || 0) + 1);
           fetch("/api/federated-query", {
             method: "POST",
+            credentials: "same-origin",
             headers: {
               "Content-Type": "application/json",
-              "X-Sidecar-Token": window.__KC_SESSION_TOKEN || "",
-              "X-Owner-Token": window.__KC_SESSION_TOKEN || "",
+              "X-KC-Request": "1",
             },
             body: JSON.stringify({
               query: q,
@@ -3945,7 +4873,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               }
               const emptyMsg = document.getElementById("ace-empty-msg");
               if (emptyMsg && added === 0) {
-                emptyMsg.textContent = "No matching Remote Tier OKF Bundles concepts.";
+                emptyMsg.textContent = "No matching OKF Bundles concepts.";
               }
             })
             .catch(() => {});
@@ -3994,12 +4922,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       promoteModal.classList.add("visible");
       promoteModalBody.innerHTML = `<div style="color:var(--text-muted);">Running 4-Gate Schema Gate Preflight &amp; DLP Isolation Audit on <code>${escapeHtml(node.id)}</code>...</div>`;
 
+      const relPath = node.ceRelPath || node.id.replace(/^shared-okf-patterns:\/\/|^shared-okf-patterns\//, "");
       let payload = null;
       try {
-        const relPath = node.ceRelPath || node.id.replace(/^shared-okf-patterns:\/\/|^shared-okf-patterns\//, "");
         const res = await fetch("/api/ace-promote", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          credentials: "same-origin",
+          headers: {
+            "Content-Type": "application/json",
+            "X-KC-Request": "1",
+          },
           body: JSON.stringify({ notePath: relPath }),
         });
         if (res.ok) {
@@ -4061,7 +4993,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           <span style="font-weight:700;color:#93c5fd;">OKFBundle (${escapeHtml(payload.author_id || "author@example.com")})</span>
           <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
             <button id="btn-live-ace-preflight" class="icon-btn" style="border-color:rgba(96,165,250,0.65);color:#bfdbfe;height:28px;">🧪 1. Run Live Server Preflight</button>
-            <button id="btn-live-ace-submit" class="promote-btn" style="display:none !important;">🚀 2. Publish to Remote Tier Bundle</button>
+            <button id="btn-live-ace-submit" class="promote-btn" style="display:none !important;">🚀 2. Publish to Live Remote Tier Spanner</button>
             <button id="btn-copy-okf-sub" class="icon-btn" style="height:28px;">📋 Copy JSON</button>
           </div>
         </div>
@@ -4087,9 +5019,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         try {
           const res = await fetch("/api/ace-live-preflight", {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            credentials: "same-origin",
+            headers: {
+              "Content-Type": "application/json",
+              "X-KC-Request": "1",
+            },
             body: JSON.stringify({
-              content: payload.candidate_submission.content,
+              notePath: relPath,
               defaultId: payload.candidate_submission.default_id,
             }),
           });
@@ -4137,9 +5073,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           if (pft.startsWith("pft_local_")) {
             const pfRes = await fetch("/api/ace-live-preflight", {
               method: "POST",
-              headers: { "Content-Type": "application/json" },
+              credentials: "same-origin",
+              headers: {
+                "Content-Type": "application/json",
+                "X-KC-Request": "1",
+              },
               body: JSON.stringify({
-                content: payload.candidate_submission.content,
+                notePath: relPath,
                 defaultId: payload.candidate_submission.default_id,
               }),
             });
@@ -4157,16 +5097,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 statusBox.innerHTML = `ℹ️ <strong>Preflight Gate Feedback (HTTP ${pfData.http_status} — Nothing written to the Remote Tier):</strong><pre style="margin-top:4px;white-space:pre-wrap;font-size:11px;">${escapeHtml(JSON.stringify(pfData.response, null, 2))}</pre>`;
               }
               btn.disabled = false;
-              btn.textContent = "🚀 2. Publish to Remote Tier Bundle";
+              btn.textContent = "🚀 2. Publish to Live Remote Tier Spanner";
               return;
             }
           }
           const subRes = await fetch("/api/ace-live-submit", {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            credentials: "same-origin",
+            headers: {
+              "Content-Type": "application/json",
+              "X-KC-Request": "1",
+            },
             body: JSON.stringify({
+              notePath: relPath,
               id: payload.candidate_submission.id,
-              content: payload.candidate_submission.content,
               defaultId: payload.candidate_submission.default_id,
               preflightToken: pft,
             }),
@@ -4178,7 +5122,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             const publishedNodeId = `ace://l0/${publishedCid}`;
             const authorEmail = payload.author_id || "author@example.com";
             const authorShort = authorEmail.split("@")[0];
-            if (!nodeMap.has(publishedNodeId)) {
+            if (!nodeById.has(publishedNodeId)) {
               const newAceNode = {
                 id: publishedNodeId,
                 label: `[OKF Bundle • ${authorShort} • bundle_export] ${node.baseName || node.label}`,
@@ -4209,7 +5153,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 radius: 9,
               };
               allNodes.push(newAceNode);
-              nodeMap.set(publishedNodeId, newAceNode);
+              nodeById.set(publishedNodeId, newAceNode);
               if (graphData.stats?.categoryCounts) {
                 graphData.stats.categoryCounts.remote_tier = (graphData.stats.categoryCounts.remote_tier || 0) + 1;
               }
@@ -4220,8 +5164,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (statusBox) {
               statusBox.style.borderColor = "rgba(16,185,129,0.75)";
               statusBox.innerHTML = isNoOp
-                ? `✅ <strong>Already Up-to-Date in Remote Tier Bundle (Idempotent No-Op — Rev ${escapeHtml(String(subData.response?.revision_number || 1))}):</strong> Concept ID: <code>${escapeHtml(publishedCid)}</code> • UID: <code>${escapeHtml(subData.response?.concept_uid || "")}</code> • Cohort: <code>bundle_export</code> • Author: <code>${escapeHtml(authorEmail)}</code> (No duplicate row written)`
-                : `🎉 <strong>Published to Remote Tier Bundle (Rev ${escapeHtml(String(subData.response?.revision_number || 1))})!</strong> Concept ID: <code>${escapeHtml(publishedCid)}</code> • UID: <code>${escapeHtml(subData.response?.concept_uid || "")}</code> • Cohort: <code>bundle_export</code> • Author: <code>${escapeHtml(authorEmail)}</code>`;
+                ? `✅ <strong>Already Up-to-Date in Live Remote Tier Spanner (Idempotent No-Op — Rev ${escapeHtml(String(subData.response?.revision_number || 1))}):</strong> Concept ID: <code>${escapeHtml(publishedCid)}</code> • UID: <code>${escapeHtml(subData.response?.concept_uid || "")}</code> • Cohort: <code>bundle_export</code> • Author: <code>${escapeHtml(authorEmail)}</code> (No duplicate row written)`
+                : `🎉 <strong>Published to Live Remote Tier Spanner (Rev ${escapeHtml(String(subData.response?.revision_number || 1))})!</strong> Concept ID: <code>${escapeHtml(publishedCid)}</code> • UID: <code>${escapeHtml(subData.response?.concept_uid || "")}</code> • Cohort: <code>bundle_export</code> • Author: <code>${escapeHtml(authorEmail)}</code>`;
             }
             btn.textContent = isNoOp ? "✅ Already in the Remote Tier (Up-to-Date)" : "✅ Published to the Remote Tier!";
           } else {
@@ -4230,14 +5174,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               statusBox.innerHTML = `ℹ️ <strong>Remote Tier Submit Response (HTTP ${subData.http_status}):</strong><pre style="margin-top:4px;white-space:pre-wrap;font-size:11px;">${escapeHtml(JSON.stringify(subData.response, null, 2))}</pre>`;
             }
             btn.disabled = false;
-            btn.textContent = "🚀 2. Publish to Remote Tier Bundle";
+            btn.textContent = "🚀 2. Publish to Live Remote Tier Spanner";
           }
         } catch (err) {
           if (statusBox) {
             statusBox.innerHTML = `⚠️ Error calling submit endpoint: ${escapeHtml(String(err))}`;
           }
           btn.disabled = false;
-          btn.textContent = "🚀 2. Publish to Remote Tier Bundle";
+          btn.textContent = "🚀 2. Publish to Live Remote Tier Spanner";
         }
       });
     }
@@ -4568,12 +5512,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       }
 
       const matches = allNodes
-        .filter(n =>
-          n.label.toLowerCase().includes(cleanQ) ||
-          n.id.toLowerCase().includes(cleanQ) ||
-          (n.tags && n.tags.some(t => t.toLowerCase().includes(cleanQ))) ||
-          (n.aliases && n.aliases.some(a => a.toLowerCase().includes(cleanQ)))
-        )
+        .filter(n => nodeMatchesQuickFilter(n, q))
         .sort((a, b) => b.degree - a.degree)
         .slice(0, 12);
 
@@ -4667,29 +5606,178 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 """
 
 
-def render_graph_html(graph_data: dict[str, Any], sidecar_mode: bool = False) -> str:
+_TEMPLATE_BEFORE_PAYLOAD, _TEMPLATE_AFTER_PAYLOAD = HTML_TEMPLATE.split(
+    "__GRAPH_JSON_PAYLOAD__", 1
+)
+
+
+def _render_graph_html_from_payload(
+    payload_json: str,
+    sidecar_mode: bool = False,
+    csp_nonce: str | None = None,
+) -> str:
+    """Substitute preload tag, CSP nonce, and pre-serialized JSON payload into HTML_TEMPLATE."""
+    if csp_nonce:
+        safe_nonce = re.sub(r"[^A-Za-z0-9_-]", "", csp_nonce)
+        preload_tag = (
+            f'<script nonce="{safe_nonce}" src="/preload.js"></script>'
+            if sidecar_mode
+            else ""
+        )
+        before = _TEMPLATE_BEFORE_PAYLOAD.replace(
+            "__SIDECAR_PRELOAD_SCRIPT__", preload_tag
+        ).replace("__CSP_NONCE__", safe_nonce)
+        after = _TEMPLATE_AFTER_PAYLOAD.replace("__CSP_NONCE__", safe_nonce)
+    else:
+        preload_tag = '<script src="/preload.js"></script>' if sidecar_mode else ""
+        before = _TEMPLATE_BEFORE_PAYLOAD.replace(
+            "__SIDECAR_PRELOAD_SCRIPT__", preload_tag
+        ).replace(' nonce="__CSP_NONCE__"', "")
+        after = _TEMPLATE_AFTER_PAYLOAD.replace(' nonce="__CSP_NONCE__"', "")
+    return f"{before}{payload_json}{after}"
+
+
+def render_graph_html(
+    graph_data: dict[str, Any],
+    sidecar_mode: bool = False,
+    csp_nonce: str | None = None,
+) -> str:
     """Compile the self-contained WebGL Graph Visualizer HTML document."""
-    preload_tag = '<script src="/preload.js"></script>' if sidecar_mode else ""
-    payload_json = json.dumps(graph_data, ensure_ascii=False)
-    # Prevent accidental </script> closing inside markdown notes
-    payload_json = payload_json.replace("</script>", "<\\/script>")
-    html = HTML_TEMPLATE.replace("__SIDECAR_PRELOAD_SCRIPT__", preload_tag)
-    html = html.replace("__GRAPH_JSON_PAYLOAD__", payload_json)
-    return html
+    payload_json = _serialize_graph_html_payload(graph_data)
+    return _render_graph_html_from_payload(
+        payload_json, sidecar_mode=sidecar_mode, csp_nonce=csp_nonce
+    )
+
+
+def resolve_default_export_html_path(
+    filename: str = "Obsidian_Vault_WebGL_Graph.html",
+) -> Path:
+    """Resolve owner-only ($XDG_CACHE_HOME/knowledge-compiler/exports/<filename>) default HTML export path."""
+    safe_name = Path(filename).name or "Obsidian_Vault_WebGL_Graph.html"
+    xdg_raw = (os.environ.get("XDG_CACHE_HOME") or "").strip()
+    xdg_candidate = Path(xdg_raw).expanduser() if xdg_raw else None
+    cache_base = (
+        xdg_candidate
+        if (xdg_candidate is not None and xdg_candidate.is_absolute())
+        else (Path.home() / ".cache")
+    )
+
+    def _prepare_exports_dir(base_dir: Path) -> Path:
+        base_resolved = base_dir.resolve()
+        kc_dir = base_resolved / "knowledge-compiler"
+        exports_dir = kc_dir / "exports"
+        if kc_dir.is_symlink() or exports_dir.is_symlink():
+            raise OSError(f"Refusing symlink export directory: {exports_dir}")
+        exports_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if kc_dir.is_symlink() or exports_dir.is_symlink() or not exports_dir.is_dir():
+            raise OSError(f"Invalid export directory: {exports_dir}")
+        os.chmod(kc_dir, 0o700)
+        os.chmod(exports_dir, 0o700)
+        return exports_dir
+
+    try:
+        return _prepare_exports_dir(cache_base) / safe_name
+    except OSError:
+        uid_part = str(os.getuid()) if hasattr(os, "getuid") else "user"
+        tmp_root = Path(tempfile.gettempdir()).resolve()
+        fallback_base = tmp_root / f"knowledge-compiler-{uid_part}"
+        fallback_exports = fallback_base / "exports"
+        try:
+            if fallback_base.is_symlink() or fallback_exports.is_symlink():
+                raise OSError("Refusing symlinked fallback export directory")
+            fallback_exports.mkdir(parents=True, exist_ok=True, mode=0o700)
+            st = os.lstat(fallback_exports)
+            if not stat.S_ISDIR(st.st_mode) or (
+                hasattr(os, "getuid") and st.st_uid != os.getuid()
+            ):
+                raise OSError("Fallback export directory not owned by current user")
+            os.chmod(fallback_base, 0o700)
+            os.chmod(fallback_exports, 0o700)
+            return fallback_exports / safe_name
+        except OSError:
+            ephemeral_dir = Path(tempfile.mkdtemp(prefix="knowledge-compiler-exports-"))
+            os.chmod(ephemeral_dir, 0o700)
+            return ephemeral_dir / safe_name
+
+
+def validate_export_output_path(
+    vault_root: Path,
+    output_path: Path | str,
+) -> Path:
+    """Enforce strict Vault Containment Guard and symlink rejection on HTML export targets."""
+    raw_vault = Path(vault_root).expanduser()
+    resolved_vault = find_vault_root(raw_vault).resolve()
+    vault_candidates = {resolved_vault, raw_vault.resolve()}
+
+    raw_out = Path(output_path).expanduser()
+    if raw_out.is_symlink():
+        raise ValueError(f"Refusing to export HTML to symlink target: {output_path}")
+
+    abs_out = Path(os.path.abspath(str(raw_out)))
+    for v_cand in vault_candidates:
+        if abs_out == v_cand or v_cand in abs_out.parents:
+            raise ValueError(
+                f"Vault Containment Guard violation: refusing to write '{raw_out.name}' "
+                f"inside vault tree '{v_cand}'."
+            )
+
+    resolved_out = raw_out.resolve()
+    if resolved_out.is_symlink():
+        raise ValueError(f"Refusing to export HTML to symlink target: {output_path}")
+    if resolved_out.exists() and resolved_out.is_dir():
+        raise ValueError(
+            f"Export output path is a directory, expected file path: {resolved_out}"
+        )
+    for v_cand in vault_candidates:
+        if resolved_out == v_cand or v_cand in resolved_out.parents:
+            raise ValueError(
+                f"Vault Containment Guard violation: refusing to write '{resolved_out.name}' "
+                f"inside vault tree '{v_cand}'."
+            )
+    return resolved_out
 
 
 def export_graph_html(
-    vault_root: Path, output_path: Path, sidecar_mode: bool = False
+    vault_root: Path,
+    output_path: Path | str | None = None,
+    sidecar_mode: bool = False,
 ) -> dict[str, Any]:
-    """Build the vault graph and write a standalone WebGL HTML visualizer file."""
+    """Build the vault graph and atomically write a 0o600 standalone WebGL HTML visualizer file."""
+    target_path = (
+        output_path if output_path is not None else resolve_default_export_html_path()
+    )
+    out_path = validate_export_output_path(vault_root, target_path)
     graph_data = build_vault_graph(vault_root)
     html_content = render_graph_html(graph_data, sidecar_mode=sidecar_mode)
-    output_path = output_path.expanduser().resolve()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(html_content, encoding="utf-8")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if out_path.is_symlink():
+        raise ValueError(f"Refusing to export HTML to symlink target: {out_path}")
+
+    tmp_name = f".{out_path.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp"
+    tmp_path = out_path.parent / tmp_name
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(tmp_path, flags, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            os.chmod(tmp_path, 0o600)
+            fh.write(html_content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, out_path)
+        os.chmod(out_path, 0o600)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
     return {
         "success": True,
-        "output_path": str(output_path),
+        "output_path": str(out_path),
         "vault_path": graph_data["vaultPath"],
         "stats": graph_data["stats"],
     }
@@ -4760,27 +5848,85 @@ def is_valid_host_header(host_header: str | None, allowed_port: int | None = Non
 
 
 OWNER_TOKEN_PATH = get_plugin_data_dir() / ".vault_graph_token"
+_INITIAL_OWNER_TOKEN_PATH = OWNER_TOKEN_PATH
 _LEGACY_OWNER_TOKEN_PATH = OWNER_TOKEN_PATH
 
 
-def get_or_create_owner_token() -> str:
+def _is_secure_token_file(tok_path: Path) -> bool:
+    """Verify token file is a regular file owned by current UID with 0600 permissions."""
+    try:
+        st = os.lstat(tok_path)
+    except OSError:
+        return False
+    if not stat.S_ISREG(st.st_mode):
+        return False
+    if hasattr(os, "getuid") and st.st_uid != os.getuid():
+        return False
+    if (st.st_mode & 0o077) != 0:
+        return False
+    return True
+
+
+def get_or_create_owner_token(port: int | None = None) -> str:
     """Return the persistent 256-bit owner token (`chmod 600`) for remote/UberProxy access."""
     env_tok = (os.environ.get("VAULT_GRAPH_OWNER_TOKEN") or "").strip()
     if env_tok:
+        if len(env_tok) < 32:
+            raise ValueError(
+                "VAULT_GRAPH_OWNER_TOKEN must be at least 32 characters long."
+            )
         return env_tok
-    try:
-        for tok_path in (OWNER_TOKEN_PATH, _LEGACY_OWNER_TOKEN_PATH):
-            if tok_path.is_file():
+
+    custom_path_overridden = OWNER_TOKEN_PATH != _INITIAL_OWNER_TOKEN_PATH
+    primary_path = (
+        OWNER_TOKEN_PATH
+        if custom_path_overridden
+        else get_plugin_data_dir() / ".vault_graph_token"
+    )
+    use_legacy_fallback = (
+        not custom_path_overridden
+        and not os.environ.get("PLUGIN_DATA")
+        and not os.environ.get("XDG_DATA_HOME")
+    )
+    candidates = (
+        (primary_path, _LEGACY_OWNER_TOKEN_PATH)
+        if use_legacy_fallback
+        else (primary_path,)
+    )
+
+    for tok_path in candidates:
+        if _is_secure_token_file(tok_path):
+            try:
                 existing = tok_path.read_text(encoding="utf-8").strip()
-                if len(existing) >= 24:
-                    return existing
-        OWNER_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-        tok = secrets.token_urlsafe(32)
-        OWNER_TOKEN_PATH.write_text(tok + "\n", encoding="utf-8")
-        os.chmod(OWNER_TOKEN_PATH, 0o600)
+            except OSError:
+                continue
+            if len(existing) >= 32:
+                return existing
+
+    tok = secrets.token_urlsafe(32)
+    try:
+        primary_path.parent.mkdir(parents=True, exist_ok=True)
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(primary_path, flags, 0o600)
+        except FileExistsError:
+            primary_path.unlink(missing_ok=True)
+            fd = os.open(primary_path, flags, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(tok + "\n")
         return tok
-    except Exception:
-        return secrets.token_urlsafe(32)
+    except OSError as exc:
+        active_port = port or int(
+            os.environ.get("ANTIGRAVITY_SIDECAR_WEB_PORT", "8765")
+        )
+        sys.stderr.write(
+            f"[vault-graph] Token file persistence unavailable ({exc}); "
+            f"using ephemeral owner token. Unlock URL: http://127.0.0.1:{active_port}/?token={tok}\n"
+        )
+        sys.stderr.flush()
+        return tok
 
 
 _FORBIDDEN_LOCK_HTML = """<!DOCTYPE html>
@@ -4826,23 +5972,38 @@ _FORBIDDEN_LOCK_HTML = """<!DOCTYPE html>
 """
 
 
-def serve_vault_graph(
+def create_graph_request_handler(
     vault_root: Path,
     port: int = 8765,
     sidecar_mode: bool = False,
-    host: str = "127.0.0.1",
-) -> None:
-    """Run a ThreadingHTTPServer serving the WebGL Vault Graph Visualizer with Owner Token + Cookie Gate."""
-    ui_token = (
-        ((os.environ.get("ANTIGRAVITY_SIDECAR_UI_TOKEN") or "").strip() or secrets.token_urlsafe(32))
-        if sidecar_mode
-        else None
+    owner_token: str | None = None,
+    ui_token: str | None = None,
+    cache: VaultGraphCache | None = None,
+) -> type[http.server.BaseHTTPRequestHandler]:
+    """Build a configured GraphRequestHandler class bound to vault_root and owner_token."""
+    resolved_ui_token = (
+        ui_token
+        if ui_token is not None
+        else (
+            ((os.environ.get("ANTIGRAVITY_SIDECAR_UI_TOKEN") or "").strip() or secrets.token_urlsafe(32))
+            if sidecar_mode
+            else None
+        )
     )
-    owner_token = get_or_create_owner_token()
+    resolved_owner_token = (
+        owner_token
+        if owner_token is not None
+        else (None if sidecar_mode else get_or_create_owner_token(port=port))
+    )
     preload_js_path = SCRIPT_DIR.parent / "sidecars" / "vault_graph" / "preload.js"
     logo_svg_path = SCRIPT_DIR.parent / "assets" / "logo.svg"
+    prepared_candidate_cache: dict[tuple[str, str, int], dict[str, Any]] = {}
+    graph_cache = cache if cache is not None else VaultGraphCache(max_entries=4)
 
     class GraphRequestHandler(http.server.BaseHTTPRequestHandler):
+        timeout = 10
+        MAX_POST_BODY_BYTES = 1_048_576
+
         def log_message(self, fmt: str, *args: object) -> None:
             try:
                 rendered = fmt % args if args else fmt
@@ -4862,40 +6023,54 @@ def serve_vault_graph(
                 )
                 self.send_header(
                     "Access-Control-Allow-Headers",
-                    "Content-Type, Authorization, X-Requested-With, X-Sidecar-Token, X-Owner-Token",
+                    "Content-Type, Authorization, X-Requested-With, X-Sidecar-Token, X-Owner-Token, X-KC-Request",
                 )
+
+        def _send_csp_header(self, csp_nonce: str) -> None:
+            frame_directive = "" if sidecar_mode else "frame-ancestors 'self'; "
+            self.send_header(
+                "Content-Security-Policy",
+                f"default-src 'none'; script-src 'self' 'nonce-{csp_nonce}'; "
+                "style-src 'unsafe-inline'; img-src 'self' data: blob:; "
+                "font-src 'self' data:; connect-src 'self'; "
+                f"{frame_directive}base-uri 'none'",
+            )
 
         def _check_host(self) -> bool:
             return is_valid_host_header(self.headers.get("Host"), allowed_port=port)
 
-        def _check_auth(self) -> tuple[bool, bool]:
+        def _check_auth(self, is_post: bool = False) -> tuple[bool, bool]:
             """Return (is_authorized, should_set_owner_cookie)."""
             if not self._check_host():
                 return False, False
-            if sidecar_mode:
-                if not ui_token:
-                    return False, False
-                expected = ui_token.encode("utf-8")
-                header_tok = self.headers.get("X-Sidecar-Token")
-                if header_tok and hmac.compare_digest(header_tok.encode("utf-8"), expected):
+            active_tok = (
+                resolved_ui_token if sidecar_mode else resolved_owner_token
+            ) or ""
+            if not active_tok:
+                return False, False
+            expected = active_tok.encode("utf-8")
+
+            # 1. Explicit header authentication (CLI / tests / direct sidecar header)
+            auth_hdr = (self.headers.get("Authorization") or "").strip()
+            if auth_hdr.lower().startswith("bearer "):
+                bearer_val = auth_hdr[7:].strip()
+                if bearer_val and hmac.compare_digest(bearer_val.encode("utf-8"), expected):
                     return True, False
+
+            for hdr_name in ("X-Owner-Token", "X-Sidecar-Token"):
+                hdr_val = (self.headers.get(hdr_name) or "").strip()
+                if hdr_val and hmac.compare_digest(hdr_val.encode("utf-8"), expected):
+                    return True, False
+
+            # 2. Initial unlock query parameter (?token=...) on GET requests -> sets HttpOnly cookie
+            if not is_post:
                 parsed = urllib.parse.urlparse(self.path)
                 q_tokens = urllib.parse.parse_qs(parsed.query).get("token", [])
-                return (
-                    any(
-                        hmac.compare_digest(candidate.encode("utf-8"), expected)
-                        for candidate in q_tokens
-                    ),
-                    False,
-                )
+                for candidate in q_tokens:
+                    if hmac.compare_digest(candidate.encode("utf-8"), expected):
+                        return True, True
 
-            expected_owner = owner_token.encode("utf-8")
-            parsed = urllib.parse.urlparse(self.path)
-            q_tokens = urllib.parse.parse_qs(parsed.query).get("token", [])
-            for candidate in q_tokens:
-                if hmac.compare_digest(candidate.encode("utf-8"), expected_owner):
-                    return True, True
-
+            # 3. HttpOnly kc_owner_token cookie (requires X-KC-Request: 1 on POST routes to block CSRF)
             cookie_hdr = self.headers.get("Cookie") or ""
             if cookie_hdr:
                 try:
@@ -4903,20 +6078,19 @@ def serve_vault_graph(
                     jar.load(cookie_hdr)
                     if "kc_owner_token" in jar:
                         c_val = jar["kc_owner_token"].value
-                        if hmac.compare_digest(c_val.encode("utf-8"), expected_owner):
+                        if hmac.compare_digest(c_val.encode("utf-8"), expected):
+                            if is_post:
+                                csrf_hdr = (self.headers.get("X-KC-Request") or "").strip()
+                                if csrf_hdr != "1":
+                                    return False, False
                             return True, False
                 except Exception:
                     pass
 
-            for hdr_name in ("X-Owner-Token", "X-Sidecar-Token"):
-                hdr_val = self.headers.get(hdr_name)
-                if hdr_val and hmac.compare_digest(hdr_val.encode("utf-8"), expected_owner):
-                    return True, False
-
             return False, False
 
-        def _validate_token(self) -> bool:
-            ok, _ = self._check_auth()
+        def _validate_token(self, is_post: bool = False) -> bool:
+            ok, _ = self._check_auth(is_post=is_post)
             return ok
 
         def do_OPTIONS(self) -> None:  # noqa: N802
@@ -4931,6 +6105,7 @@ def serve_vault_graph(
             if not self._check_host():
                 self.send_response(http.HTTPStatus.FORBIDDEN)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("X-Content-Type-Options", "nosniff")
                 self.end_headers()
                 self.wfile.write(b'{"error": "forbidden: invalid Host header"}')
                 return
@@ -4965,8 +6140,9 @@ def serve_vault_graph(
                 self.wfile.write(svg_bytes)
                 return
 
-            authorized, set_cookie = self._check_auth()
+            authorized, set_cookie = self._check_auth(is_post=False)
             if not authorized:
+                lock_nonce = secrets.token_urlsafe(24)
                 status = (
                     http.HTTPStatus.UNAUTHORIZED
                     if sidecar_mode
@@ -4974,6 +6150,7 @@ def serve_vault_graph(
                 )
                 self.send_response(status)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
+                self._send_csp_header(lock_nonce)
                 self.send_header(
                     "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0"
                 )
@@ -4983,36 +6160,52 @@ def serve_vault_graph(
                 return
 
             if path in ("/", "/index.html"):
-                graph_data = build_vault_graph(vault_root)
-                html_str = render_graph_html(graph_data, sidecar_mode=sidecar_mode)
-                active_token = ui_token if sidecar_mode else owner_token
-                token_script = (
-                    f"<script>window.__KC_SESSION_TOKEN = {json.dumps(active_token)};"
+                csp_nonce = secrets.token_urlsafe(24)
+                html_str = graph_cache.get_rendered_html(
+                    vault_root,
+                    include_remote_tier=False,
+                    sidecar_mode=sidecar_mode,
+                    csp_nonce=csp_nonce,
+                )
+                cleanup_script = (
+                    f'<script nonce="{csp_nonce}">'
                     "if(window.location.search.includes('token=')){"
                     "window.history.replaceState({},document.title,window.location.pathname);"
                     "}</script></head>"
                 )
-                html_str = html_str.replace("</head>", token_script, 1)
+                html_str = html_str.replace("</head>", cleanup_script, 1)
                 html_bytes = html_str.encode("utf-8")
                 self.send_response(http.HTTPStatus.OK)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Referrer-Policy", "no-referrer")
+                self.send_header("Content-Length", str(len(html_bytes)))
+                self._send_csp_header(csp_nonce)
                 self.send_header(
                     "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0"
                 )
-                if set_cookie:
+                active_cookie_tok = (
+                    resolved_ui_token if sidecar_mode else resolved_owner_token
+                )
+                if set_cookie and active_cookie_tok:
                     self.send_header(
                         "Set-Cookie",
-                        f"kc_owner_token={owner_token}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax",
+                        f"kc_owner_token={active_cookie_tok}; Path=/; Max-Age=604800; HttpOnly; SameSite=Strict",
                     )
                 self._cors_headers()
                 self.end_headers()
                 self.wfile.write(html_bytes)
             elif path == "/api/graph":
-                graph_data = build_vault_graph(vault_root)
-                body = json.dumps(graph_data, ensure_ascii=False).encode("utf-8")
+                q_params = urllib.parse.parse_qs(parsed.query)
+                include_ace = q_params.get("include_ace", ["0"])[0].lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                )
+                body = graph_cache.get_json_bytes(
+                    vault_root, include_remote_tier=include_ace
+                )
                 self.send_response(http.HTTPStatus.OK)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
                 self._cors_headers()
                 self.end_headers()
                 self.wfile.write(body)
@@ -5023,6 +6216,7 @@ def serve_vault_graph(
             if not self._check_host():
                 self.send_response(http.HTTPStatus.FORBIDDEN)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("X-Content-Type-Options", "nosniff")
                 self.end_headers()
                 self.wfile.write(b'{"error": "forbidden: invalid Host header"}')
                 return
@@ -5031,11 +6225,39 @@ def serve_vault_graph(
             if origin and not is_allowed_origin(origin, allowed_port=port):
                 self.send_response(http.HTTPStatus.FORBIDDEN)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("X-Content-Type-Options", "nosniff")
                 self.end_headers()
                 self.wfile.write(b'{"error": "forbidden: invalid Origin header"}')
                 return
 
-            if not self._validate_token():
+            if self.headers.get("Transfer-Encoding"):
+                self.send_response(http.HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self._cors_headers()
+                self.end_headers()
+                self.wfile.write(b'{"error": "Payload Too Large"}')
+                return
+
+            raw_len = self.headers.get("Content-Length", "0")
+            try:
+                length = int(raw_len)
+            except ValueError:
+                self.send_response(http.HTTPStatus.BAD_REQUEST)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self._cors_headers()
+                self.end_headers()
+                self.wfile.write(b'{"error": "Invalid Content-Length"}')
+                return
+
+            if length < 0 or length > self.MAX_POST_BODY_BYTES:
+                self.send_response(http.HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self._cors_headers()
+                self.end_headers()
+                self.wfile.write(b'{"error": "Payload Too Large (max 1 MiB)"}')
+                return
+
+            if not self._validate_token(is_post=True):
                 self.send_response(http.HTTPStatus.UNAUTHORIZED)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self._cors_headers()
@@ -5054,7 +6276,6 @@ def serve_vault_graph(
 
             parsed = urllib.parse.urlparse(self.path)
             path = parsed.path
-            length = int(self.headers.get("Content-Length", "0"))
             raw_body = self.rfile.read(length) if length > 0 else b"{}"
             try:
                 data = json.loads(raw_body.decode("utf-8")) if raw_body else {}
@@ -5078,6 +6299,70 @@ def serve_vault_graph(
                     return json.loads(out) if out else {}
                 except Exception as exc:
                     return {"error": str(exc)}
+
+            def prepare_isolated_ace_candidate() -> tuple[dict[str, Any] | None, int, dict[str, Any] | None]:
+                """Resolve notePath strictly inside ce_patterns_root and produce canonical server-side sanitized content."""
+                ce_root = resolve_ce_patterns_root(
+                    os.environ.get("OKF_PATTERNS_PATH")
+                ).resolve()
+                note_rel = str(data.get("notePath") or "").strip()
+                if not note_rel:
+                    err = {
+                        "ok": False,
+                        "http_status": 400,
+                        "error": "notePath inside shared-okf-patterns is required",
+                        "response": {"error": "notePath inside shared-okf-patterns is required"},
+                    }
+                    return None, int(http.HTTPStatus.BAD_REQUEST), err
+                target_path = (ce_root / note_rel).resolve()
+                try:
+                    target_path.relative_to(ce_root)
+                except ValueError:
+                    err = {
+                        "ok": False,
+                        "http_status": 403,
+                        "error": "notePath must reside strictly inside shared-okf-patterns",
+                        "response": {"error": "notePath must reside strictly inside shared-okf-patterns"},
+                    }
+                    return None, int(http.HTTPStatus.FORBIDDEN), err
+                file_sha = (
+                    hashlib.sha256(target_path.read_bytes()).hexdigest()
+                    if target_path.is_file()
+                    else ""
+                )
+                cache_key = (
+                    str(target_path),
+                    file_sha,
+                    id(prepare_pattern_for_remote_tier),
+                )
+                prep = prepared_candidate_cache.get(cache_key)
+                if prep is None:
+                    try:
+                        prep = prepare_pattern_for_remote_tier(
+                            note_path=target_path,
+                            ce_patterns_root=ce_root,
+                            obsidian_vault_root=vault_root,
+                        )
+                    except Exception as exc:
+                        err = {
+                            "ok": False,
+                            "http_status": 403,
+                            "error": str(exc),
+                            "response": {"error": str(exc)},
+                        }
+                        return None, int(http.HTTPStatus.FORBIDDEN), err
+                cand = prep.get("candidate_submission") if isinstance(prep, dict) else None
+                if not isinstance(cand, dict) or not cand.get("content"):
+                    msg = str((prep or {}).get("error") or "Failed to prepare candidate pattern")
+                    err = {
+                        "ok": False,
+                        "http_status": 403,
+                        "error": msg,
+                        "response": {"error": msg},
+                    }
+                    return None, int(http.HTTPStatus.FORBIDDEN), err
+                prepared_candidate_cache[cache_key] = prep
+                return prep, int(http.HTTPStatus.OK), None
 
             if (path.startswith("/_sidecar/") or path.startswith("/api/ace-")) and not HAS_1P_FED_BRIDGE:
                 self.send_error(http.HTTPStatus.NOT_FOUND)
@@ -5141,31 +6426,85 @@ def serve_vault_graph(
                 try:
                     ce_root = resolve_ce_patterns_root(
                         os.environ.get("OKF_PATTERNS_PATH")
-                    )
-                    note_rel = str(data.get("notePath", ""))
+                    ).resolve()
+                    note_rel = str(data.get("notePath", "")).strip()
+                    if not note_rel:
+                        raise ValueError("notePath is required")
                     target_path = (ce_root / note_rel).resolve()
-                    resp = prepare_pattern_for_remote_tier(
-                        note_path=target_path,
-                        ce_patterns_root=ce_root,
-                        obsidian_vault_root=vault_root,
+                    target_path.relative_to(ce_root)
+                    file_sha = (
+                        hashlib.sha256(target_path.read_bytes()).hexdigest()
+                        if target_path.is_file()
+                        else ""
                     )
+                    cache_key = (
+                        str(target_path),
+                        file_sha,
+                        id(prepare_pattern_for_remote_tier),
+                    )
+                    resp = prepared_candidate_cache.get(cache_key)
+                    if resp is None:
+                        resp = prepare_pattern_for_remote_tier(
+                            note_path=target_path,
+                            ce_patterns_root=ce_root,
+                            obsidian_vault_root=vault_root,
+                        )
+                        if (
+                            isinstance(resp, dict)
+                            and isinstance(resp.get("candidate_submission"), dict)
+                            and resp["candidate_submission"].get("content")
+                        ):
+                            prepared_candidate_cache[cache_key] = resp
                 except Exception as exc:
                     resp = {"error": str(exc)}
             elif path == "/api/ace-live-preflight":
+                prep, err_status, err_payload = prepare_isolated_ace_candidate()
+                if err_payload is not None or prep is None:
+                    self.send_response(err_status)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self._cors_headers()
+                    self.end_headers()
+                    self.wfile.write(json.dumps(err_payload).encode("utf-8"))
+                    return
+                cand = prep["candidate_submission"]
                 try:
                     resp = run_remote_tier_preflight(
-                        content=str(data.get("content", "")),
-                        default_id=str(data.get("defaultId", "")),
+                        content=str(cand["content"]),
+                        default_id=str(
+                            cand.get("default_id")
+                            or prep.get("concept_id")
+                            or data.get("defaultId", "")
+                        ),
                     )
                 except Exception as exc:
                     resp = {"ok": False, "http_status": 0, "response": {"error": str(exc)}}
             elif path == "/api/ace-live-submit":
+                prep, err_status, err_payload = prepare_isolated_ace_candidate()
+                if err_payload is not None or prep is None:
+                    self.send_response(err_status)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self._cors_headers()
+                    self.end_headers()
+                    self.wfile.write(json.dumps(err_payload).encode("utf-8"))
+                    return
+                cand = prep["candidate_submission"]
                 try:
                     resp = submit_to_remote_tier(
-                        submission_id=str(data.get("id", "")),
-                        content=str(data.get("content", "")),
-                        default_id=str(data.get("defaultId", "")),
-                        preflight_token=str(data.get("preflightToken", "")),
+                        submission_id=str(
+                            cand.get("id")
+                            or prep.get("submission_id")
+                            or data.get("id", "")
+                        ),
+                        content=str(cand["content"]),
+                        default_id=str(
+                            cand.get("default_id")
+                            or prep.get("concept_id")
+                            or data.get("defaultId", "")
+                        ),
+                        preflight_token=str(
+                            data.get("preflightToken")
+                            or cand.get("preflight_token", "")
+                        ),
                     )
                 except Exception as exc:
                     resp = {"ok": False, "http_status": 0, "response": {"error": str(exc)}}
@@ -5180,8 +6519,32 @@ def serve_vault_graph(
             self.end_headers()
             self.wfile.write(body_bytes)
 
+    return GraphRequestHandler
+
+
+def serve_vault_graph(
+    vault_root: Path,
+    port: int = 8765,
+    sidecar_mode: bool = False,
+    host: str = "127.0.0.1",
+) -> None:
+    """Run a ThreadingHTTPServer serving the WebGL Vault Graph Visualizer with Owner Token + Cookie Gate."""
+    ui_token = (
+        ((os.environ.get("ANTIGRAVITY_SIDECAR_UI_TOKEN") or "").strip() or secrets.token_urlsafe(32))
+        if sidecar_mode
+        else None
+    )
+    owner_token = get_or_create_owner_token(port=port)
+    handler_cls = create_graph_request_handler(
+        vault_root=vault_root,
+        port=port,
+        sidecar_mode=sidecar_mode,
+        owner_token=owner_token,
+        ui_token=ui_token,
+    )
+
     bind_host = "127.0.0.1" if sidecar_mode else host
-    with http.server.ThreadingHTTPServer((bind_host, port), GraphRequestHandler) as srv:
+    with http.server.ThreadingHTTPServer((bind_host, port), handler_cls) as srv:
         logger.info(
             "Serving WebGL Vault Graph Visualizer (%s) on http://%s:%d",
             vault_root,
@@ -5228,9 +6591,14 @@ def main() -> None:
     )
     parser.add_argument(
         "--export",
-        type=str,
+        nargs="?",
+        const="__DEFAULT__",
         default=None,
-        help="Export a standalone self-contained WebGL HTML file to the given path.",
+        metavar="PATH",
+        help=(
+            "Export a standalone self-contained WebGL HTML file "
+            "(defaults to $XDG_CACHE_HOME/knowledge-compiler/exports/Obsidian_Vault_WebGL_Graph.html)."
+        ),
     )
     parser.add_argument(
         "--serve",
@@ -5268,8 +6636,13 @@ def main() -> None:
         print(json.dumps(data, indent=2, ensure_ascii=False))
         return
 
-    if args.export:
-        res = export_graph_html(vault_root, Path(args.export))
+    if args.export is not None:
+        export_target = (
+            resolve_default_export_html_path()
+            if args.export == "__DEFAULT__"
+            else Path(args.export)
+        )
+        res = export_graph_html(vault_root, export_target)
         print(
             f"✅ Exported WebGL Vault Graph ({res['stats']['wikiNotes']} wiki notes, "
             f"{res['stats']['totalEdges']} links) -> {res['output_path']}"

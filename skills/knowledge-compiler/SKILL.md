@@ -74,7 +74,7 @@ python3 scripts/vault_lint.py /path/to/my-vault --fix
    - When linking Note A $\rightarrow$ Note B, always check if Note B should reference Note A back. Bi-directional connections maximize graph density in Obsidian.
 
 4. **OKF v0.2 YAML Frontmatter**:
-   - Every note in `wiki/` must have frontmatter with `title`, `type`, `tags`, `status`, `generated`, `verified`, and optional `aliases`.
+   - Every note in `wiki/` must have OKF v0.2 frontmatter with `type` (plus recommended `title`, `tags`, `status`, `sources`, `generated`, and optional `aliases`). Omit `verified:` on agent-authored notes until explicit human review (`vault-lint --approve-human <note>`).
 
 ---
 

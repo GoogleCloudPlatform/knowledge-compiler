@@ -30,6 +30,8 @@ Always outputs a valid empty JSON object `{}` to stdout per the Stop contract.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+import errno
 import hashlib
 import json
 import os
@@ -39,6 +41,12 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Iterator
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
 
 FRONTMATTER_RE = re.compile(r"\A(---\r?\n.*?\r?\n---\r?\n?)(.*)\Z", re.DOTALL)
 UPDATED_LINE_RE = re.compile(
@@ -48,6 +56,87 @@ LOG_HEADING_SPLIT_RE = re.compile(r"(?=^## \[\d{4}-\d{2}-\d{2}\])", re.MULTILINE
 LOG_DATE_RE = re.compile(r"^## \[(\d{4}-\d{2}-\d{2})\]")
 SECTION_SPLIT_RE = re.compile(r"(?=^## )", re.MULTILINE)
 WIKILINK_TARGET_RE = re.compile(r"\[\[([^\]|#]+)")
+
+
+def get_plugin_data_dir() -> Path:
+    """Return the per-user writable runtime data directory (outside immutable plugin source)."""
+    for env_key in ("PLUGIN_DATA", "ANTIGRAVITY_EXECUTABLE_DATA_DIR", "KC_DATA_DIR"):
+        val = (os.environ.get(env_key) or "").strip()
+        if val:
+            return Path(val).expanduser().resolve()
+    xdg_state = (os.environ.get("XDG_STATE_HOME") or "").strip()
+    if xdg_state:
+        return (Path(xdg_state).expanduser() / "knowledge-compiler").resolve()
+    return Path("~/.local/share/knowledge-compiler").expanduser().resolve()
+
+
+@contextmanager
+def acquire_vault_lock(vault_path: Path) -> Iterator[bool]:
+    """Acquire a non-blocking exclusive fcntl.flock for `vault_path`.
+
+    Yields True if the lock was acquired, or False if another hook process
+    currently holds the lock.
+    """
+    if fcntl is None:
+        yield True
+        return
+
+    resolved = vault_path.expanduser().resolve()
+    sha16 = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:16]
+    lock_dirs = [
+        get_plugin_data_dir() / "locks",
+        Path(tempfile.gettempdir()) / f"kc-locks-{os.getuid()}",
+    ]
+
+    fd: int | None = None
+    for lock_dir in lock_dirs:
+        try:
+            lock_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(lock_dir, 0o700)
+            except OSError:
+                pass
+            lock_path = lock_dir / f"vault-{sha16}.lock"
+            if lock_path.is_symlink():
+                yield False
+                return
+            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            break
+        except OSError:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                fd = None
+            continue
+
+    if fd is None:
+        yield True
+        return
+
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK):
+                yield False
+                return
+            yield True
+            return
+
+        try:
+            yield True
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def get_default_vault_path() -> Path:
@@ -143,16 +232,61 @@ def get_active_branch(repo_dir: Path) -> str:
     return branch if proc.returncode == 0 and branch else "main"
 
 
-def is_rebase_in_progress(repo_dir: Path) -> bool:
+def _resolve_git_dir(repo_dir: Path) -> Path | None:
     git_dir_proc = run_cmd(
         ["git", "rev-parse", "--git-dir"], cwd=repo_dir, timeout=5
     )
     if git_dir_proc.returncode != 0:
-        return False
+        return None
     git_dir = Path(git_dir_proc.stdout.strip())
     if not git_dir.is_absolute():
         git_dir = (repo_dir / git_dir).resolve()
+    return git_dir
+
+
+def is_rebase_in_progress(repo_dir: Path) -> bool:
+    git_dir = _resolve_git_dir(repo_dir)
+    if git_dir is None:
+        return False
     return (git_dir / "rebase-merge").exists() or (git_dir / "rebase-apply").exists()
+
+
+def has_in_progress_git_operation(repo_dir: Path) -> str | None:
+    """Return active Git conflict/operation state if sync must skip without mutating."""
+    git_dir = _resolve_git_dir(repo_dir)
+    if git_dir is None:
+        return None
+    if (git_dir / "rebase-merge").exists() or (git_dir / "rebase-apply").exists():
+        return "rebase"
+
+    def _has_ref_or_file(ref_name: str) -> bool:
+        if (git_dir / ref_name).exists():
+            return True
+        proc = run_cmd(
+            ["git", "rev-parse", "-q", "--verify", ref_name],
+            cwd=repo_dir,
+            timeout=5,
+        )
+        return proc.returncode == 0 and bool(proc.stdout.strip())
+
+    if _has_ref_or_file("MERGE_HEAD"):
+        return "merge"
+    if _has_ref_or_file("CHERRY_PICK_HEAD"):
+        return "cherry_pick"
+    if _has_ref_or_file("REVERT_HEAD"):
+        return "revert"
+    if (git_dir / "sequencer").exists():
+        return "sequencer"
+    if (git_dir / "BISECT_LOG").exists():
+        return "bisect"
+    unmerged_proc = run_cmd(
+        ["git", "diff", "--name-only", "--diff-filter=U"],
+        cwd=repo_dir,
+        timeout=5,
+    )
+    if unmerged_proc.returncode == 0 and unmerged_proc.stdout.strip():
+        return "unmerged_conflicts"
+    return None
 
 
 def _extract_updated_date(text: str) -> str:
@@ -417,6 +551,13 @@ def rebase_onto_origin(vault_path: Path, branch: str = "main") -> dict:
     if rebase_proc.returncode == 0 and not is_rebase_in_progress(vault_path):
         return {"ok": True, "status": "rebased"}
 
+    if not is_rebase_in_progress(vault_path):
+        return {
+            "ok": False,
+            "status": "rebase_failed",
+            "conflicted_file": "",
+        }
+
     for _ in range(25):
         if not is_rebase_in_progress(vault_path):
             break
@@ -442,7 +583,7 @@ def rebase_onto_origin(vault_path: Path, branch: str = "main") -> dict:
         run_cmd(["git", "rebase", "--abort"], cwd=vault_path, timeout=10)
         return {"ok": False, "status": "conflict_aborted", "conflicted_file": "unknown"}
 
-    return {"ok": True, "status": "rebased_with_okf_merge"}
+    return {"ok": False, "status": "rebase_failed", "conflicted_file": ""}
 
 
 def _check_and_mark_debounce(tag: str, target_path: Path, debounce_seconds: float) -> bool:
@@ -450,7 +591,13 @@ def _check_and_mark_debounce(tag: str, target_path: Path, debounce_seconds: floa
     if debounce_seconds <= 0:
         return False
     digest = hashlib.sha256(f"{tag}:{target_path}".encode("utf-8")).hexdigest()[:12]
-    stamp_file = Path(tempfile.gettempdir()) / f"kc_hook_{tag}_{digest}.stamp"
+    stamp_dir = get_plugin_data_dir() / "stamps"
+    try:
+        stamp_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(stamp_dir, 0o700)
+    except OSError:
+        stamp_dir = Path(tempfile.gettempdir())
+    stamp_file = stamp_dir / f"kc_hook_{tag}_{digest}.stamp"
     now = time.time()
     try:
         if stamp_file.is_file():
@@ -508,9 +655,43 @@ def sync_vault(
     if _check_and_mark_debounce("stop", vault_path, debounce_seconds):
         return {"status": "debounced", "vault_path": str(vault_path), "harness": harness}
 
-    # Safety guard: never commit on top of an interrupted rebase
-    if is_rebase_in_progress(vault_path):
-        run_cmd(["git", "rebase", "--abort"], cwd=vault_path, timeout=10)
+    with acquire_vault_lock(vault_path) as lock_acquired:
+        if not lock_acquired:
+            return {
+                "status": "locked_skipped",
+                "vault_path": str(vault_path),
+                "harness": harness,
+                "committed": False,
+                "pushed": False,
+            }
+
+        return _sync_vault_locked(
+            vault_path=vault_path,
+            conversation_id=conversation_id,
+            harness=harness,
+        )
+
+
+def _sync_vault_locked(
+    vault_path: Path,
+    conversation_id: str = "",
+    harness: str = "Antigravity",
+) -> dict:
+    # Safety guard: never commit/abort during an active rebase, merge, cherry-pick, revert, or unmerged conflict
+    active_op = has_in_progress_git_operation(vault_path)
+    if active_op:
+        status = (
+            "skipped_rebase_in_progress"
+            if active_op == "rebase"
+            else f"skipped_{active_op}_in_progress"
+        )
+        return {
+            "status": status,
+            "vault_path": str(vault_path),
+            "harness": harness,
+            "committed": False,
+            "pushed": False,
+        }
 
     branch = get_active_branch(vault_path)
     remote_configured = has_origin_remote(vault_path)
@@ -590,10 +771,16 @@ def sync_vault(
                     )
                     if post_status.stdout.strip():
                         _stage_vault_files(vault_path)
-                        run_cmd(
-                            ["git", "commit", "--amend", "--no-edit"],
-                            cwd=vault_path,
-                        )
+                        if (
+                            run_cmd(
+                                ["git", "diff", "--cached", "--quiet"], cwd=vault_path
+                            ).returncode
+                            != 0
+                        ):
+                            run_cmd(
+                                ["git", "commit", "--amend", "--no-edit"],
+                                cwd=vault_path,
+                            )
                     retry_push = run_cmd(
                         ["git", "push", "origin", branch],
                         cwd=vault_path,
