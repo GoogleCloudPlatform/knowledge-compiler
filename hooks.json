@@ -1,0 +1,44 @@
+{
+  "vault-session-start": {
+    "enabled": false,
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "python3 -B scripts/hooks/session_sync.py || exit 0",
+        "timeout": 15
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "python3 -B scripts/hooks/session_sync.py || exit 0",
+        "timeout": 15
+      }
+    ]
+  },
+  "vault-stop-hook": {
+    "enabled": false,
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python3 -B scripts/hooks/auto_sync_vault.py || exit 0",
+        "timeout": 15
+      }
+    ]
+  },
+  "wikiskill-error-recorder": {
+    "enabled": false,
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -B scripts/hooks/log_tool_failure.py || exit 0",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

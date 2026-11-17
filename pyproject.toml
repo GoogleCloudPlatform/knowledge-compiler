@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "knowledge-compiler"
+version = "1.1.3"
+description = "Compile PDFs, slides, docs, and agent sessions into a local Open Knowledge Format (OKF v0.2) Markdown wiki with a 2D/3D WebGL graph and linter."
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Google LLC"}
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+keywords = ["knowledge-compiler", "open-knowledge-format", "okf", "llm-wiki", "context-engineering", "knowledge-graph", "obsidian", "wikiskill", "agent-memory", "markdown", "google-cloud"]
+dependencies = [
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+extract = [
+    "python-pptx>=0.6.21,<2.0.0",
+    "pypdf>=4.0.0,<8.0.0",
+    "python-docx>=1.0.0,<2.0.0",
+    "openpyxl>=3.1.0,<4.0.0",
+]
+all = [
+    "python-pptx>=0.6.21,<2.0.0",
+    "pypdf>=4.0.0,<8.0.0",
+    "python-docx>=1.0.0,<2.0.0",
+    "openpyxl>=3.1.0,<4.0.0",
+]
+dev = [
+    "pytest>=7.4.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/GoogleCloudPlatform/knowledge-compiler"
+Repository = "https://github.com/GoogleCloudPlatform/knowledge-compiler"
+
+[project.scripts]
+vault-init = "scripts.init_vault:main"
+vault-extract = "scripts.extract_source:main"
+vault-lint = "scripts.vault_lint:main"
+vault-correct = "scripts.vault_correct:main"
+vault-query = "scripts.vault_query:main"
+vault-sync-patterns = "scripts.sync_patterns:main"
+vault-sanitize-check = "scripts.sanitize_check:main"
+vault-analyze-trace = "scripts.analyze_trace:main"
+vault-wikiskill-eval = "scripts.wikiskill_eval:main"
+vault-hooks = "scripts.vault_hooks:main"
+vault-graph = "scripts.vault_graph:main"
+kc-install-plugin = "scripts.install_plugin:main"
+
+[tool.setuptools]
+packages = ["scripts", "scripts.hooks"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
