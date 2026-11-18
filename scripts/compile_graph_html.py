@@ -112,7 +112,7 @@ def main() -> int:
             f"SUPERSEDES={edge_counts.get('SUPERSEDES', 0)}, "
             f"LINKS_TO={edge_counts.get('LINKS_TO', 0)}"
         )
-        print(f"❌ Broken Wikilinks   : {len(lint['broken_links'])}")
+        print(f"❌ Broken Links       : {len(lint['broken_links'])}")
         print(f"🏝️ Orphan Wiki Notes  : {len(lint['orphan_notes'])}")
         print(f"📐 Missing Frontmatter: {len(lint['missing_frontmatter'])}")
         print(f"📊 Table Pipe Errors  : {len(lint['table_invariant_violations'])}")

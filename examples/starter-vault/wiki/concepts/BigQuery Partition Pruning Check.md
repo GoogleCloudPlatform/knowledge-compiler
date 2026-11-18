@@ -31,13 +31,13 @@ sources:
 generated:
   by: "knowledge-compiler/1.2.0"
   at: "2026-11-18T00:00:00Z"
-corroborates:
-  - "[[BigQuery Partitioning and Clustering]]"
+x-kc-corroborates:
+  - "/wiki/concepts/BigQuery Partitioning and Clustering.md"
 ---
 
 # BigQuery Partition Pruning Check
 
-This Attested Computation turns the design rules in [[BigQuery Partitioning and Clustering]] into evidence. For each recent single-table query against a partitioned table, it compares the bytes the query processed with the logical size of the table it read. A `scan_ratio` near 1.0 means the query read about as much data as the table holds, so its partition filter, if it had one, pruned almost nothing.[^bq-jobs-view][^bq-table-storage]
+This Attested Computation turns the design rules in [BigQuery Partitioning and Clustering](BigQuery%20Partitioning%20and%20Clustering.md) into evidence. For each recent single-table query against a partitioned table, it compares the bytes the query processed with the logical size of the table it read. A `scan_ratio` near 1.0 means the query read about as much data as the table holds, so its partition filter, if it had one, pruned almost nothing.[^bq-jobs-view][^bq-table-storage]
 
 ## Parameters
 
@@ -45,7 +45,7 @@ This Attested Computation turns the design rules in [[BigQuery Partitioning and 
 | :--- | :--- | :--- |
 | `lookback_days` | integer | Trailing window of finished query jobs to audit, counted back from the time of the run. The JOBS view keeps 180 days of history. |
 
-The weekly check in the [[BigQuery Governance Notes Summary]] corresponds to `lookback_days = 7`; a longer window turns the same output into a trend line.[^bq-jobs-view]
+The weekly check in the [BigQuery Governance Notes Summary](../sources/BigQuery%20Governance%20Notes%20Summary.md) corresponds to `lookback_days = 7`; a longer window turns the same output into a trend line.[^bq-jobs-view]
 
 ## Receipt and Attestation
 
@@ -57,18 +57,18 @@ The weekly check in the [[BigQuery Governance Notes Summary]] corresponds to `lo
 
 - **Ratio Near or Above 1.0**: The query read roughly the whole table. Check its filter on the partitioning column first: a filter whose value comes from a subquery, or that mixes in other columns, does not prune.[^bq-query-partitions]
 - **Low Ratio**: Not proof of pruning. BigQuery also reads only the columns a query references, so a narrow query over every partition can still look small. Confirm with the query plan.
-- **Repeat Offenders**: Group the output by `user_email` or `table_path` to find dashboards and scheduled queries that need a constant date filter, then make the filter mandatory with the [[Partition Filter Enforcement Guardrail]].
-- **Out of Scope**: Unpartitioned tables such as the [[Legacy Unpartitioned Daily Batch Table]] never appear, because there is nothing to prune. Neither do queries that join several tables, since their bytes cannot be attributed to one table.
+- **Repeat Offenders**: Group the output by `user_email` or `table_path` to find dashboards and scheduled queries that need a constant date filter, then make the filter mandatory with the [Partition Filter Enforcement Guardrail](../patterns/Partition%20Filter%20Enforcement%20Guardrail.md).
+- **Out of Scope**: Unpartitioned tables such as the [Legacy Unpartitioned Daily Batch Table](Legacy%20Unpartitioned%20Daily%20Batch%20Table.md) never appear, because there is nothing to prune. Neither do queries that join several tables, since their bytes cannot be attributed to one table.
 
 ## Related Notes
 
-- [[BigQuery Partitioning and Clustering]]
-- [[Partition Filter Enforcement Guardrail]]
-- [[Legacy Unpartitioned Daily Batch Table]]
-- [[BigQuery]]
-- [[BigQuery Governance Notes Summary]]
-- [[Production Readiness and Observability Checklist]]
-- [[Google Cloud Serverless Analytics Reference]]
+- [BigQuery Partitioning and Clustering](BigQuery%20Partitioning%20and%20Clustering.md)
+- [Partition Filter Enforcement Guardrail](../patterns/Partition%20Filter%20Enforcement%20Guardrail.md)
+- [Legacy Unpartitioned Daily Batch Table](Legacy%20Unpartitioned%20Daily%20Batch%20Table.md)
+- [BigQuery](../entities/BigQuery.md)
+- [BigQuery Governance Notes Summary](../sources/BigQuery%20Governance%20Notes%20Summary.md)
+- [Production Readiness and Observability Checklist](../synthesis/Production%20Readiness%20and%20Observability%20Checklist.md)
+- [Google Cloud Serverless Analytics Reference](../synthesis/Google%20Cloud%20Serverless%20Analytics%20Reference.md)
 
 # Computation
 

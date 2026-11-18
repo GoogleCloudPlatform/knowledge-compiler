@@ -23,19 +23,19 @@ sources:
 generated:
   by: "knowledge-compiler/1.2.0"
   at: "2026-11-18T00:00:00Z"
-extends:
-  - "[[Cloud Run Serverless Containers]]"
-corroborates:
-  - "[[Partition Filter Enforcement Guardrail]]"
-supersedes:
-  - "[[Legacy Unpartitioned Daily Batch Table]]"
+x-kc-extends:
+  - "/wiki/concepts/Cloud Run Serverless Containers.md"
+x-kc-corroborates:
+  - "/wiki/patterns/Partition Filter Enforcement Guardrail.md"
+x-kc-supersedes:
+  - "/wiki/concepts/Legacy Unpartitioned Daily Batch Table.md"
 ---
 
 # BigQuery Partitioning and Clustering
 
-Partitioning divides a [[BigQuery]] table into segments by a time-unit column, ingestion time, or an integer range. Clustering sorts the storage blocks inside each segment by the values of up to four columns. Together they let BigQuery skip data that a query cannot need, which cuts bytes processed and latency for the filtered reads that dominate analytical workloads.[^bq-partitioned-tables][^bq-clustered-tables]
+Partitioning divides a [BigQuery](../entities/BigQuery.md) table into segments by a time-unit column, ingestion time, or an integer range. Clustering sorts the storage blocks inside each segment by the values of up to four columns. Together they let BigQuery skip data that a query cannot need, which cuts bytes processed and latency for the filtered reads that dominate analytical workloads.[^bq-partitioned-tables][^bq-clustered-tables]
 
-This note **extends** [[Cloud Run Serverless Containers]] into the storage tier: the services and jobs described there write the events, and this layout decides how cheaply those events can be read back. It **corroborates** the [[Partition Filter Enforcement Guardrail]], because requiring a partition filter only pays off when tables are partitioned on the column that queries actually filter. It also **supersedes** the [[Legacy Unpartitioned Daily Batch Table]], the full-scan layout it replaced.
+This note **extends** [Cloud Run Serverless Containers](Cloud%20Run%20Serverless%20Containers.md) into the storage tier: the services and jobs described there write the events, and this layout decides how cheaply those events can be read back. It **corroborates** the [Partition Filter Enforcement Guardrail](../patterns/Partition%20Filter%20Enforcement%20Guardrail.md), because requiring a partition filter only pays off when tables are partitioned on the column that queries actually filter. It also **supersedes** the [Legacy Unpartitioned Daily Batch Table](Legacy%20Unpartitioned%20Daily%20Batch%20Table.md), the full-scan layout it replaced.
 
 ## Design Invariants
 
@@ -44,11 +44,11 @@ This note **extends** [[Cloud Run Serverless Containers]] into the storage tier:
 - **Require Partition Filters**: Set `require_partition_filter = TRUE` on large tables so a query without a usable filter on the partitioning column fails instead of scanning the full history.[^bq-create-partitions]
 - **Expire Old Partitions**: Set `partition_expiration_days` so partitions past their retention period are dropped automatically rather than removed with large `DELETE` statements.[^bq-create-partitions]
 - **Order Clustering Columns Deliberately**: Column order sets the sort precedence. A query that filters on the first clustering column, or on the first and second together, benefits most, while a filter on only a later column benefits less.[^bq-clustered-tables]
-- **Treat Estimates as Upper Bounds**: A dry run reflects partition pruning before execution, but block pruning from clustering is known only after the query runs. Measure the real effect with [[BigQuery Partition Pruning Check]].[^bq-clustered-tables]
+- **Treat Estimates as Upper Bounds**: A dry run reflects partition pruning before execution, but block pruning from clustering is known only after the query runs. Measure the real effect with [BigQuery Partition Pruning Check](BigQuery%20Partition%20Pruning%20Check.md).[^bq-clustered-tables]
 
 ## Reference Table Definition
 
-This is the layout that the [[Event Analytics Design Brief Summary]] specifies for `analytics.events`: daily partitions on `event_ts`, clustering by tenant and then event type, a mandatory partition filter, and a 400-day partition expiry.
+This is the layout that the [Event Analytics Design Brief Summary](../sources/Event%20Analytics%20Design%20Brief%20Summary.md) specifies for `analytics.events`: daily partitions on `event_ts`, clustering by tenant and then event type, a mandatory partition filter, and a 400-day partition expiry.
 
 ```sql
 CREATE TABLE analytics.events
@@ -84,10 +84,10 @@ Large event tables often combine both: daily partitions on event time for lifecy
 
 ## Related Notes
 
-- [[BigQuery]]
-- [[BigQuery Partition Pruning Check]]
-- [[Partition Filter Enforcement Guardrail]]
-- [[Legacy Unpartitioned Daily Batch Table]] (deprecated predecessor)
-- [[Cloud Run Serverless Containers]]
-- [[Google Cloud Serverless Analytics Reference]]
-- [[BigQuery Governance Notes Summary]]
+- [BigQuery](../entities/BigQuery.md)
+- [BigQuery Partition Pruning Check](BigQuery%20Partition%20Pruning%20Check.md)
+- [Partition Filter Enforcement Guardrail](../patterns/Partition%20Filter%20Enforcement%20Guardrail.md)
+- [Legacy Unpartitioned Daily Batch Table](Legacy%20Unpartitioned%20Daily%20Batch%20Table.md) (deprecated predecessor)
+- [Cloud Run Serverless Containers](Cloud%20Run%20Serverless%20Containers.md)
+- [Google Cloud Serverless Analytics Reference](../synthesis/Google%20Cloud%20Serverless%20Analytics%20Reference.md)
+- [BigQuery Governance Notes Summary](../sources/BigQuery%20Governance%20Notes%20Summary.md)

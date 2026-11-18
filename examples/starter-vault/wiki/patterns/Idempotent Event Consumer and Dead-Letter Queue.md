@@ -35,15 +35,15 @@ sources:
 generated:
   by: "knowledge-compiler/1.2.0"
   at: "2026-11-18T00:00:00Z"
-extends:
-  - "[[Event-Driven PubSub Pipelines]]"
-complements:
-  - "[[Revision Traffic Splitting and Canary Rollback]]"
+x-kc-extends:
+  - "/wiki/concepts/Event-Driven PubSub Pipelines.md"
+x-kc-complements:
+  - "/wiki/patterns/Revision Traffic Splitting and Canary Rollback.md"
 ---
 
 # Idempotent Event Consumer and Dead-Letter Queue
 
-An **idempotent consumer** records a deduplication key together with the effect of a message, so a redelivered message changes nothing. A **dead-letter topic** takes messages that keep failing out of the main subscription, so one bad payload cannot stall the backlog. Together they make at-least-once delivery from [[Cloud PubSub|Pub/Sub]] safe to land in [[Cloud SQL for PostgreSQL]] or [[BigQuery]].
+An **idempotent consumer** records a deduplication key together with the effect of a message, so a redelivered message changes nothing. A **dead-letter topic** takes messages that keep failing out of the main subscription, so one bad payload cannot stall the backlog. Together they make at-least-once delivery from [Pub/Sub](../entities/Cloud%20PubSub.md) safe to land in [Cloud SQL for PostgreSQL](../entities/Cloud%20SQL%20for%20PostgreSQL.md) or [BigQuery](../entities/BigQuery.md).
 
 ## Problem
 
@@ -76,14 +76,14 @@ Three rules hold the pattern together:
 
 | Sink | Deduplication mechanism | Remaining gap |
 | :--- | :--- | :--- |
-| [[Cloud SQL for PostgreSQL]], effect and key in one database | A unique constraint on `event_id`, written in the same transaction as the business change with `INSERT ... ON CONFLICT DO NOTHING` | None. The transaction commits both or neither. |
-| [[BigQuery]] append guarded by a [[Cloud SQL for PostgreSQL|Cloud SQL]] ledger | Look up `event_id` in the ledger, append the row, insert the key, then acknowledge | A crash between the append and the insert can leave a duplicate row, which readers remove by `event_id`. |
-| [[BigQuery]] through a committed Storage Write API stream | Row offsets give exactly-once appends within the stream. The default stream is at-least-once.[^bq-storage-write-api] | A replay through a different stream is not detected, so `event_id` stays in the table. |
-| [[BigQuery]] through a BigQuery subscription | Pub/Sub writes rows without consumer code and without exactly-once delivery, so readers deduplicate on `event_id`.[^pubsub-exactly-once] | A row that cannot be written is negatively acknowledged and can be forwarded to a dead-letter topic with an error attribute.[^pubsub-bigquery-subscriptions] |
+| [Cloud SQL for PostgreSQL](../entities/Cloud%20SQL%20for%20PostgreSQL.md), effect and key in one database | A unique constraint on `event_id`, written in the same transaction as the business change with `INSERT ... ON CONFLICT DO NOTHING` | None. The transaction commits both or neither. |
+| [BigQuery](../entities/BigQuery.md) append guarded by a [Cloud SQL](../entities/Cloud%20SQL%20for%20PostgreSQL.md) ledger | Look up `event_id` in the ledger, append the row, insert the key, then acknowledge | A crash between the append and the insert can leave a duplicate row, which readers remove by `event_id`. |
+| [BigQuery](../entities/BigQuery.md) through a committed Storage Write API stream | Row offsets give exactly-once appends within the stream. The default stream is at-least-once.[^bq-storage-write-api] | A replay through a different stream is not detected, so `event_id` stays in the table. |
+| [BigQuery](../entities/BigQuery.md) through a BigQuery subscription | Pub/Sub writes rows without consumer code and without exactly-once delivery, so readers deduplicate on `event_id`.[^pubsub-exactly-once] | A row that cannot be written is negatively acknowledged and can be forwarded to a dead-letter topic with an error attribute.[^pubsub-bigquery-subscriptions] |
 
-The second row is the loader design in [[Event Analytics Design Brief Summary]]: a `processed_events` ledger with a primary key on `event_id`, and a deduplicating view for readers that need exact counts.
+The second row is the loader design in [Event Analytics Design Brief Summary](../sources/Event%20Analytics%20Design%20Brief%20Summary.md): a `processed_events` ledger with a primary key on `event_id`, and a deduplicating view for readers that need exact counts.
 
-When the effect and the key live in the same [[Cloud SQL for PostgreSQL]] database, one transaction covers both:
+When the effect and the key live in the same [Cloud SQL for PostgreSQL](../entities/Cloud%20SQL%20for%20PostgreSQL.md) database, one transaction covers both:
 
 ```sql
 BEGIN;
@@ -100,7 +100,7 @@ WHERE tenant_id = :tenant_id;
 COMMIT;
 ```
 
-Read-time deduplication in [[BigQuery]] keeps one row per key. The partition filter comes before the window function, so the query still satisfies [[Partition Filter Enforcement Guardrail]]:
+Read-time deduplication in [BigQuery](../entities/BigQuery.md) keeps one row per key. The partition filter comes before the window function, so the query still satisfies [Partition Filter Enforcement Guardrail](Partition%20Filter%20Enforcement%20Guardrail.md):
 
 ```sql
 SELECT *
@@ -137,19 +137,19 @@ gcloud pubsub subscriptions create loader-push \
 - **Backlog age**: Alert on `subscription/oldest_unacked_message_age_by_region` to catch a consumer that is falling behind.[^pubsub-monitoring]
 - **Dead-letter volume**: Alert when `subscription/dead_letter_message_count` rises above zero.[^pubsub-monitoring]
 - **Duplicates absorbed**: Count skipped effects in the consumer. A sudden rise usually means the acknowledgment deadline is shorter than the processing time.
-- **Trace continuity**: Carry trace context in message attributes so a dead-lettered message can be tied back to the request that produced it, as described in [[OpenTelemetry Trace Propagation Across Services]].
+- **Trace continuity**: Carry trace context in message attributes so a dead-lettered message can be tied back to the request that produced it, as described in [OpenTelemetry Trace Propagation Across Services](OpenTelemetry%20Trace%20Propagation%20Across%20Services.md).
 
 ## Trade-offs
 
 - **Key storage grows**: Prune ledger rows once they are older than the longest window in which a message could still be redelivered or replayed.
 - **Ordering multiplies duplicates**: On a subscription with ordering keys, redelivering one message also redelivers every later message for that key, even acknowledged ones.[^pubsub-ordering] An ordered consumer needs the key check more, not less.
 - **External side effects are not covered**: An email or a call to another API is outside the stored effect. Pass `event_id` to the downstream service as its idempotency token.
-- **A ledger adds a dependency**: Every delivery now needs the database. Cap consumer instances and pool connections so a burst of deliveries does not exhaust [[Cloud SQL for PostgreSQL]].
+- **A ledger adds a dependency**: Every delivery now needs the database. Cap consumer instances and pool connections so a burst of deliveries does not exhaust [Cloud SQL for PostgreSQL](../entities/Cloud%20SQL%20for%20PostgreSQL.md).
 
 ## Related Notes
 
-- [[Event-Driven PubSub Pipelines]] describes the delivery modes this pattern builds on.
-- [[Event Analytics Design Brief Summary]] is the source of the loader, ledger, and dead-letter settings used as examples here.
-- [[Revision Traffic Splitting and Canary Rollback]] relies on idempotent handlers so work retried during a rollback is safe.
-- [[Production Readiness and Observability Checklist]] turns this pattern into a launch gate.
-- [[Google Cloud Serverless Analytics Reference]] shows where the consumer sits in the end-to-end flow.
+- [Event-Driven PubSub Pipelines](../concepts/Event-Driven%20PubSub%20Pipelines.md) describes the delivery modes this pattern builds on.
+- [Event Analytics Design Brief Summary](../sources/Event%20Analytics%20Design%20Brief%20Summary.md) is the source of the loader, ledger, and dead-letter settings used as examples here.
+- [Revision Traffic Splitting and Canary Rollback](Revision%20Traffic%20Splitting%20and%20Canary%20Rollback.md) relies on idempotent handlers so work retried during a rollback is safe.
+- [Production Readiness and Observability Checklist](../synthesis/Production%20Readiness%20and%20Observability%20Checklist.md) turns this pattern into a launch gate.
+- [Google Cloud Serverless Analytics Reference](../synthesis/Google%20Cloud%20Serverless%20Analytics%20Reference.md) shows where the consumer sits in the end-to-end flow.

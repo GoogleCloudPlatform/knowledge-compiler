@@ -80,6 +80,7 @@ _WIKILINK_ALIASED_RE = re.compile(
     r"\[\[([^\[\]|\n]{1,512})\\?\|([^\[\]\n]{1,512})\]\]"
 )
 _WIKILINK_PLAIN_RE = re.compile(r"\[\[([^\[\]\n]{1,512})\]\]")
+_MD_LINK_LABEL_RE = re.compile(r"(?<!!)\[([^\[\]\n]{1,512})\]\([^()\n]{1,512}\)")
 _BLOCKQUOTE_LINE_RE = re.compile(r"(?m)^[ \t]*>+[ \t]*")
 _MD_SYNTAX_CHARS_RE = re.compile(r"[*_`|#~]+")
 _WHITESPACE_RUN_RE = re.compile(r"\s+")
@@ -455,6 +456,7 @@ def _build_plain_excerpt(text: str, max_chars: int = 240) -> str:
     sample = sample[:4096]
     unwrapped = _WIKILINK_ALIASED_RE.sub(r"\2", sample)
     unwrapped = _WIKILINK_PLAIN_RE.sub(r"\1", unwrapped)
+    unwrapped = _MD_LINK_LABEL_RE.sub(r"\1", unwrapped)
     unwrapped = _BLOCKQUOTE_LINE_RE.sub(" ", unwrapped)
     cleaned = _MD_SYNTAX_CHARS_RE.sub(" ", unwrapped)
     collapsed = _WHITESPACE_RUN_RE.sub(" ", cleaned).strip()

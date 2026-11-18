@@ -20,6 +20,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sys
 import tempfile
@@ -32,6 +33,7 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 import init_vault  # noqa: E402
+import okf  # noqa: E402
 import vault_lint  # noqa: E402
 
 
@@ -817,6 +819,8 @@ class TestVaultLintV1Conformance(unittest.TestCase):
         rep = json.loads(out)
         self.assertTrue(rep["is_healthy"])
         self.assertTrue(rep["strict_passed"])
+        self.assertEqual(rep["bundle_root"], ".")
+        self.assertEqual(rep["concepts_dir"], "wiki")
         self.assertEqual(rep["bundle_okf_version"], "0.3")
         self.assertEqual(rep["total_wiki_notes"], 21)
         self.assertEqual(rep["broken_links"], [])
@@ -824,6 +828,47 @@ class TestVaultLintV1Conformance(unittest.TestCase):
         self.assertEqual(rep["missing_from_index"], [])
         self.assertEqual(rep["conformance_errors"], [])
         self.assertGreaterEqual(rep["trust_tier_counts"]["machine-confirmed"], 1)
+
+        # Verify OKF v0.3 §8 frontmatter-free subdirectory index.md files exist
+        for sub_idx in (
+            starter / "wiki" / "index.md",
+            starter / "wiki" / "concepts" / "index.md",
+            starter / "wiki" / "entities" / "index.md",
+            starter / "wiki" / "patterns" / "index.md",
+            starter / "wiki" / "sources" / "index.md",
+            starter / "wiki" / "synthesis" / "index.md",
+        ):
+            self.assertTrue(sub_idx.is_file(), f"Missing OKF v0.3 subdirectory index: {sub_idx}")
+            self.assertFalse(
+                sub_idx.read_text(encoding="utf-8").startswith("---"),
+                f"Subdirectory index {sub_idx} must not have YAML frontmatter (OKF v0.3 §8)",
+            )
+
+        # Verify starter vault uses portable standard Markdown links (0 prose wikilinks)
+        # and x-kc-* namespaced epistemic frontmatter keys (0 bare epistemic keys)
+        md_link_re = re.compile(r"(?<!!)\[[^\]]*\]\(\s*<?([^)\s>]+)>?(?:\s+\"[^\"]*\")?\s*\)")
+        md_link_count = 0
+        for md_file in sorted(starter.rglob("*.md")):
+            txt = md_file.read_text(encoding="utf-8")
+            doc = okf.parse_okf_document(txt, strict=False)
+            fm = doc.get("frontmatter") or {}
+            if isinstance(fm, dict):
+                for bare_k in vault_lint.EPISTEMIC_EDGE_CANONICAL_TYPES:
+                    self.assertNotIn(
+                        bare_k,
+                        {str(k).lower() for k in fm},
+                        msg=f"Starter vault note {md_file} still has bare epistemic key {bare_k!r}",
+                    )
+            body_no_code = re.sub(r"```[\s\S]*?```|`[^`\n]+`", "", doc["body"])
+            self.assertEqual(
+                re.findall(r"\[\[[^\]]+\]\]", body_no_code),
+                [],
+                msg=f"Starter vault note {md_file} still has prose [[wikilinks]]",
+            )
+            for href in md_link_re.findall(body_no_code):
+                if href.split("#", 1)[0].lower().endswith(".md"):
+                    md_link_count += 1
+        self.assertGreaterEqual(md_link_count, 400)
 
         for query_text in (
             "BigQuery partition pruning",
@@ -862,6 +907,112 @@ class TestVaultLintV1Conformance(unittest.TestCase):
                 1,
                 msg=f"Expected >= 1 edge of type {edge_type!r}, got {edge_counts}",
             )
+
+    def test_okf_v03_portable_links_x_kc_and_broken_md_links(self) -> None:
+        """Verify --portable-links conversion, x-kc-* migration, sub-index creation, and broken .md link detection."""
+        vault = self.tmp_dir / "portable_interop_vault"
+        (vault / "wiki" / "concepts").mkdir(parents=True)
+        (vault / "wiki" / "entities").mkdir(parents=True)
+        (vault / "raw").mkdir(parents=True)
+
+        (vault / "index.md").write_text(
+            '---\nokf_version: "0.3"\ntitle: "Interop Vault"\ndescription: "Test vault."\n---\n\n'
+            "# Index\n\n"
+            "- [[Alpha Concept]]\n"
+            "- [[Beta Service]]\n",
+            encoding="utf-8",
+        )
+        (vault / "purpose.md").write_text(
+            "---\ntitle: Purpose\ntype: meta\nstatus: stable\n---\n\n"
+            "# Purpose\n\nSee [[index|Master Index]] and [[Alpha Concept]].\n",
+            encoding="utf-8",
+        )
+        (vault / "log.md").write_text("# Audit Log\n\n## 2026-11-18\n\n- **init** | Created.\n", encoding="utf-8")
+        (vault / "raw" / "source.md").write_text(
+            "# Raw Source\n\nPreserve [[Alpha Concept]] and [External Relative](missing_in_raw.md).\n",
+            encoding="utf-8",
+        )
+        (vault / "wiki" / "entities" / "Beta Service.md").write_text(
+            "---\ntitle: Beta Service\ntype: entity\nstatus: stable\n"
+            "sources:\n  - id: s1\n    resource: /raw/source.md\n---\n\n"
+            "# Beta Service\n\nUsed by [[Alpha Concept]].\n",
+            encoding="utf-8",
+        )
+        (vault / "wiki" / "concepts" / "Alpha Concept.md").write_text(
+            "---\ntitle: Alpha Concept\ntype: concept\nstatus: stable\n"
+            "sources:\n  - id: s1\n    resource: /raw/source.md\n"
+            'corroborates:\n  - "[[Beta Service]]"\n'
+            "---\n\n"
+            "# Alpha Concept\n\n"
+            "Depends on [[Beta Service|Beta]], keeps `[[Inline Code]]` literal, "
+            "and ignores fenced code:\n\n"
+            "```markdown\n[[Fenced Link]]\n```\n",
+            encoding="utf-8",
+        )
+
+        # 1. Migrate to OKF v0.3 + portable relative Markdown links in one command
+        code, out, err = self._run_cli(
+            [str(vault), "--fix", "--migrate-v03", "--portable-links", "--strict", "--json"]
+        )
+        self.assertEqual(code, 0, msg=f"Migration failed:\n{out}\n{err}")
+        rep = json.loads(out)
+        self.assertEqual(rep["bundle_root"], ".")
+        self.assertEqual(rep["concepts_dir"], "wiki")
+        self.assertEqual(rep["broken_links"], [])
+        self.assertEqual(rep["epistemic_edge_counts"]["CORROBORATES"], 1)
+        self.assertIn("wiki/concepts/Alpha Concept.md", rep["portable_links_files"])
+
+        # Verify frontmatter x-kc-corroborates path, relative Markdown body links, code preservation, and raw immutability
+        alpha_txt = (vault / "wiki" / "concepts" / "Alpha Concept.md").read_text(encoding="utf-8")
+        self.assertIn("x-kc-corroborates:", alpha_txt)
+        self.assertNotIn("\ncorroborates:", alpha_txt)
+        self.assertIn('"/wiki/entities/Beta Service.md"', alpha_txt)
+        self.assertIn("[Beta](../entities/Beta%20Service.md)", alpha_txt)
+        self.assertIn("`[[Inline Code]]`", alpha_txt)
+        self.assertIn("[[Fenced Link]]", alpha_txt)
+
+        # Verify [[index|Master Index]] resolved to root index.md (not wiki/index.md!)
+        purpose_txt = (vault / "purpose.md").read_text(encoding="utf-8")
+        self.assertIn("[Master Index](index.md)", purpose_txt)
+        self.assertIn("[Alpha Concept](wiki/concepts/Alpha%20Concept.md)", purpose_txt)
+
+        # Verify raw/ stayed byte-for-byte untouched
+        raw_txt = (vault / "raw" / "source.md").read_text(encoding="utf-8")
+        self.assertIn("Preserve [[Alpha Concept]]", raw_txt)
+
+        # Verify frontmatter-free sub-indexes were generated
+        for sub_idx in (
+            vault / "wiki" / "index.md",
+            vault / "wiki" / "concepts" / "index.md",
+            vault / "wiki" / "entities" / "index.md",
+        ):
+            self.assertTrue(sub_idx.is_file())
+            self.assertFalse(sub_idx.read_text(encoding="utf-8").startswith("---"))
+
+        # 2. Second run is 100% idempotent
+        code2, out2, _ = self._run_cli(
+            [str(vault), "--fix", "--migrate-v03", "--portable-links", "--strict", "--json"]
+        )
+        rep2 = json.loads(out2)
+        self.assertEqual(code2, 0)
+        self.assertEqual(rep2["migrated_v03_files"], [])
+        self.assertEqual(rep2["portable_links_files"], [])
+        self.assertEqual(rep2["fixed_files"], [])
+
+        # 3. Verify broken relative .md Markdown links in living wiki notes are flagged (while external URLs pass)
+        (vault / "wiki" / "concepts" / "Alpha Concept.md").write_text(
+            alpha_txt
+            + "\nBroken link [Ghost](../entities/Does%20Not%20Exist.md) and [External](https://example.com/doc.md).\n",
+            encoding="utf-8",
+        )
+        code3, out3, _ = self._run_cli([str(vault), "--json"])
+        rep3 = json.loads(out3)
+        self.assertEqual(code3, 1)
+        self.assertFalse(rep3["is_healthy"])
+        self.assertEqual(
+            rep3["broken_links"],
+            [{"source": "wiki/concepts/Alpha Concept.md", "target": "../entities/Does Not Exist.md"}],
+        )
 
 
 if __name__ == "__main__":

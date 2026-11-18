@@ -18,14 +18,14 @@ This Layer 0 anchor defines the scope and organizing questions for the **Google 
 
 ## Scope and Organizing Questions
 
-The vault compiles two immutable `raw/` briefs ([[raw/event-analytics-design-brief|Event Analytics Platform Design Brief]] and [[raw/bigquery-governance-notes|BigQuery Governance Notes]]) into a 21-note `wiki/` knowledge graph designed to answer three architectural questions:
+The vault compiles two immutable `raw/` briefs ([Event Analytics Platform Design Brief](raw/event-analytics-design-brief.md) and [BigQuery Governance Notes](raw/bigquery-governance-notes.md)) into a 21-note `wiki/` knowledge graph designed to answer three architectural questions:
 
-1. **How do serverless ingestion, asynchronous delivery, stateful processing, and analytical storage compose cleanly?** Synthesized in [[Google Cloud Serverless Analytics Reference]].
-2. **When should a containerized service run on Cloud Run versus GKE Autopilot?** Synthesized in [[Cloud Run vs GKE Autopilot Decision Matrix]].
-3. **Which identity, observability, rollout, idempotency, and scan controls gate production launch?** Synthesized in [[Production Readiness and Observability Checklist]].
+1. **How do serverless ingestion, asynchronous delivery, stateful processing, and analytical storage compose cleanly?** Synthesized in [Google Cloud Serverless Analytics Reference](wiki/synthesis/Google%20Cloud%20Serverless%20Analytics%20Reference.md).
+2. **When should a containerized service run on Cloud Run versus GKE Autopilot?** Synthesized in [Cloud Run vs GKE Autopilot Decision Matrix](wiki/synthesis/Cloud%20Run%20vs%20GKE%20Autopilot%20Decision%20Matrix.md).
+3. **Which identity, observability, rollout, idempotency, and scan controls gate production launch?** Synthesized in [Production Readiness and Observability Checklist](wiki/synthesis/Production%20Readiness%20and%20Observability%20Checklist.md).
 
 ## Layer Structure
 
-- **Layer 0 (Anchors)**: [[index|Master Index]], `purpose.md`, and [[log|Audit Log]] (`log.md` maintains reverse-chronological `## YYYY-MM-DD` entries with zero frontmatter per OKF v0.3 Section 9).
+- **Layer 0 (Anchors)**: [Master Index](index.md), `purpose.md`, and [Audit Log](log.md) (`log.md` maintains reverse-chronological `## YYYY-MM-DD` entries with zero frontmatter per OKF v0.3 Section 9).
 - **Layer 1 (`raw/`)**: Immutable source briefs preserved verbatim as the factual baseline.
-- **Layer 2 (`wiki/`)**: Compiled `sources/` (2), `entities/` (5), `concepts/` (7, covering `Attested Computation` and `status: deprecated` + `superseded_by`), `patterns/` (4), and `synthesis/` (3), connected via 5-way typed epistemic edges (`CORROBORATES`, `COMPLEMENTS`, `EXTENDS`, `CONTRADICTS`, `SUPERSEDES`) and standard `[[wikilinks]]`.
+- **Layer 2 (`wiki/`)**: Compiled `sources/` (2), `entities/` (5), `concepts/` (7, covering `Attested Computation` and `status: deprecated` + `superseded_by`), `patterns/` (4), and `synthesis/` (3), connected via OKF v0.3 standard relative Markdown links and namespaced `x-kc-*` 5-way typed epistemic edges (`x-kc-corroborates`, `x-kc-complements`, `x-kc-extends`, `x-kc-contradicts`, `x-kc-supersedes`).

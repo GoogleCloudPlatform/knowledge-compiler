@@ -231,7 +231,7 @@ class TestOssCrossCompliance(unittest.TestCase):
             import build_oss_release
 
             readme_3p = build_oss_release._render_3p_readme(
-                "knowledge-compiler", "Knowledge Compiler", "1.2.0"
+                "knowledge-compiler", "Knowledge Compiler", "1.3.0"
             )
             self.assertIn("This is not an officially supported Google product", readme_3p)
             contrib_3p = build_oss_release._render_3p_contributing(

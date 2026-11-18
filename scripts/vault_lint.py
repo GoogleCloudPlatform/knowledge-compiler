@@ -14,10 +14,11 @@
 # limitations under the License.
 """
 OKF v0.3 Knowledge Compiler Vault Linter & Conformance Auditor (with v0.2 compatibility).
-Validates OKF v0.3 bundle conformance inside `wiki/`, wikilink integrity,
-table formatting invariants, orphan notes, ranked `wanted_pages`, trust-tier
-breakdown (`verified[].at >= generated.at`), freshness (`stale_after`),
-`superseded_by` lifecycle edges, and Workspace Profile root files.
+Validates OKF v0.3 bundle conformance (root `.`, compiled concepts in `wiki/`),
+relative Markdown link and `[[wikilink]]` integrity, table formatting invariants,
+orphan notes, ranked `wanted_pages`, trust-tier breakdown (`verified[].at >= generated.at`),
+freshness (`stale_after`), `superseded_by` lifecycle edges, `x-kc-*` epistemic
+extension keys, and Workspace Profile root files.
 """
 from __future__ import annotations
 
@@ -29,12 +30,14 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import posixpath
 import re
 import stat
 import sys
 import tempfile
 from typing import Any
 import urllib.error
+import urllib.parse
 import urllib.request
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -71,20 +74,50 @@ _PROTECTED_LINT_FIX_FILENAMES = frozenset(
 _PROTECTED_LINT_FIX_DIRS = frozenset(
     {"skills", "rules", ".agents", ".gemini", "raw", "archive"}
 )
-EPISTEMIC_EDGE_KEYS = (
+_PORTABLE_LINK_PROTECTED_FILENAMES = frozenset(
+    {
+        "gemini.md",
+        "agents.md",
+        "claude.md",
+        "skill.md",
+        "hooks.json",
+        "plugin.json",
+        "log.md",
+    }
+)
+EPISTEMIC_EDGE_CANONICAL_TYPES = (
     "corroborates",
     "complements",
     "extends",
     "contradicts",
     "supersedes",
 )
+EPISTEMIC_EDGE_X_PREFIX = "x-kc-"
+EPISTEMIC_EDGE_X_KEYS = tuple(
+    f"{EPISTEMIC_EDGE_X_PREFIX}{k}" for k in EPISTEMIC_EDGE_CANONICAL_TYPES
+)
+EPISTEMIC_EDGE_KEYS = EPISTEMIC_EDGE_X_KEYS + EPISTEMIC_EDGE_CANONICAL_TYPES
+
+
+def _epistemic_edge_type_for_key(key: str) -> str | None:
+    """Map an `x-kc-<rel>` or legacy `<rel>` frontmatter key to canonical uppercase edge type."""
+    low = str(key).strip().lower()
+    if low.startswith(EPISTEMIC_EDGE_X_PREFIX):
+        low = low[len(EPISTEMIC_EDGE_X_PREFIX) :]
+    if low in EPISTEMIC_EDGE_CANONICAL_TYPES:
+        return low.upper()
+    return None
+
 
 _HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}(?:[ \t]|$)")
 _BQ_PREFIX_RE = re.compile(r"^((?:[ \t]*>[ \t]?)*)([\s\S]*)$")
 _LIST_MARKER_RE = re.compile(r"^([ \t]*(?:[-*+]|\d+[.)])[ \t]+(?:\[[ xX]\][ \t]+)?)")
 _OPEN_FENCE_LINE_RE = re.compile(r"^([ \t]*)(`{3,}|~{3,})([^\r\n]*)$")
 _WIKILINK_RE = re.compile(r"\[\[([^\]\n]+)\]\]")
-_MD_LINK_RE = re.compile(r"(?<!!)\[[^\]\n]+\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
+_PORTABLE_WIKILINK_RE = re.compile(r"(?<!!)\[\[([^\]\n]+)\]\]")
+_MD_LINK_RE = re.compile(
+    r"(?<!!)\[[^\]\n]+\]\(\s*<?([^)\s>]+)>?(?:\s+\"[^\"]*\")?\s*\)"
+)
 _TABLE_ESCAPED_PIPE_RE = re.compile(r"\[\[([^\]\n]+?\\\|[^\]\n]+)\]\]")
 _FOOTNOTE_DEF_RE = re.compile(r"(?m)^[ \t]*\[\^([^\]\s]+)\]:")
 _FOOTNOTE_REF_RE = re.compile(r"\[\^([^\]\s]+)\](?!:)")
@@ -117,7 +150,7 @@ def check_upstream_okf_version(timeout: float = 5.0) -> dict[str, Any]:
     }
 
     headers = {
-        "User-Agent": "knowledge-compiler-okf-checker/1.2.0",
+        "User-Agent": "knowledge-compiler-okf-checker/1.3.0",
         "Accept": "application/vnd.github.v3+json",
     }
 
@@ -790,27 +823,56 @@ def approve_human_note(
 
 
 def _extract_epistemic_wikilinks(fm: dict[str, Any]) -> list[str]:
-    """Extract `[[wikilink]]` targets from frontmatter epistemic edge keys and OKF v0.3 `superseded_by`."""
+    """Extract targets from frontmatter `x-kc-*` / legacy epistemic keys and OKF v0.3 `superseded_by`."""
     targets: list[str] = []
+    fm_lower = {str(k).lower(): v for k, v in fm.items()} if isinstance(fm, dict) else {}
     for ep_k in EPISTEMIC_EDGE_KEYS:
-        val = fm.get(ep_k)
+        val = fm_lower.get(ep_k)
         items = val if isinstance(val, list) else ([val] if isinstance(val, str) else [])
         for item in items:
             if not isinstance(item, str):
                 continue
-            for m in _WIKILINK_RE.finditer(item):
-                raw_link = m.group(1).strip()
-                tgt = re.split(r"\\?\|", raw_link)[0].strip()
-                if tgt and not tgt.startswith("#"):
-                    tgt = tgt.split("#", 1)[0].strip()
-                    if tgt:
-                        targets.append(tgt)
-    sup_by = fm.get("superseded_by")
+            raw_str = item.strip()
+            if not raw_str:
+                continue
+            wl_matches = list(_WIKILINK_RE.finditer(raw_str))
+            if wl_matches:
+                for m in wl_matches:
+                    raw_link = m.group(1).strip()
+                    tgt = re.split(r"\\?\|", raw_link)[0].strip()
+                    if tgt and not tgt.startswith("#"):
+                        tgt = tgt.split("#", 1)[0].strip()
+                        if tgt:
+                            targets.append(tgt)
+                continue
+            md_matches = list(_MD_LINK_RE.finditer(raw_str))
+            if md_matches:
+                for m in md_matches:
+                    href = m.group(1).strip()
+                    if not href or href.startswith(("#", "//")) or _URI_SCHEME_RE.match(href):
+                        continue
+                    clean_href = (
+                        urllib.parse.unquote(href.split("#", 1)[0].split("?", 1)[0])
+                        .strip()
+                        .lstrip("/")
+                    )
+                    if clean_href:
+                        targets.append(clean_href)
+                continue
+            if not raw_str.startswith(("#", "//")) and not _URI_SCHEME_RE.match(raw_str):
+                clean_item = (
+                    urllib.parse.unquote(raw_str.split("#", 1)[0].split("?", 1)[0])
+                    .strip()
+                    .lstrip("/")
+                )
+                if clean_item:
+                    targets.append(clean_item)
+    sup_by = fm_lower.get("superseded_by")
     if isinstance(sup_by, str) and sup_by.strip():
         clean_sup = re.sub(r"^\[\[|\]\]$", "", sup_by.strip())
-        clean_sup = re.split(r"\\?\|", clean_sup)[0].split("#", 1)[0].strip()
-        if clean_sup and not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", clean_sup):
-            clean_sup = clean_sup.lstrip("/")
+        clean_sup = re.split(r"\\?\|", clean_sup)[0].split("#", 1)[0].split("?", 1)[0].strip()
+        if clean_sup and not _URI_SCHEME_RE.match(clean_sup) and not clean_sup.startswith("//"):
+            clean_sup = urllib.parse.unquote(clean_sup).lstrip("/")
             if clean_sup:
                 targets.append(clean_sup)
     return targets
@@ -1948,16 +2010,416 @@ def _migrate_log_content_to_v03(content: str) -> tuple[str, bool]:
     return (new_text, new_text != content)
 
 
-def migrate_vault_to_v03(vault_root: Path) -> dict[str, Any]:
+def _rename_top_level_yaml_key(yaml_text: str, old_key: str, new_key: str, nl: str) -> str:
+    """Rename a top-level YAML key `old_key:` to `new_key:` while preserving its value block."""
+    pattern = re.compile(rf"^{re.escape(old_key)}:(.*)$")
+    lines = yaml_text.splitlines()
+    changed = False
+    out_lines: list[str] = []
+    for line in lines:
+        if not line.startswith((" ", "\t")):
+            m = pattern.match(line)
+            if m:
+                out_lines.append(f"{new_key}:{m.group(1)}")
+                changed = True
+                continue
+        out_lines.append(line)
+    return nl.join(out_lines) if changed else yaml_text
+
+
+def _encode_md_link_path(rel_posix_path: str) -> str:
+    """Percent-encode a POSIX relative path for portable OKF v0.3 / CommonMark links."""
+    return urllib.parse.quote(rel_posix_path.replace("\\", "/"), safe="/-._~")
+
+
+def _is_protected_from_portable_links(rel_path: str) -> bool:
+    """Return True if `rel_path` must not be modified by `--portable-links` conversion."""
+    rel_norm = rel_path.replace("\\", "/").strip("/")
+    parts = [p.lower() for p in Path(rel_norm).parts]
+    if not parts:
+        return True
+    if parts[-1] in _PORTABLE_LINK_PROTECTED_FILENAMES:
+        return True
+    if any(p in _PROTECTED_LINT_FIX_DIRS or p.startswith(".") for p in parts[:-1]):
+        return True
+    return False
+
+
+_SUBDIR_TITLES: dict[str, str] = {
+    "sources": "Source Summaries",
+    "entities": "Entities",
+    "concepts": "Core Concepts",
+    "patterns": "Architectural Patterns",
+    "synthesis": "Synthesis",
+}
+
+
+def _ensure_wiki_subindexes(vault_root: Path) -> list[str]:
+    """Ensure frontmatter-free OKF v0.3 §8 `wiki/index.md` and `wiki/<subdir>/index.md` exist.
+
+    Idempotent: creates missing subdirectory indexes only; never overwrites existing ones.
+    """
+    v_root = Path(vault_root).resolve()
+    wiki_root = v_root / "wiki"
+    if not wiki_root.is_dir() or wiki_root.is_symlink():
+        return []
+
+    created: list[str] = []
+    subdir_entries: list[tuple[str, str, int]] = []
+
+    for child in sorted(wiki_root.iterdir(), key=lambda p: p.name.lower()):
+        if not child.is_dir() or child.is_symlink():
+            continue
+        if child.name in IGNORED_DIR_NAMES or child.name.startswith("."):
+            continue
+        notes = sorted(
+            (
+                p
+                for p in child.iterdir()
+                if p.is_file()
+                and not p.is_symlink()
+                and p.name.endswith(".md")
+                and p.name.lower() not in RESERVED_BUNDLE_FILENAMES
+            ),
+            key=lambda p: p.name.lower(),
+        )
+        if not notes:
+            continue
+
+        heading = _SUBDIR_TITLES.get(
+            child.name.lower(), child.name.replace("-", " ").replace("_", " ").title()
+        )
+        subdir_entries.append((child.name, heading, len(notes)))
+        sub_index = child / "index.md"
+        if sub_index.exists() or sub_index.is_symlink():
+            continue
+
+        lines = [
+            f"# {heading}",
+            "",
+            f"OKF v0.3 subdirectory index for `wiki/{child.name}/` (see [Master Index](../../index.md) and [Wiki Index](../index.md)).",
+            "",
+        ]
+        for note_path in notes:
+            txt, ok_u8 = _read_text_preserve_eol(note_path)
+            title = note_path.stem
+            desc = ""
+            if ok_u8:
+                doc = okf.parse_okf_document(txt, strict=False)
+                fm = doc.get("frontmatter") or {}
+                if isinstance(fm, dict):
+                    raw_t = str(fm.get("title") or "").strip()
+                    if raw_t:
+                        title = raw_t
+                    desc = str(fm.get("description") or "").strip()
+            href = _encode_md_link_path(note_path.name)
+            if desc:
+                lines.append(f"- [{title}]({href}): {desc}")
+            else:
+                lines.append(f"- [{title}]({href})")
+        _atomic_write_text(sub_index, "\n".join(lines) + "\n")
+        created.append(sub_index.relative_to(v_root).as_posix())
+
+    wiki_index = wiki_root / "index.md"
+    if not wiki_index.exists() and not wiki_index.is_symlink():
+        top_notes = sorted(
+            (
+                p
+                for p in wiki_root.iterdir()
+                if p.is_file()
+                and not p.is_symlink()
+                and p.name.endswith(".md")
+                and p.name.lower() not in RESERVED_BUNDLE_FILENAMES
+            ),
+            key=lambda p: p.name.lower(),
+        )
+        lines = [
+            "# Wiki Index",
+            "",
+            "Compiled knowledge directory for this OKF v0.3 bundle (see [Master Index](../index.md)).",
+            "",
+        ]
+        if subdir_entries:
+            lines.append("## Sections")
+            lines.append("")
+            for dir_name, heading, count in subdir_entries:
+                plural = "note" if count == 1 else "notes"
+                lines.append(
+                    f"- [{heading}]({_encode_md_link_path(dir_name)}/index.md): {count} {plural} in `wiki/{dir_name}/`."
+                )
+            lines.append("")
+        if top_notes:
+            lines.append("## Ledgers & Notes")
+            lines.append("")
+            for note_path in top_notes:
+                txt, ok_u8 = _read_text_preserve_eol(note_path)
+                title = note_path.stem
+                desc = ""
+                if ok_u8:
+                    doc = okf.parse_okf_document(txt, strict=False)
+                    fm = doc.get("frontmatter") or {}
+                    if isinstance(fm, dict):
+                        raw_t = str(fm.get("title") or "").strip()
+                        if raw_t:
+                            title = raw_t
+                        desc = str(fm.get("description") or "").strip()
+                href = _encode_md_link_path(note_path.name)
+                if desc:
+                    lines.append(f"- [{title}]({href}): {desc}")
+                else:
+                    lines.append(f"- [{title}]({href})")
+            lines.append("")
+        _atomic_write_text(wiki_index, "\n".join(lines).rstrip() + "\n")
+        created.append("wiki/index.md")
+
+    return created
+
+
+def convert_wikilinks_to_markdown_links(vault_root: Path) -> dict[str, Any]:
+    """Deterministically rewrite resolved Obsidian `[[wikilinks]]` to OKF v0.3 relative Markdown links.
+
+    - Converts resolved `[[Target]]` / `[[Target|Alias]]` in masked Markdown prose (skipping code
+      fences, inline code, HTML comments, `![[embeds]]`, unresolved targets, `raw/`, `archive/`,
+      `GEMINI.md`, and `log.md`) to RFC 3986 `%20`-encoded relative Markdown links
+      `[Label](relative/path.md)`.
+    - Converts resolved `[[Target]]` values inside `x-kc-*` / legacy epistemic frontmatter lists to
+      canonical OKF v0.3 §6.2 bundle-root paths (`"/wiki/.../Target.md"`).
+    - Idempotent: returns empty `converted_files` on re-run.
+    """
+    v_root = Path(vault_root).resolve()
+    all_md_files: dict[str, dict[str, Any]] = {}
+    raw_assets: dict[str, dict[str, Any]] = {}
+
+    for root, dirs, files in os.walk(v_root, followlinks=False):
+        root_path = Path(root)
+        dirs[:] = sorted(
+            d
+            for d in dirs
+            if d not in IGNORED_DIR_NAMES and not (root_path / d).is_symlink()
+        )
+        try:
+            rel_dir = root_path.relative_to(v_root)
+        except ValueError:
+            continue
+        if any(part in IGNORED_DIR_NAMES for part in rel_dir.parts):
+            continue
+        for f in sorted(files):
+            full_path = root_path / f
+            if full_path.is_symlink():
+                continue
+            try:
+                full_path.resolve().relative_to(v_root)
+            except (OSError, ValueError):
+                continue
+            rel_path = full_path.relative_to(v_root).as_posix()
+            entry = {
+                "full_path": full_path,
+                "base_name": full_path.stem,
+                "rel_path": rel_path,
+            }
+            if f.endswith(".md"):
+                all_md_files[rel_path] = entry
+            else:
+                raw_assets[rel_path] = entry
+
+    name_to_rel: dict[str, str] = {}
+    for rel_path, data in raw_assets.items():
+        name_to_rel[data["full_path"].name.lower()] = rel_path
+        name_to_rel[data["base_name"].lower()] = rel_path
+        name_to_rel[rel_path.lower()] = rel_path
+        if rel_path.startswith("raw/"):
+            name_to_rel[rel_path[4:].lower()] = rel_path
+
+    def _set_md_alias(key: str, target_rel: str) -> None:
+        existing = name_to_rel.get(key)
+        if (
+            existing is None
+            or not existing.endswith(".md")
+            or target_rel.count("/") < existing.count("/")
+        ):
+            name_to_rel[key] = target_rel
+
+    for rel_path, data in all_md_files.items():
+        _set_md_alias(data["base_name"].lower(), rel_path)
+        name_to_rel[rel_path.lower()] = rel_path
+        _set_md_alias(rel_path[:-3].lower(), rel_path)
+        if rel_path.startswith("wiki/"):
+            _set_md_alias(rel_path[5:].lower(), rel_path)
+            _set_md_alias(rel_path[5:-3].lower(), rel_path)
+        elif rel_path.startswith("raw/"):
+            _set_md_alias(rel_path[4:].lower(), rel_path)
+            _set_md_alias(rel_path[4:-3].lower(), rel_path)
+
+    graph_lookup: dict[str, dict[str, Any]] = {}
+    for rel_path, data in all_md_files.items():
+        txt, ok_u8 = _read_text_preserve_eol(data["full_path"])
+        fm_obj: dict[str, Any] | None = None
+        if ok_u8:
+            doc = okf.parse_okf_document(txt, strict=False)
+            if doc.get("has_frontmatter") and isinstance(doc.get("frontmatter"), dict):
+                fm_obj = doc["frontmatter"]
+        graph_lookup[rel_path] = {"frontmatter": fm_obj}
+
+    converted_files: list[str] = []
+    links_converted = 0
+
+    for rel_path in sorted(all_md_files):
+        if _is_protected_from_portable_links(rel_path):
+            continue
+        fp = all_md_files[rel_path]["full_path"]
+        orig, ok_u8 = _read_text_preserve_eol(fp)
+        if not ok_u8:
+            continue
+
+        bom = "\ufeff" if orig.startswith("\ufeff") else ""
+        text = orig[len(bom) :]
+        fm_match = okf._FRONTMATTER_RE.match(text)
+
+        new_fm_prefix = ""
+        body_part = text
+        fm_changed = False
+
+        if fm_match:
+            fm_nl = fm_match.group(1)
+            yaml_text = fm_match.group(2) if fm_match.group(2) is not None else ""
+            close_nl = fm_match.group(3)
+            body_part = fm_match.group(4)
+            updated_yaml = yaml_text
+            try:
+                fm = okf.parse_frontmatter(yaml_text, strict=True)
+            except okf.OKFParseError:
+                fm = None
+
+            if isinstance(fm, dict):
+                for ep_key in list(fm.keys()):
+                    if _epistemic_edge_type_for_key(str(ep_key)) is None:
+                        continue
+                    raw_val = fm.get(ep_key)
+                    if isinstance(raw_val, list):
+                        new_items: list[str] = []
+                        list_changed = False
+                        all_str = True
+                        for item in raw_val:
+                            if not isinstance(item, str):
+                                all_str = False
+                                break
+                            s_item = item.strip()
+                            m_wl = _WIKILINK_RE.fullmatch(s_item)
+                            if m_wl:
+                                raw_inner = m_wl.group(1).strip()
+                                tgt_part = re.split(r"\\?\|", raw_inner)[0].split("#", 1)[0].strip()
+                                dst_rel = (
+                                    _resolve_target(tgt_part, name_to_rel, graph_lookup)
+                                    if tgt_part
+                                    else None
+                                )
+                                if dst_rel:
+                                    new_items.append(f"/{dst_rel}")
+                                    list_changed = True
+                                    links_converted += 1
+                                    continue
+                            new_items.append(item)
+                        if all_str and list_changed:
+                            block_lines = [f"{ep_key}:"] + [
+                                f'  - "{okf._escape_double_quoted_yaml_str(it)}"'
+                                for it in new_items
+                            ]
+                            updated_yaml = okf._replace_top_level_key_block(
+                                updated_yaml, str(ep_key), fm_nl.join(block_lines), fm_nl
+                            )
+                            fm_changed = True
+                    elif isinstance(raw_val, str):
+                        m_wl = _WIKILINK_RE.fullmatch(raw_val.strip())
+                        if m_wl:
+                            raw_inner = m_wl.group(1).strip()
+                            tgt_part = re.split(r"\\?\|", raw_inner)[0].split("#", 1)[0].strip()
+                            dst_rel = (
+                                _resolve_target(tgt_part, name_to_rel, graph_lookup)
+                                if tgt_part
+                                else None
+                            )
+                            if dst_rel:
+                                replacement_scalar = (
+                                    f'{ep_key}: "{okf._escape_double_quoted_yaml_str(f"/{dst_rel}")}"'
+                                )
+                                updated_yaml = okf._replace_top_level_key_block(
+                                    updated_yaml, str(ep_key), replacement_scalar, fm_nl
+                                )
+                                fm_changed = True
+                                links_converted += 1
+
+            new_fm_prefix = f"---{fm_nl}{updated_yaml}{fm_nl}---{close_nl}"
+
+        masked_body, restore_body, _unclosed = _mask_markdown_code(body_part)
+        src_dir = posixpath.dirname(rel_path) or "."
+        body_links_changed = 0
+
+        def _replace_wl(m: re.Match[str]) -> str:
+            nonlocal body_links_changed
+            raw_inner = m.group(1).strip()
+            parts = re.split(r"\\?\|", raw_inner, maxsplit=1)
+            raw_target = parts[0].strip()
+            explicit_alias = parts[1].strip() if len(parts) > 1 else ""
+            if not raw_target or raw_target.startswith("#"):
+                return m.group(0)
+            frag = ""
+            target_no_frag = raw_target
+            if "#" in raw_target:
+                target_no_frag, frag = raw_target.split("#", 1)
+                target_no_frag = target_no_frag.strip()
+                frag = frag.strip()
+            if not target_no_frag:
+                return m.group(0)
+            dst_rel = _resolve_target(target_no_frag, name_to_rel, graph_lookup)
+            if not dst_rel:
+                return m.group(0)
+
+            rel_href = posixpath.relpath(dst_rel, src_dir)
+            encoded_href = _encode_md_link_path(rel_href)
+            if frag:
+                encoded_href = f"{encoded_href}#{urllib.parse.quote(frag, safe='-._~')}"
+
+            if explicit_alias:
+                label = explicit_alias
+            else:
+                label = target_no_frag.split("/")[-1].removesuffix(".md").strip()
+                if not label:
+                    label = Path(dst_rel).stem
+            safe_label = label.replace("]", r"\]")
+            body_links_changed += 1
+            return f"[{safe_label}]({encoded_href})"
+
+        converted_masked = _PORTABLE_WIKILINK_RE.sub(_replace_wl, masked_body)
+        if body_links_changed > 0 or fm_changed:
+            new_body = restore_body(converted_masked) if body_links_changed > 0 else body_part
+            new_content = bom + new_fm_prefix + new_body
+            if new_content != orig:
+                _atomic_write_text(fp, new_content)
+                converted_files.append(rel_path)
+                links_converted += body_links_changed
+
+    return {
+        "converted_files": converted_files,
+        "links_converted": links_converted,
+    }
+
+
+def migrate_vault_to_v03(vault_root: Path, portable_links: bool = False) -> dict[str, Any]:
     """Deterministically upgrade a vault to OKF v0.3 conformance (idempotent).
 
-    Performs three safe, deterministic upgrades:
+    Performs five safe, deterministic upgrades:
       1. Adds `okf_version: "0.3"` (plus `title` / `description` if missing) to root `index.md`.
       2. Strips YAML frontmatter from `log.md` (and any sub-`index.md`) and normalizes
          `log.md` date headings to newest-first `## YYYY-MM-DD` (OKF v0.3 §8.2, §9).
       3. Prefixes bare v0.2 bundle-root path fields (`sources[].resource`, `superseded_by`,
          `resource`, `computation`, `executor.resource`, `attester.resource`) inside `wiki/`
-         with `/` when the target resolves from the vault root (OKF v0.3 §6.2).
+         with `/` when the target resolves from the vault root (OKF v0.3 §6.2), and namespaces
+         bare epistemic frontmatter keys (`corroborates`, `complements`, `extends`,
+         `contradicts`, `supersedes`) under `x-kc-*` (OKF v0.3 §4.1).
+      4. Ensures frontmatter-free subdirectory `wiki/index.md` and `wiki/<subdir>/index.md`
+         files exist for progressive disclosure (OKF v0.3 §8).
+      5. When `portable_links=True`, rewrites resolved `[[wikilinks]]` to RFC 3986 `%20`-encoded
+         relative Markdown links (`[Label](relative/path.md)`) and `x-kc-*` bundle-root paths.
     """
     v_root = Path(vault_root).resolve()
     migrated_files: list[str] = []
@@ -2126,13 +2588,41 @@ def migrate_vault_to_v03(vault_root: Path) -> dict[str, Any]:
                                 updated_yaml, map_key, block, fm_nl
                             )
 
+                # OKF v0.3 §4.1: namespace bare epistemic keys under `x-kc-*`
+                fm_keys_lower = {str(k).lower(): str(k) for k in fm}
+                for bare_key in EPISTEMIC_EDGE_CANONICAL_TYPES:
+                    x_key = f"{EPISTEMIC_EDGE_X_PREFIX}{bare_key}"
+                    if bare_key in fm_keys_lower and x_key not in fm_keys_lower:
+                        orig_key_name = fm_keys_lower[bare_key]
+                        updated_yaml = _rename_top_level_yaml_key(
+                            updated_yaml, orig_key_name, x_key, fm_nl
+                        )
+
                 if updated_yaml != yaml_text:
                     new_content = f"{bom}---{fm_nl}{updated_yaml}{fm_nl}---{close_nl}{body}"
                     if new_content != orig:
                         _atomic_write_text(fp, new_content)
                         migrated_files.append(rel_posix)
 
-    return {"migrated_files": migrated_files, "errors": errors}
+    # 4. Ensure frontmatter-free wiki/index.md and wiki/<subdir>/index.md (OKF v0.3 §8)
+    for sub_idx_rel in _ensure_wiki_subindexes(v_root):
+        if sub_idx_rel not in migrated_files:
+            migrated_files.append(sub_idx_rel)
+
+    # 5. Optional: convert resolved [[wikilinks]] to OKF v0.3 relative Markdown links
+    portable_converted: list[str] = []
+    if portable_links:
+        p_res = convert_wikilinks_to_markdown_links(v_root)
+        portable_converted = list(p_res.get("converted_files", []))
+        for conv_rel in portable_converted:
+            if conv_rel not in migrated_files:
+                migrated_files.append(conv_rel)
+
+    return {
+        "migrated_files": migrated_files,
+        "portable_links_files": portable_converted,
+        "errors": errors,
+    }
 
 
 def run_vault_lint(
@@ -2143,6 +2633,7 @@ def run_vault_lint(
     strict: bool = False,
     migrate_sources: bool = False,
     migrate_v03: bool = False,
+    portable_links: bool = False,
     strict_drift: bool = False,
     include_mentions: bool = False,
 ) -> dict[str, Any]:
@@ -2177,9 +2668,14 @@ def run_vault_lint(
         return err_res
 
     migrated_v03_files: list[str] = []
+    portable_links_files: list[str] = []
     if auto_fix and migrate_v03:
-        mig_res = migrate_vault_to_v03(vault_root)
+        mig_res = migrate_vault_to_v03(vault_root, portable_links=portable_links)
         migrated_v03_files = list(mig_res.get("migrated_files", []))
+        portable_links_files = list(mig_res.get("portable_links_files", []))
+    elif auto_fix and portable_links:
+        p_res = convert_wikilinks_to_markdown_links(vault_root)
+        portable_links_files = list(p_res.get("converted_files", []))
 
     bundle_okf_version: str | None = None
     root_idx_path = vault_root / "index.md"
@@ -2267,16 +2763,25 @@ def run_vault_lint(
         if rel_path.startswith("raw/"):
             name_to_rel[rel_path[4:].lower()] = rel_path
 
+    def _set_md_alias(key: str, target_rel: str) -> None:
+        existing = name_to_rel.get(key)
+        if (
+            existing is None
+            or not existing.endswith(".md")
+            or target_rel.count("/") < existing.count("/")
+        ):
+            name_to_rel[key] = target_rel
+
     for rel_path, data in all_md_files.items():
-        name_to_rel[data["base_name"].lower()] = rel_path
+        _set_md_alias(data["base_name"].lower(), rel_path)
         name_to_rel[rel_path.lower()] = rel_path
-        name_to_rel[rel_path[:-3].lower()] = rel_path
+        _set_md_alias(rel_path[:-3].lower(), rel_path)
         if rel_path.startswith("wiki/"):
-            name_to_rel[rel_path[5:].lower()] = rel_path
-            name_to_rel[rel_path[5:-3].lower()] = rel_path
+            _set_md_alias(rel_path[5:].lower(), rel_path)
+            _set_md_alias(rel_path[5:-3].lower(), rel_path)
         elif rel_path.startswith("raw/"):
-            name_to_rel[rel_path[4:].lower()] = rel_path
-            name_to_rel[rel_path[4:-3].lower()] = rel_path
+            _set_md_alias(rel_path[4:].lower(), rel_path)
+            _set_md_alias(rel_path[4:-3].lower(), rel_path)
 
     graph: dict[str, dict[str, Any]] = {
         k: {
@@ -2290,7 +2795,7 @@ def run_vault_lint(
     }
 
     table_invariant_violations: list[dict[str, str]] = []
-    fixed_files: list[str] = list(migrated_v03_files)
+    fixed_files: list[str] = list(dict.fromkeys(migrated_v03_files + portable_links_files))
     migrated_sources_files: list[str] = []
     conformance_errors: list[dict[str, str]] = []
     missing_frontmatter: list[str] = []
@@ -2641,13 +3146,21 @@ def run_vault_lint(
 
         for md_m in _MD_LINK_RE.finditer(masked_body):
             raw_href = md_m.group(1).strip()
-            if not raw_href or raw_href.startswith(("#", "http://", "https://", "mailto:")):
+            if (
+                not raw_href
+                or raw_href.startswith(("#", "//"))
+                or _URI_SCHEME_RE.match(raw_href)
+            ):
                 continue
             href_clean = raw_href.split("#", 1)[0].split("?", 1)[0].strip()
-            if href_clean.lower().endswith(".md"):
+            if not href_clean:
+                continue
+            href_decoded = urllib.parse.unquote(href_clean).replace("\\", "/")
+            if href_decoded.lower().endswith(".md"):
                 graph[rel_path]["outbound_md"].add(href_clean)
 
-    # Resolve wikilinks and build inbound edges
+    # Resolve wikilinks and relative Markdown links; build inbound edges
+    exact_path_to_rel: dict[str, str] = {rel.lower(): rel for rel in all_md_files}
     broken_links: list[dict[str, str]] = []
     for src in sorted(graph):
         data = graph[src]
@@ -2660,15 +3173,24 @@ def run_vault_lint(
                 broken_links.append({"source": src, "target": target})
 
         for md_href in sorted(data["outbound_md"]):
-            candidate_rel = md_href.lstrip("/")
-            if not md_href.startswith("/"):
-                src_parent = Path(src).parent
-                joined = os.path.normpath(str(src_parent / md_href)).replace("\\", "/")
-                if not joined.startswith(".."):
-                    candidate_rel = joined
-            resolved_md = _resolve_target(candidate_rel, name_to_rel, graph)
+            decoded_href = urllib.parse.unquote(md_href).replace("\\", "/")
+            if decoded_href.startswith("/"):
+                candidate_rel = posixpath.normpath(decoded_href.lstrip("/"))
+            else:
+                src_parent = posixpath.dirname(src.replace("\\", "/"))
+                joined = (
+                    posixpath.join(src_parent, decoded_href)
+                    if src_parent
+                    else decoded_href
+                )
+                candidate_rel = posixpath.normpath(joined)
+            if not candidate_rel or candidate_rel == "." or candidate_rel.startswith(".."):
+                continue
+            resolved_md = exact_path_to_rel.get(candidate_rel.lower())
             if resolved_md and resolved_md in graph:
                 graph[resolved_md]["inbound"].add(src)
+            elif not src.startswith("raw/"):
+                broken_links.append({"source": src, "target": decoded_href})
 
     wanted_pages = _build_wanted_pages(broken_links)
 
@@ -2688,7 +3210,7 @@ def run_vault_lint(
     index_file = vault_root / "index.md"
     if index_file.is_file() and not index_file.is_symlink():
         index_content, _idx_utf8 = _read_text_preserve_eol(index_file)
-        idx_lower = index_content.lower()
+        idx_lower = urllib.parse.unquote(index_content).lower()
         for rel_path in all_md_files:
             if (
                 rel_path.startswith("wiki/")
@@ -2705,7 +3227,7 @@ def run_vault_lint(
                 ):
                     missing_from_index.append(rel_path)
 
-    # Count 5-way typed epistemic edges across wiki notes
+    # Count 5-way typed epistemic edges across wiki notes (both `x-kc-*` and legacy keys)
     epistemic_edge_counts = {
         "CORROBORATES": 0,
         "COMPLEMENTS": 0,
@@ -2716,12 +3238,26 @@ def run_vault_lint(
     for rel_path, data in graph.items():
         if rel_path.startswith("wiki/") and rel_path.endswith(".md") and data["has_fm"]:
             fm = data.get("frontmatter") or {}
+            fm_lower = {str(k).lower(): v for k, v in fm.items()}
+            seen_ep_note: set[tuple[str, str]] = set()
             for ep_k in EPISTEMIC_EDGE_KEYS:
-                val = fm.get(ep_k)
-                if isinstance(val, list):
-                    epistemic_edge_counts[ep_k.upper()] += len(val)
-                elif isinstance(val, str) and val.strip():
-                    epistemic_edge_counts[ep_k.upper()] += 1
+                edge_type = _epistemic_edge_type_for_key(ep_k)
+                if not edge_type:
+                    continue
+                val = fm_lower.get(ep_k)
+                items = (
+                    val
+                    if isinstance(val, list)
+                    else ([val] if isinstance(val, str) and val.strip() else [])
+                )
+                for item in items:
+                    key_tok = str(item).strip().lower()
+                    if not key_tok:
+                        continue
+                    pair = (edge_type, key_tok)
+                    if pair not in seen_ep_note:
+                        seen_ep_note.add(pair)
+                        epistemic_edge_counts[edge_type] += 1
 
     stale_syntheses = _detect_stale_syntheses(all_md_files, graph, name_to_rel)
     unlinked_mentions = (
@@ -2761,7 +3297,8 @@ def run_vault_lint(
     results: dict[str, Any] = {
         "success": True,
         "vault_path": str(vault_root),
-        "bundle_root": "wiki",
+        "bundle_root": ".",
+        "concepts_dir": "wiki",
         "supported_okf_version": SUPPORTED_OKF_VERSION,
         "bundle_okf_version": bundle_okf_version,
         "total_markdown_files": len(all_md_files),
@@ -2772,6 +3309,7 @@ def run_vault_lint(
         "fixed_files": fixed_files,
         "migrated_sources_files": migrated_sources_files,
         "migrated_v03_files": migrated_v03_files,
+        "portable_links_files": portable_links_files,
         "orphan_notes": orphan_notes,
         "missing_from_index": missing_from_index,
         "missing_frontmatter": missing_frontmatter,
@@ -2812,7 +3350,12 @@ def _print_lint_report(results: dict[str, Any], *, auto_fix: bool, strict: bool)
     print("🔍 OKF v0.3 Knowledge Compiler Vault Audit Report")
     print("=" * 60)
     bver = results.get("bundle_okf_version") or "legacy/0.2"
-    print(f"📁 Vault Path: {results['vault_path']} (OKF Bundle Root: wiki/, Spec: {bver})")
+    broot = results.get("bundle_root", ".")
+    cdir = results.get("concepts_dir", "wiki")
+    print(
+        f"📁 Vault Path: {results['vault_path']} "
+        f"(OKF Bundle Root: {broot}, Concepts: {cdir}/, Spec: {bver})"
+    )
     print(f"📄 Total Markdown Files: {results['total_markdown_files']}")
     print(f"📚 Total Wiki Concepts: {results['total_wiki_notes']}")
     print(
@@ -2838,6 +3381,13 @@ def _print_lint_report(results: dict[str, Any], *, auto_fix: bool, strict: bool)
         for mv in results["migrated_v03_files"]:
             print(f"   • {mv}")
 
+    if results.get("portable_links_files"):
+        print(
+            f"🔗 Converted Links to Portable OKF Markdown ({len(results['portable_links_files'])}):"
+        )
+        for plf in results["portable_links_files"]:
+            print(f"   • {plf}")
+
     if results["migrated_sources_files"]:
         print(
             f"🔄 Migrated Legacy String Sources to {{id, resource}} ({len(results['migrated_sources_files'])}):"
@@ -2856,9 +3406,11 @@ def _print_lint_report(results: dict[str, Any], *, auto_fix: bool, strict: bool)
                 print(f"   • [{err['file']}] {err['message']}")
 
         if results["broken_links"]:
-            print(f"❌ Broken Wikilinks ({len(results['broken_links'])}):")
+            print(f"❌ Broken Links ({len(results['broken_links'])}):")
             for b in results["broken_links"]:
-                print(f"   • [{b['source']}] -> [[{b['target']}]]")
+                tgt = b["target"]
+                formatted_tgt = tgt if tgt.lower().endswith(".md") else f"[[{tgt}]]"
+                print(f"   • [{b['source']}] -> {formatted_tgt}")
 
         if results["wanted_pages"]:
             print(f"📌 Wanted Pages (Ranked by Inbound Refs, {len(results['wanted_pages'])}):")
@@ -3016,7 +3568,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--migrate-v03",
         action="store_true",
-        help="With --fix, deterministically upgrade index.md (okf_version: '0.3'), log.md (frontmatter-free ## YYYY-MM-DD), and bare bundle-root path fields to OKF v0.3.",
+        help="With --fix, deterministically upgrade index.md (okf_version: '0.3'), log.md (frontmatter-free ## YYYY-MM-DD), bare bundle-root path fields, bare epistemic keys (-> x-kc-*), and missing wiki/**/index.md files to OKF v0.3.",
+    )
+    parser.add_argument(
+        "--portable-links",
+        action="store_true",
+        help="With --fix, deterministically rewrite resolved Obsidian [[wikilinks]] in living notes to OKF v0.3 RFC 3986 relative Markdown links and x-kc-* bundle-root paths.",
     )
     parser.add_argument(
         "--strict",
@@ -3130,6 +3687,7 @@ def main(argv: list[str] | None = None) -> None:
         strict=args.strict,
         migrate_sources=args.migrate_sources,
         migrate_v03=args.migrate_v03,
+        portable_links=args.portable_links,
         strict_drift=args.strict_drift,
         include_mentions=args.mentions,
     )

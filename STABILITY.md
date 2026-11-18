@@ -1,6 +1,6 @@
-# Knowledge Compiler `1.x` Stability & Compatibility Policy (`v1.2.0`)
+# Knowledge Compiler `1.x` Stability & Compatibility Policy (`v1.3.0`)
 
-This document defines the Semantic Versioning (`SemVer 2.0.0`) and backward-compatibility guarantees for **Knowledge Compiler** across the `1.x` release series, starting with `v1.0.0` (updated for `v1.2.0` with native `OKF v0.3` support and full `OKF v0.2` backward compatibility).
+This document defines the Semantic Versioning (`SemVer 2.0.0`) and backward-compatibility guarantees for **Knowledge Compiler** across the `1.x` release series, starting with `v1.0.0` (updated for `v1.3.0` with full `OKF v0.3` interoperability: portable relative Markdown links, unambiguous `.` bundle root + `wiki/**/index.md` progressive disclosure, and `x-kc-*` namespaced epistemic extensions, while keeping full `OKF v0.2` backward compatibility).
 
 Throughout `1.x`, patch releases (`1.0.z`) contain only bug fixes and security hardening, and minor releases (`1.y.0`) introduce backward-compatible features without breaking the frozen contracts documented below.
 
@@ -8,11 +8,12 @@ Throughout `1.x`, patch releases (`1.0.z`) contain only bug fixes and security h
 
 ## 1. OKF v0.3 / v0.2 Bundle Root & Vault Workspace Profile (`1.x` Frozen)
 
-- **Strict OKF v0.3 / v0.2 Bundle Root (`wiki/`)**:
-  - The `wiki/` subdirectory is frozen as the canonical Open Knowledge Format (`OKF v0.3`, backward-compatible with `OKF v0.2`) bundle root containing `wiki/concepts/`, `wiki/entities/`, `wiki/patterns/`, `wiki/sources/`, and `wiki/synthesis/`.
-  - All compiled notes inside `wiki/` conform to the OKF frontmatter schema (`title`, `type`, `status`, `created`, `updated`, `tags`, `sources`, optional `superseded_by`, `generated`, `verified`, `stale_after`) and optional 5-way typed epistemic edges (`corroborates`, `complements`, `extends`, `contradicts`, `supersedes`).
+- **OKF v0.3 Bundle Root (`.`) & Compiled Concepts Directory (`wiki/`)**:
+  - The vault root (`.`) is the canonical Open Knowledge Format (`OKF v0.3`) bundle root holding `index.md` (`okf_version: "0.3"`), frontmatter-free `log.md`, and optional `purpose.md`, with compiled concepts organized in `wiki/` (`wiki/index.md`, `wiki/concepts/`, `wiki/entities/`, `wiki/patterns/`, `wiki/sources/`, and `wiki/synthesis/`).
+  - All compiled notes inside `wiki/` conform to the OKF frontmatter schema (`title`, `type`, `status`, `created`, `updated`, `tags`, `sources`, optional `superseded_by`, `generated`, `verified`, `stale_after`) and optional 5-way typed epistemic extensions (`x-kc-corroborates`, `x-kc-complements`, `x-kc-extends`, `x-kc-contradicts`, `x-kc-supersedes`; legacy unprefixed keys remain 100% readable).
+  - Both standard OKF v0.3 relative Markdown links (`[Label](../dir/Note%20Name.md)`) and Obsidian `[[wikilinks]]` are first-class across `vault-lint`, `vault-query`, and `vault-graph` (`vault-lint --fix --portable-links` deterministically rewrites resolved `[[wikilinks]]` to RFC 3986 relative Markdown links).
 - **Vault Workspace Profile (Vault Root)**:
-  - Vault-root files (`GEMINI.md`, `index.md` declaring `okf_version: "0.3"`, frontmatter-free `log.md`, `purpose.md`, and `.obsidian/`) follow the Vault Workspace Profile surrounding the `wiki/` bundle root. Legacy `OKF v0.2` vaults remain 100% readable and can be upgraded in one command via `vault-lint --fix --migrate-v03`.
+  - Vault-root files (`GEMINI.md`, `index.md` declaring `okf_version: "0.3"`, frontmatter-free `log.md`, `purpose.md`, and `.obsidian/`) compose the Workspace Profile alongside `wiki/index.md` and `wiki/<subdir>/index.md` (§8 progressive disclosure). Legacy `OKF v0.2` vaults remain 100% readable and can be upgraded in one command via `vault-lint --fix --migrate-v03` (plus optional `--portable-links`).
   - Raw source artifacts and extracted media reside under `raw/` and `raw/assets/` with SHA-256 idempotency metadata in `.ingest_cache.json` at the vault root.
 - **Dual-Format `sources` Compatibility**:
   - Both legacy string `sources` entries (e.g., `sources: ["[[wiki/sources/deck]]"]`) and OKF v0.2 structured `{id, resource, title}` mapping entries remain readable across all `1.x` tools (`vault-lint`, `vault-query`, `vault-correct`, `vault-graph`, `vault-sync-patterns`); passing `--strict` to `vault-lint` requires migrated structured `sources` (`vault-lint --migrate-sources`).
@@ -68,7 +69,7 @@ Across `vault-lint`, `vault-query`, and `vault-correct`, process exit codes are 
 Machine-readable `--json` outputs follow an **additive-only** evolution policy throughout `1.x` minor releases. Existing documented top-level keys (`vault_lint --json`, `vault-query --json`, `vault-correct --json`, `vault-graph --json`) will not be removed or incompatibly retyped in `1.x`:
 
 - **`vault-lint --json` (`vault_lint --json`)**:
-  - Preserves top-level keys: `success`, `vault_path`, `bundle_root`, `supported_okf_version`, `bundle_okf_version`, `total_markdown_files`, `total_wiki_notes`, `broken_links`, `wanted_pages`, `table_invariant_violations`, `fixed_files`, `migrated_sources_files`, `migrated_v03_files`, `orphan_notes`, `missing_from_index`, `missing_frontmatter`, `conformance_errors`, `legacy_sources_notes`, `dangling_footnotes`, `stale_notes`, `stale_verification_notes`, `stale_syntheses`, `workspace_profile_warnings`, `trust_tier_counts`, `epistemic_edge_counts`, `is_healthy`, `strict`, `strict_passed`, `strict_drift`, `strict_drift_passed` (plus `unlinked_mentions` when `--mentions` is passed).
+  - Preserves top-level keys: `success`, `vault_path`, `bundle_root`, `concepts_dir`, `supported_okf_version`, `bundle_okf_version`, `total_markdown_files`, `total_wiki_notes`, `broken_links`, `wanted_pages`, `table_invariant_violations`, `fixed_files`, `migrated_sources_files`, `migrated_v03_files`, `portable_links_files`, `orphan_notes`, `missing_from_index`, `missing_frontmatter`, `conformance_errors`, `legacy_sources_notes`, `dangling_footnotes`, `stale_notes`, `stale_verification_notes`, `stale_syntheses`, `workspace_profile_warnings`, `trust_tier_counts`, `epistemic_edge_counts`, `is_healthy`, `strict`, `strict_passed`, `strict_drift`, `strict_drift_passed` (plus `unlinked_mentions` when `--mentions` is passed).
 - **`vault-query --json`**:
   - Preserves top-level keys: `query`, `tokens`, `vault`, `include_raw`, `total_results`, `results` (or `query`, `create_safety`, `matches` when `--check-duplicate` is passed).
 - **`vault-correct --json`**:

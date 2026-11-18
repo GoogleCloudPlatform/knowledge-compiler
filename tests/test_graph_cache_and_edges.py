@@ -2258,14 +2258,14 @@ vm.runInContext(appScript, vmCtx);
             self.assertEqual(note_payload["id"], showcase_id)
             self.assertIn("```mermaid", note_payload["markdown"])
 
-            # 5. GET /api/graph?source=vault&slim=1 returns the user's untouched 5-node vault
+            # 5. GET /api/graph?source=vault&slim=1 returns the user's untouched 6-node vault (incl. wiki/index.md)
             conn.request("GET", "/api/graph?source=vault&slim=1", headers=headers)
             resp_user = conn.getresponse()
             user_payload = json.loads(resp_user.read().decode("utf-8"))
             self.assertEqual(resp_user.status, 200)
             self.assertFalse(user_payload["isSampleMode"])
             self.assertTrue(user_payload["isStarterVault"])
-            self.assertEqual(len(user_payload["nodes"]), 5)
+            self.assertEqual(len(user_payload["nodes"]), 6)
             conn.close()
         finally:
             server.shutdown()
@@ -2460,12 +2460,12 @@ vm.runInContext(appScript, vmCtx);
         self.assertTrue(vm_res["sampleBannerVisible"])
         self.assertFalse(vm_res["sampleOnboardVisible"])
         self.assertIn("Sample Vault (21 Notes)", vm_res["sampleTitle"])
-        self.assertIn("257 Links", vm_res["sampleStatsText"])
+        self.assertIn("295 Links", vm_res["sampleStatsText"])
         self.assertFalse(vm_res["sampleDrawerCollapsed"])
         self.assertTrue(vm_res["hasMermaidSvg"])
         self.assertFalse(vm_res["backBannerVisible"])
         self.assertTrue(vm_res["backOnboardVisible"])
-        self.assertIn("5 Notes", vm_res["backStatsText"])
+        self.assertIn("6 Notes", vm_res["backStatsText"])
         self.assertTrue(any("source=sample" in u for u in vm_res["fetchedUrls"]))
         self.assertTrue(any("source=vault" in u for u in vm_res["fetchedUrls"]))
 
@@ -2526,6 +2526,75 @@ vm.runInContext(appScript, vmCtx);
             finally:
                 server.shutdown()
                 server.server_close()
+
+    def test_x_kc_epistemic_edges_subindex_anchor_and_md_link_excerpt(self) -> None:
+        """Verify x-kc-* frontmatter edges, legacy compat, wiki/index.md anchor classification, and Markdown link excerpt unwrapping."""
+        import vault_query
+
+        vault = self._tmp_dir / "x_kc_graph_vault"
+        init_vault.init_vault(vault, quiet=True)
+        # Fresh init_vault (with wiki/index.md) must remain a starter vault with wiki/index.md classified as anchor
+        fresh_graph = vault_graph.build_vault_graph(
+            vault, ce_patterns_root=self._tmp_dir / "no_shared"
+        )
+        self.assertTrue(fresh_graph["isStarterVault"])
+        wiki_idx_node = next(
+            (n for n in fresh_graph["nodes"] if n["id"] == "wiki/index.md"), None
+        )
+        self.assertIsNotNone(wiki_idx_node)
+        self.assertEqual(wiki_idx_node["group"], "anchor")
+
+        # Add notes using x-kc-* paths, legacy bare keys, and inline rel::[Label](path.md)
+        (vault / "wiki" / "concepts" / "Target Concept.md").write_text(
+            "---\ntitle: Target Concept\ntype: concept\nstatus: stable\n---\n\n"
+            "# Target Concept\n\nTarget body.\n",
+            encoding="utf-8",
+        )
+        (vault / "wiki" / "concepts" / "Legacy Concept.md").write_text(
+            "---\ntitle: Legacy Concept\ntype: concept\nstatus: stable\n"
+            'extends:\n  - "[[Target Concept]]"\n---\n\n'
+            "# Legacy Concept\n\nLegacy body.\n",
+            encoding="utf-8",
+        )
+        (vault / "wiki" / "patterns" / "Modern Pattern.md").write_text(
+            "---\ntitle: Modern Pattern\ntype: pattern\nstatus: stable\n"
+            'x-kc-corroborates:\n  - "/wiki/concepts/Target Concept.md"\n---\n\n'
+            "# Modern Pattern\n\n"
+            "complements::[Legacy Concept](../concepts/Legacy%20Concept.md) with clean prose.\n",
+            encoding="utf-8",
+        )
+
+        g = vault_graph.build_vault_graph(
+            vault, ce_patterns_root=self._tmp_dir / "no_shared"
+        )
+        self.assertFalse(g["isStarterVault"])
+        edge_map = {(e["source"], e["target"]): e["type"] for e in g["edges"]}
+        self.assertEqual(
+            edge_map.get(("wiki/patterns/Modern Pattern.md", "wiki/concepts/Target Concept.md")),
+            "CORROBORATES",
+        )
+        self.assertEqual(
+            edge_map.get(("wiki/patterns/Modern Pattern.md", "wiki/concepts/Legacy Concept.md")),
+            "COMPLEMENTS",
+        )
+        self.assertEqual(
+            edge_map.get(("wiki/concepts/Legacy Concept.md", "wiki/concepts/Target Concept.md")),
+            "EXTENDS",
+        )
+
+        # Verify Markdown links unwrap cleanly to display labels in both graph & BM25 excerpts
+        modern_node = next(
+            n for n in g["nodes"] if n["id"] == "wiki/patterns/Modern Pattern.md"
+        )
+        self.assertIn("Legacy Concept", modern_node["excerpt"])
+        self.assertNotIn("../concepts/", modern_node["excerpt"])
+        q_excerpt = vault_query._build_plain_excerpt(
+            "See [BigQuery](../entities/BigQuery.md) and [Guide](GKE%20Autopilot.md)."
+        )
+        self.assertIn("BigQuery", q_excerpt)
+        self.assertIn("Guide", q_excerpt)
+        self.assertNotIn("../entities/", q_excerpt)
+        self.assertNotIn("%20", q_excerpt)
 
 
 if __name__ == "__main__":

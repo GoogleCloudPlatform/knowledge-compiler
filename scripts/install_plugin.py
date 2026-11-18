@@ -34,7 +34,7 @@ PLUGIN_MANIFEST = {
     "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
     "name": "knowledge-compiler",
     "displayName": "Knowledge Compiler",
-    "version": "1.2.0",
+    "version": "1.3.0",
     "description": (
         "Compile PDFs, slides, docs, and agent sessions into a local Open Knowledge Format "
         "(OKF v0.3) Markdown wiki with a 2D/3D WebGL graph and linter."
@@ -364,7 +364,7 @@ def install_global_plugin(
         "args": ["-B", "-u", "server.py"],
         "restart_policy": "always",
         "display_name": "Knowledge Graph",
-        "description": "Interactive 2D/3D graph of your Open Knowledge Format wiki with a 21-note sample preview, search, and Markdown reader (v1.2.0).",
+        "description": "Interactive 2D/3D graph of your Open Knowledge Format wiki with a 21-note sample preview, search, and Markdown reader (v1.3.0).",
         "has_web_ui": True,
         "ui_config": {
             "display_name": "Vault WebGL Graph",
@@ -482,7 +482,7 @@ def sync_repo_marketplace_bundle(repo_root: Path | None = None) -> dict:
         "args": ["-B", "-u", "server.py"],
         "restart_policy": "always",
         "display_name": "Knowledge Graph",
-        "description": "Interactive 2D/3D graph of your Open Knowledge Format wiki with a 21-note sample preview, search, and Markdown reader (v1.2.0).",
+        "description": "Interactive 2D/3D graph of your Open Knowledge Format wiki with a 21-note sample preview, search, and Markdown reader (v1.3.0).",
         "has_web_ui": True,
         "ui_config": {
             "display_name": "Vault WebGL Graph",
@@ -596,7 +596,7 @@ def main() -> None:
         harnesses.append("Default (~/.gemini/config)")
 
     print("============================================================")
-    print(" Knowledge Compiler — Global Plugin Installer (v1.2.0)")
+    print(" Knowledge Compiler — Global Plugin Installer (v1.3.0)")
     print("============================================================")
     print(f" Detected Harnesses : {', '.join(harnesses)}")
     print(f" Plugin Directory   : {result['plugin_dir']}")

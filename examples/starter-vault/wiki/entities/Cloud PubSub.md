@@ -36,10 +36,10 @@ sources:
 generated:
   by: "knowledge-compiler/1.2.0"
   at: "2026-11-18T00:00:00Z"
-complements:
-  - "[[Event-Driven PubSub Pipelines]]"
-  - "[[Idempotent Event Consumer and Dead-Letter Queue]]"
-  - "[[Cloud Run]]"
+x-kc-complements:
+  - "/wiki/concepts/Event-Driven PubSub Pipelines.md"
+  - "/wiki/patterns/Idempotent Event Consumer and Dead-Letter Queue.md"
+  - "/wiki/entities/Cloud Run.md"
 ---
 
 # Cloud PubSub
@@ -52,9 +52,9 @@ A subscription's type decides how messages reach the consumer.[^pubsub-subscript
 
 | Subscription type | How messages arrive | Consumer in the design brief |
 | :--- | :--- | :--- |
-| Push | Pub/Sub sends each message as an HTTPS request to a configured endpoint | Loader on [[Cloud Run]] |
-| Pull | The subscriber client requests messages from Pub/Sub | Sessionizer on [[Google Kubernetes Engine|GKE]] |
-| Export | Pub/Sub writes messages directly to a destination such as a [[BigQuery]] table | Considered, not adopted |
+| Push | Pub/Sub sends each message as an HTTPS request to a configured endpoint | Loader on [Cloud Run](Cloud%20Run.md) |
+| Pull | The subscriber client requests messages from Pub/Sub | Sessionizer on [GKE](Google%20Kubernetes%20Engine.md) |
+| Export | Pub/Sub writes messages directly to a destination such as a [BigQuery](BigQuery.md) table | Considered, not adopted |
 
 With push delivery, the endpoint acknowledges a message by returning an HTTP success status. Any other response tells Pub/Sub to send the message again.[^pubsub-push]
 
@@ -73,20 +73,20 @@ In the design brief, Pub/Sub is the durable buffer between the ingest API and it
 - **One topic, two subscriptions**: `events-raw` feeds a push subscription for the loader and a pull subscription, ordered by session ID, for the sessionizer.
 - **Success means published**: The ingest API returns a success status only after the publish call is acknowledged. The no-loss goal rests on this.
 - **Five attempts, then aside**: Both subscriptions forward a message to a dead-letter topic after five failed deliveries, and a separate subscription keeps those messages for inspection and replay.
-- **Trace context in attributes**: The publisher copies W3C trace context into message attributes so consumers can continue the trace. See [[OpenTelemetry Trace Propagation Across Services]].
+- **Trace context in attributes**: The publisher copies W3C trace context into message attributes so consumers can continue the trace. See [OpenTelemetry Trace Propagation Across Services](../patterns/OpenTelemetry%20Trace%20Propagation%20Across%20Services.md).
 
-The trade-offs between push and pull are covered in [[Event-Driven PubSub Pipelines]]. The consumer-side contract is covered in [[Idempotent Event Consumer and Dead-Letter Queue]].
+The trade-offs between push and pull are covered in [Event-Driven PubSub Pipelines](../concepts/Event-Driven%20PubSub%20Pipelines.md). The consumer-side contract is covered in [Idempotent Event Consumer and Dead-Letter Queue](../patterns/Idempotent%20Event%20Consumer%20and%20Dead-Letter%20Queue.md).
 
 ## Operating Notes
 
 - **Design for redelivery first**: The brief relies on an idempotency key and leaves exactly-once delivery as an open question for the pull subscription.[^design-brief]
 - **Keep ordering keys fine-grained**: A key that carries too much traffic becomes a bottleneck. The brief flags hot keys as a risk that needs a load test.[^design-brief]
-- **Watch the dead-letter topic**: Messages that land there are the ones the pipeline could not process. See [[Production Readiness and Observability Checklist]].
-- **Publish and subscribe without keys**: Publishers and subscribers authenticate with runtime identities. See [[Workload Identity Federation]].
+- **Watch the dead-letter topic**: Messages that land there are the ones the pipeline could not process. See [Production Readiness and Observability Checklist](../synthesis/Production%20Readiness%20and%20Observability%20Checklist.md).
+- **Publish and subscribe without keys**: Publishers and subscribers authenticate with runtime identities. See [Workload Identity Federation](../concepts/Workload%20Identity%20Federation.md).
 
 ## Related Notes
 
-- Concept: [[Event-Driven PubSub Pipelines]]
-- Pattern: [[Idempotent Event Consumer and Dead-Letter Queue]]
-- Source: [[Event Analytics Design Brief Summary]]
-- Synthesis: [[Google Cloud Serverless Analytics Reference]]
+- Concept: [Event-Driven PubSub Pipelines](../concepts/Event-Driven%20PubSub%20Pipelines.md)
+- Pattern: [Idempotent Event Consumer and Dead-Letter Queue](../patterns/Idempotent%20Event%20Consumer%20and%20Dead-Letter%20Queue.md)
+- Source: [Event Analytics Design Brief Summary](../sources/Event%20Analytics%20Design%20Brief%20Summary.md)
+- Synthesis: [Google Cloud Serverless Analytics Reference](../synthesis/Google%20Cloud%20Serverless%20Analytics%20Reference.md)

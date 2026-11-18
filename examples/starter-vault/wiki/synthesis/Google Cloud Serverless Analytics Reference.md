@@ -26,17 +26,17 @@ sources:
 generated:
   by: "knowledge-compiler/1.2.0"
   at: "2026-11-18T00:00:00Z"
-complements:
-  - "[[Cloud Run Serverless Containers]]"
-  - "[[GKE Autopilot]]"
-  - "[[BigQuery Partitioning and Clustering]]"
-  - "[[BigQuery Partition Pruning Check]]"
-  - "[[Event-Driven PubSub Pipelines]]"
+x-kc-complements:
+  - "/wiki/concepts/Cloud Run Serverless Containers.md"
+  - "/wiki/concepts/GKE Autopilot.md"
+  - "/wiki/concepts/BigQuery Partitioning and Clustering.md"
+  - "/wiki/concepts/BigQuery Partition Pruning Check.md"
+  - "/wiki/concepts/Event-Driven PubSub Pipelines.md"
 ---
 
 # Google Cloud Serverless Analytics Reference
 
-This synthesis connects stateless ingestion on [[Cloud Run]], asynchronous delivery through [[Cloud PubSub|Pub/Sub]], stateful processing on [[Google Kubernetes Engine]], a deduplication ledger in [[Cloud SQL for PostgreSQL]], and partitioned analytics in [[BigQuery]] into one composable reference pattern.[^gcp-arch-center] It generalizes the platform described in [[Event Analytics Design Brief Summary]] and the table rules in [[BigQuery Governance Notes Summary]].
+This synthesis connects stateless ingestion on [Cloud Run](../entities/Cloud%20Run.md), asynchronous delivery through [Pub/Sub](../entities/Cloud%20PubSub.md), stateful processing on [Google Kubernetes Engine](../entities/Google%20Kubernetes%20Engine.md), a deduplication ledger in [Cloud SQL for PostgreSQL](../entities/Cloud%20SQL%20for%20PostgreSQL.md), and partitioned analytics in [BigQuery](../entities/BigQuery.md) into one composable reference pattern.[^gcp-arch-center] It generalizes the platform described in [Event Analytics Design Brief Summary](../sources/Event%20Analytics%20Design%20Brief%20Summary.md) and the table rules in [BigQuery Governance Notes Summary](../sources/BigQuery%20Governance%20Notes%20Summary.md).
 
 ## End-to-End Sequence
 
@@ -67,22 +67,22 @@ sequenceDiagram
 
 | Layer | Service | Role in the flow | Governing notes |
 | :--- | :--- | :--- | :--- |
-| Ingestion edge | [[Cloud Run]] | Validates each event, publishes it, and reports success only after the publish is acknowledged | [[Cloud Run Serverless Containers|Serverless containers]], [[Revision Traffic Splitting and Canary Rollback|Canary rollback]] |
-| Event backbone | [[Cloud PubSub|Pub/Sub]] | Buffers events and delivers them at least once to a push and a pull subscription[^pubsub-subscriptions] | [[Event-Driven PubSub Pipelines|Pub/Sub pipelines]], [[Idempotent Event Consumer and Dead-Letter Queue|Idempotent consumer]] |
-| Stateless loading | [[Cloud Run]] | Turns each pushed message into one appended row | [[Idempotent Event Consumer and Dead-Letter Queue|Idempotent consumer]], [[OpenTelemetry Trace Propagation Across Services|Trace propagation]] |
-| Stateful processing | [[Google Kubernetes Engine]] | Holds open sessions in memory and scales on backlog, on Autopilot | [[GKE Autopilot]], [[Cloud Run vs GKE Autopilot Decision Matrix|Decision matrix]] |
-| Deduplication ledger | [[Cloud SQL for PostgreSQL]] | Records each processed `event_id` under a primary key | [[Idempotent Event Consumer and Dead-Letter Queue|Idempotent consumer]], [[Workload Identity Federation|Keyless identity]] |
-| Analytics | [[BigQuery]] | Stores events in a table partitioned by day and clustered by tenant and event type[^bq-partitioned-tables] | [[BigQuery Partitioning and Clustering|Partitioning and clustering]], [[Partition Filter Enforcement Guardrail|Filter guardrail]] |
+| Ingestion edge | [Cloud Run](../entities/Cloud%20Run.md) | Validates each event, publishes it, and reports success only after the publish is acknowledged | [Serverless containers](../concepts/Cloud%20Run%20Serverless%20Containers.md), [Canary rollback](../patterns/Revision%20Traffic%20Splitting%20and%20Canary%20Rollback.md) |
+| Event backbone | [Pub/Sub](../entities/Cloud%20PubSub.md) | Buffers events and delivers them at least once to a push and a pull subscription[^pubsub-subscriptions] | [Pub/Sub pipelines](../concepts/Event-Driven%20PubSub%20Pipelines.md), [Idempotent consumer](../patterns/Idempotent%20Event%20Consumer%20and%20Dead-Letter%20Queue.md) |
+| Stateless loading | [Cloud Run](../entities/Cloud%20Run.md) | Turns each pushed message into one appended row | [Idempotent consumer](../patterns/Idempotent%20Event%20Consumer%20and%20Dead-Letter%20Queue.md), [Trace propagation](../patterns/OpenTelemetry%20Trace%20Propagation%20Across%20Services.md) |
+| Stateful processing | [Google Kubernetes Engine](../entities/Google%20Kubernetes%20Engine.md) | Holds open sessions in memory and scales on backlog, on Autopilot | [GKE Autopilot](../concepts/GKE%20Autopilot.md), [Decision matrix](Cloud%20Run%20vs%20GKE%20Autopilot%20Decision%20Matrix.md) |
+| Deduplication ledger | [Cloud SQL for PostgreSQL](../entities/Cloud%20SQL%20for%20PostgreSQL.md) | Records each processed `event_id` under a primary key | [Idempotent consumer](../patterns/Idempotent%20Event%20Consumer%20and%20Dead-Letter%20Queue.md), [Keyless identity](../concepts/Workload%20Identity%20Federation.md) |
+| Analytics | [BigQuery](../entities/BigQuery.md) | Stores events in a table partitioned by day and clustered by tenant and event type[^bq-partitioned-tables] | [Partitioning and clustering](../concepts/BigQuery%20Partitioning%20and%20Clustering.md), [Filter guardrail](../patterns/Partition%20Filter%20Enforcement%20Guardrail.md) |
 
 ## Design Decisions
 
 - **Success means published**: The ingestion service validates, publishes, and only then answers the client. Slow or failing downstream work never holds a client connection open, and an accepted event no longer depends on the ingest instance.
-- **One topic, two delivery modes**: A push subscription drives the stateless loader, and a pull subscription with ordering keys feeds the stateful consumer. [[Event-Driven PubSub Pipelines]] explains the choice.
-- **Each workload on the runtime that fits it**: Stateless, request-driven services suit Cloud Run. Stateful applications and workloads that need deep control over Kubernetes suit GKE.[^gke-and-cloud-run] [[Cloud Run vs GKE Autopilot Decision Matrix]] gives the criteria.
-- **Idempotency instead of exactly-once**: Delivery is at least once, so the loader follows [[Idempotent Event Consumer and Dead-Letter Queue]] and the events table keeps `event_id` for read-time deduplication.
-- **No stored credentials**: Cloud Run services use their attached identity, GKE pods use Workload Identity Federation for GKE, and the loader signs in to PostgreSQL with IAM database authentication. See [[Workload Identity Federation]].
-- **Partitioned by default**: Event tables follow [[BigQuery Partitioning and Clustering]], and [[Partition Filter Enforcement Guardrail]] rejects queries that cannot prune. This replaces the layout recorded in [[Legacy Unpartitioned Daily Batch Table]].
-- **One trace per event**: The `traceparent` context travels in message attributes from the HTTP request to the warehouse write, following [[OpenTelemetry Trace Propagation Across Services]].
+- **One topic, two delivery modes**: A push subscription drives the stateless loader, and a pull subscription with ordering keys feeds the stateful consumer. [Event-Driven PubSub Pipelines](../concepts/Event-Driven%20PubSub%20Pipelines.md) explains the choice.
+- **Each workload on the runtime that fits it**: Stateless, request-driven services suit Cloud Run. Stateful applications and workloads that need deep control over Kubernetes suit GKE.[^gke-and-cloud-run] [Cloud Run vs GKE Autopilot Decision Matrix](Cloud%20Run%20vs%20GKE%20Autopilot%20Decision%20Matrix.md) gives the criteria.
+- **Idempotency instead of exactly-once**: Delivery is at least once, so the loader follows [Idempotent Event Consumer and Dead-Letter Queue](../patterns/Idempotent%20Event%20Consumer%20and%20Dead-Letter%20Queue.md) and the events table keeps `event_id` for read-time deduplication.
+- **No stored credentials**: Cloud Run services use their attached identity, GKE pods use Workload Identity Federation for GKE, and the loader signs in to PostgreSQL with IAM database authentication. See [Workload Identity Federation](../concepts/Workload%20Identity%20Federation.md).
+- **Partitioned by default**: Event tables follow [BigQuery Partitioning and Clustering](../concepts/BigQuery%20Partitioning%20and%20Clustering.md), and [Partition Filter Enforcement Guardrail](../patterns/Partition%20Filter%20Enforcement%20Guardrail.md) rejects queries that cannot prune. This replaces the layout recorded in [Legacy Unpartitioned Daily Batch Table](../concepts/Legacy%20Unpartitioned%20Daily%20Batch%20Table.md).
+- **One trace per event**: The `traceparent` context travels in message attributes from the HTTP request to the warehouse write, following [OpenTelemetry Trace Propagation Across Services](../patterns/OpenTelemetry%20Trace%20Propagation%20Across%20Services.md).
 
 ## Alternative Considered
 
@@ -90,16 +90,16 @@ A BigQuery subscription can write messages straight to a table with no consumer 
 
 ## Architectural Composition
 
-- **Stateless edge and ingestion**: Deploy bursty HTTP APIs and webhook receivers on [[Cloud Run Serverless Containers]] so capacity follows demand, and release them with [[Revision Traffic Splitting and Canary Rollback]].
-- **Asynchronous backbone**: Use the delivery modes in [[Event-Driven PubSub Pipelines]] to separate ingestion from processing and to absorb bursts.
-- **Stateful and operator-driven services**: Run long-lived Kubernetes workloads, custom controllers, and multi-container pods on [[GKE Autopilot]].
-- **Analytical storage layout**: Land telemetry in tables configured with [[BigQuery Partitioning and Clustering]] and validate scan efficiency with [[BigQuery Partition Pruning Check]].
+- **Stateless edge and ingestion**: Deploy bursty HTTP APIs and webhook receivers on [Cloud Run Serverless Containers](../concepts/Cloud%20Run%20Serverless%20Containers.md) so capacity follows demand, and release them with [Revision Traffic Splitting and Canary Rollback](../patterns/Revision%20Traffic%20Splitting%20and%20Canary%20Rollback.md).
+- **Asynchronous backbone**: Use the delivery modes in [Event-Driven PubSub Pipelines](../concepts/Event-Driven%20PubSub%20Pipelines.md) to separate ingestion from processing and to absorb bursts.
+- **Stateful and operator-driven services**: Run long-lived Kubernetes workloads, custom controllers, and multi-container pods on [GKE Autopilot](../concepts/GKE%20Autopilot.md).
+- **Analytical storage layout**: Land telemetry in tables configured with [BigQuery Partitioning and Clustering](../concepts/BigQuery%20Partitioning%20and%20Clustering.md) and validate scan efficiency with [BigQuery Partition Pruning Check](../concepts/BigQuery%20Partition%20Pruning%20Check.md).
 
 ## Operating the Reference
 
-[[Production Readiness and Observability Checklist]] turns the decisions above into launch gates: keyless identity, an end-to-end trace, a tested rollback, duplicate-safe consumers, and bounded analytical scans.
+[Production Readiness and Observability Checklist](Production%20Readiness%20and%20Observability%20Checklist.md) turns the decisions above into launch gates: keyless identity, an end-to-end trace, a tested rollback, duplicate-safe consumers, and bounded analytical scans.
 
 ## Source Context
 
-- [[Event Analytics Design Brief Summary]] supplies the components, targets, and runtime decisions.
-- [[BigQuery Governance Notes Summary]] supplies the table layout, scan, and access rules.
+- [Event Analytics Design Brief Summary](../sources/Event%20Analytics%20Design%20Brief%20Summary.md) supplies the components, targets, and runtime decisions.
+- [BigQuery Governance Notes Summary](../sources/BigQuery%20Governance%20Notes%20Summary.md) supplies the table layout, scan, and access rules.

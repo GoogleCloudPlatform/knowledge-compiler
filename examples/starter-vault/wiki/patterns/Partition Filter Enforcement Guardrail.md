@@ -23,17 +23,17 @@ sources:
 generated:
   by: "knowledge-compiler/1.2.0"
   at: "2026-11-18T00:00:00Z"
-contradicts:
-  - "[[Legacy Unpartitioned Daily Batch Table]]"
-corroborates:
-  - "[[BigQuery Partitioning and Clustering]]"
-complements:
-  - "[[BigQuery Partition Pruning Check]]"
+x-kc-contradicts:
+  - "/wiki/concepts/Legacy Unpartitioned Daily Batch Table.md"
+x-kc-corroborates:
+  - "/wiki/concepts/BigQuery Partitioning and Clustering.md"
+x-kc-complements:
+  - "/wiki/concepts/BigQuery Partition Pruning Check.md"
 ---
 
 # Partition Filter Enforcement Guardrail
 
-Setting `require_partition_filter` on a partitioned [[BigQuery]] table makes the engine reject any query that has no usable filter on the partitioning column. The guardrail turns a team convention ("always filter by date") into a rule that is enforced at query time.
+Setting `require_partition_filter` on a partitioned [BigQuery](../entities/BigQuery.md) table makes the engine reject any query that has no usable filter on the partitioning column. The guardrail turns a team convention ("always filter by date") into a rule that is enforced at query time.
 
 ## Problem
 
@@ -85,11 +85,11 @@ Every query must include at least one predicate that references only the partiti
 
 ## Why It Contradicts the Legacy Layout
 
-[[Legacy Unpartitioned Daily Batch Table]] treats a full table scan as the normal access path: there is no partitioning column, so every reader scans the whole history. This guardrail takes the opposite position and makes an unfiltered scan an error. The two cannot be applied to the same table, which is why the relationship is recorded as a contradiction rather than a refinement.
+[Legacy Unpartitioned Daily Batch Table](../concepts/Legacy%20Unpartitioned%20Daily%20Batch%20Table.md) treats a full table scan as the normal access path: there is no partitioning column, so every reader scans the whole history. This guardrail takes the opposite position and makes an unfiltered scan an error. The two cannot be applied to the same table, which is why the relationship is recorded as a contradiction rather than a refinement.
 
-Moving from one to the other is a migration, not a setting. [[BigQuery Governance Notes Summary]] records the route taken for the legacy table in this vault:
+Moving from one to the other is a migration, not a setting. [BigQuery Governance Notes Summary](../sources/BigQuery%20Governance%20Notes%20Summary.md) records the route taken for the legacy table in this vault:
 
-- **Rebuild the table as partitioned and clustered**, with the option set, following [[BigQuery Partitioning and Clustering]].
+- **Rebuild the table as partitioned and clustered**, with the option set, following [BigQuery Partitioning and Clustering](../concepts/BigQuery%20Partitioning%20and%20Clustering.md).
 - **Backfill history** into the new table and point writers at it.
 - **Repoint readers through a compatibility view**. Because the requirement also applies to views, each query through the view now has to carry a date filter.
 - **Retire the legacy table** once the row counts of the two tables match.
@@ -97,7 +97,7 @@ Moving from one to the other is a migration, not a setting. [[BigQuery Governanc
 ## Rollout on Existing Tables
 
 - **Inventory**: List base tables that do not yet have the option, using the `TABLE_OPTIONS` view.[^bq-table-options]
-- **Observe**: Find the queries that would start failing, using the job history that [[BigQuery Partition Pruning Check]] already reads.
+- **Observe**: Find the queries that would start failing, using the job history that [BigQuery Partition Pruning Check](../concepts/BigQuery%20Partition%20Pruning%20Check.md) already reads.
 - **Enforce**: Apply the `ALTER TABLE` statement table by table, starting with the largest.
 - **Retain**: Add `partition_expiration_days` so old partitions are removed automatically.[^bq-manage-partitioned]
 
@@ -121,14 +121,14 @@ ORDER BY
 
 ## Trade-offs
 
-- **A filter is required, a narrow filter is not**: `WHERE event_ts > TIMESTAMP('1970-01-01')` satisfies the rule and still reads everything. Pair the guardrail with [[BigQuery Partition Pruning Check]] to see how much each query actually scans. The governance notes add a second limit for the same reason: scheduled queries and dashboard connections set a maximum bytes billed value, so an over-wide query fails instead of running.
+- **A filter is required, a narrow filter is not**: `WHERE event_ts > TIMESTAMP('1970-01-01')` satisfies the rule and still reads everything. Pair the guardrail with [BigQuery Partition Pruning Check](../concepts/BigQuery%20Partition%20Pruning%20Check.md) to see how much each query actually scans. The governance notes add a second limit for the same reason: scheduled queries and dashboard connections set a maximum bytes billed value, so an over-wide query fails instead of running.
 - **Existing queries break at once**: Turning the option on fails every unfiltered reader immediately. Stage the change and announce it.
 - **Small or short-lived tables may not need it**: Reference tables that are read in full by design can leave the option off. Whether a short-lived sandbox dataset needs the rule is an open item in the governance notes.
 - **Full-history jobs stay possible**: A backfill or training job can pass an explicit wide range. The intent is then visible in the SQL instead of implied by omission.
 
 ## Related Notes
 
-- [[BigQuery Partitioning and Clustering]] defines the layout this guardrail protects.
-- [[BigQuery Partition Pruning Check]] measures whether queries prune in practice.
-- [[BigQuery Governance Notes Summary]] records the rule that every partitioned table in the `analytics` dataset sets this option.
-- [[Production Readiness and Observability Checklist]] lists the guardrail as a launch gate.
+- [BigQuery Partitioning and Clustering](../concepts/BigQuery%20Partitioning%20and%20Clustering.md) defines the layout this guardrail protects.
+- [BigQuery Partition Pruning Check](../concepts/BigQuery%20Partition%20Pruning%20Check.md) measures whether queries prune in practice.
+- [BigQuery Governance Notes Summary](../sources/BigQuery%20Governance%20Notes%20Summary.md) records the rule that every partitioned table in the `analytics` dataset sets this option.
+- [Production Readiness and Observability Checklist](../synthesis/Production%20Readiness%20and%20Observability%20Checklist.md) lists the guardrail as a launch gate.

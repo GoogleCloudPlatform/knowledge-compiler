@@ -36,10 +36,10 @@ sources:
 generated:
   by: "knowledge-compiler/1.2.0"
   at: "2026-11-18T00:00:00Z"
-complements:
-  - "[[Idempotent Event Consumer and Dead-Letter Queue]]"
-  - "[[Workload Identity Federation]]"
-  - "[[Cloud Run]]"
+x-kc-complements:
+  - "/wiki/patterns/Idempotent Event Consumer and Dead-Letter Queue.md"
+  - "/wiki/concepts/Workload Identity Federation.md"
+  - "/wiki/entities/Cloud Run.md"
 ---
 
 # Cloud SQL for PostgreSQL
@@ -60,23 +60,23 @@ In the design brief, Cloud SQL for PostgreSQL holds the `processed_events` ledge
 | Step | Loader action | Effect |
 | :--- | :--- | :--- |
 | 1 | Look up the message's `event_id` in the ledger | If present, acknowledge and stop |
-| 2 | Append the row to [[BigQuery]] | The event becomes queryable |
+| 2 | Append the row to [BigQuery](BigQuery.md) | The event becomes queryable |
 | 3 | Insert the `event_id` into the ledger | Later redeliveries are recognized |
-| 4 | Return success to [[Cloud PubSub|Pub/Sub]] | The message is acknowledged |
+| 4 | Return success to [Pub/Sub](Cloud%20PubSub.md) | The message is acknowledged |
 
-A crash between steps 2 and 3 can leave a duplicate row. The brief accepts that window and handles it with a deduplicating view. [[Idempotent Event Consumer and Dead-Letter Queue]] describes the general pattern.
+A crash between steps 2 and 3 can leave a duplicate row. The brief accepts that window and handles it with a deduplicating view. [Idempotent Event Consumer and Dead-Letter Queue](../patterns/Idempotent%20Event%20Consumer%20and%20Dead-Letter%20Queue.md) describes the general pattern.
 
-The loader signs in with IAM database authentication, so the path from [[Cloud Run]] to the database holds no stored password and no key file.[^design-brief] See [[Workload Identity Federation]].
+The loader signs in with IAM database authentication, so the path from [Cloud Run](Cloud%20Run.md) to the database holds no stored password and no key file.[^design-brief] See [Workload Identity Federation](../concepts/Workload%20Identity%20Federation.md).
 
 ## Operating Notes
 
 - **Respect connection limits**: Cloud SQL limits the number of concurrent connections, and every connection uses resources on both sides. Compute that scales out quickly can hit the limit, so the brief caps the loader's instance count and keeps a small pool per instance.[^sql-connections][^design-brief]
-- **Connect from GKE with a sidecar**: On [[Google Kubernetes Engine]], the recommended setup runs the Auth Proxy as a sidecar container in the application's pod and supplies its identity through workload identity, not a key file.[^sql-connect-gke]
-- **Keep analytics elsewhere**: The ledger serves small, transactional lookups. Analytical queries over events belong in [[BigQuery]].
+- **Connect from GKE with a sidecar**: On [Google Kubernetes Engine](Google%20Kubernetes%20Engine.md), the recommended setup runs the Auth Proxy as a sidecar container in the application's pod and supplies its identity through workload identity, not a key file.[^sql-connect-gke]
+- **Keep analytics elsewhere**: The ledger serves small, transactional lookups. Analytical queries over events belong in [BigQuery](BigQuery.md).
 
 ## Related Notes
 
-- Pattern: [[Idempotent Event Consumer and Dead-Letter Queue]]
-- Concept: [[Workload Identity Federation]]
-- Source: [[Event Analytics Design Brief Summary]]
-- Synthesis: [[Google Cloud Serverless Analytics Reference]], [[Production Readiness and Observability Checklist]]
+- Pattern: [Idempotent Event Consumer and Dead-Letter Queue](../patterns/Idempotent%20Event%20Consumer%20and%20Dead-Letter%20Queue.md)
+- Concept: [Workload Identity Federation](../concepts/Workload%20Identity%20Federation.md)
+- Source: [Event Analytics Design Brief Summary](../sources/Event%20Analytics%20Design%20Brief%20Summary.md)
+- Synthesis: [Google Cloud Serverless Analytics Reference](../synthesis/Google%20Cloud%20Serverless%20Analytics%20Reference.md), [Production Readiness and Observability Checklist](../synthesis/Production%20Readiness%20and%20Observability%20Checklist.md)
