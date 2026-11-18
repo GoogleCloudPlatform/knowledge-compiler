@@ -2,8 +2,8 @@
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "knowledge-compiler",
   "displayName": "Knowledge Compiler",
-  "version": "1.1.3",
-  "description": "Compile PDFs, slides, docs, and agent sessions into a local Open Knowledge Format (OKF v0.2) Markdown wiki with a 2D/3D WebGL graph and linter.",
+  "version": "1.2.0",
+  "description": "Compile PDFs, slides, docs, and agent sessions into a local Open Knowledge Format (OKF v0.3) Markdown wiki with a 2D/3D WebGL graph and linter.",
   "logo": "assets/logo.svg",
   "author": {
     "name": "Google LLC"
@@ -25,7 +25,7 @@
     "google-cloud"
   ],
   "suggestedPrompts": [
-    "Initialize an OKF v0.2 knowledge vault in ./vault and compile the current session into it",
+    "Initialize an OKF v0.3 knowledge vault in ./vault and compile the current session into it",
     "Ingest a PDF, slide deck, or markdown folder into my knowledge vault and update index.md",
     "Audit my knowledge vault for broken wikilinks, frontmatter errors, and orphan notes"
   ]

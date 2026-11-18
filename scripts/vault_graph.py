@@ -43,6 +43,7 @@ import json
 import logging
 import math
 import os
+import posixpath
 import re
 import secrets
 import socket
@@ -580,6 +581,18 @@ def _extract_fm_epistemic_targets(
                     clean_target = clean_target.split("#", 1)[0].strip()
                 if clean_target:
                     outbound.append((clean_target, ep_key.upper()))
+
+    # OKF v0.3 §5.4 & §6.4: `superseded_by` path field resolves to a replacement concept edge
+    sup_by = fm_lower.get("superseded_by")
+    if isinstance(sup_by, str) and sup_by.strip():
+        clean_sup = re.sub(r"^\[\[|\]\]$", "", sup_by.strip())
+        clean_sup = re.split(r"\\?\|", clean_sup)[0].split("#", 1)[0].strip()
+        if clean_sup and not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", clean_sup):
+            clean_sup = clean_sup.lstrip("/")
+            if clean_sup.lower().endswith(".md"):
+                clean_sup = clean_sup[:-3]
+            if clean_sup:
+                outbound.append((clean_sup, "SUPERSEDES"))
     return outbound
 
 
@@ -606,11 +619,238 @@ def _extract_masked_body_wikilinks(
     return outbound
 
 
+_MD_REL_LINK_RE = re.compile(r"(?<!!)\[[^\[\]\n]{1,256}\]\(([^()\n]{1,512})\)")
+_URI_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
+
+
+def _extract_masked_body_markdown_links(
+    masked_markdown: str,
+    current_rel_path: str,
+) -> list[tuple[str, str]]:
+    """Extract relative `.md` Markdown links `(target, epistemic_type)` from masked markdown."""
+    outbound: list[tuple[str, str]] = []
+    cur_dir = posixpath.dirname(current_rel_path.replace("\\", "/"))
+    for line in masked_markdown.splitlines():
+        if "](" not in line:
+            continue
+        for match in _MD_REL_LINK_RE.finditer(line):
+            raw_href = match.group(1).strip()
+            if not raw_href:
+                continue
+            if raw_href.startswith("<") and ">" in raw_href:
+                raw_href = raw_href[1 : raw_href.index(">")].strip()
+            else:
+                raw_href = raw_href.split()[0].strip()
+            if not raw_href or raw_href.startswith("#") or _URI_SCHEME_RE.match(raw_href):
+                continue
+            href_no_frag = raw_href.split("#", 1)[0].split("?", 1)[0].strip()
+            if not href_no_frag:
+                continue
+            href_decoded = urllib.parse.unquote(href_no_frag).replace("\\", "/")
+            if not href_decoded.lower().endswith(".md"):
+                continue
+            if href_decoded.startswith("/"):
+                norm_target = posixpath.normpath(href_decoded.lstrip("/"))
+            else:
+                joined = posixpath.join(cur_dir, href_decoded) if cur_dir else href_decoded
+                norm_target = posixpath.normpath(joined)
+            if not norm_target or norm_target == "." or norm_target.startswith(".."):
+                continue
+            prefix_win = line[max(0, match.start() - 64) : match.start()]
+            outbound.append((norm_target, infer_epistemic_edge_type(prefix_win)))
+    return outbound
+
+
+def resolve_sample_vault_root() -> Path | None:
+    """Return the bundled clean-room OKF v0.3 starter vault directory if present."""
+    candidate = SCRIPT_DIR.parent / "examples" / "starter-vault"
+    try:
+        if candidate.is_symlink() or not candidate.is_dir():
+            return None
+        resolved = candidate.resolve()
+        if (resolved / "index.md").is_file():
+            return resolved
+    except OSError:
+        return None
+    return None
+
+
+def resolve_sample_vault_bundle() -> Path | None:
+    """Return a bundled pre-compiled JSON snapshot of the sample vault (space-free 1P/srcfs fallback)."""
+    candidate = SCRIPT_DIR.parent / "assets" / "starter_vault.json"
+    try:
+        if candidate.is_symlink() or not candidate.is_file():
+            return None
+        return candidate.resolve()
+    except OSError:
+        return None
+
+
+def export_sample_vault_bundle(
+    sample_vault_dir: Path | str,
+    output_path: Path | str,
+) -> dict[str, Any]:
+    """Compile a clean-room starter vault directory into a portable JSON snapshot (zero user paths)."""
+    sample_root = find_vault_root(Path(sample_vault_dir).expanduser()).resolve()
+    graph = build_vault_graph(
+        sample_root,
+        ce_patterns_root=sample_root / ".no_shared_patterns",
+        include_remote_tier=False,
+        has_sample_vault=True,
+        is_sample_mode=True,
+    )
+    graph["vaultPath"] = "examples/starter-vault"
+    graph["cePatternsPath"] = ""
+    out_p = Path(output_path).expanduser().resolve()
+    out_p.parent.mkdir(parents=True, exist_ok=True)
+    out_p.write_text(json.dumps(graph, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return {
+        "success": True,
+        "output_path": str(out_p),
+        "nodes": len(graph.get("nodes", ())),
+        "edges": len(graph.get("edges", ())),
+    }
+
+
+def _is_starter_vault(nodes_list: list[dict[str, Any]]) -> bool:
+    """Return True when the vault only contains fresh scaffold anchor notes and no user/shared content."""
+    if not nodes_list:
+        return True
+    has_content_note = any(
+        n.get("group") in ("entity", "concept", "pattern", "synthesis", "source")
+        or n.get("sourcePlane") == "ce_patterns"
+        for n in nodes_list
+    )
+    if has_content_note:
+        return False
+    local_count = sum(1 for n in nodes_list if n.get("sourcePlane") == "local_vault")
+    return local_count <= 6
+
+
+def _tokenize_ace_key_terms(nd: dict[str, Any]) -> set[str]:
+    """Extract normalized lowercase product and domain tokens from an ACE node."""
+    tokens: set[str] = set()
+    for p in nd.get("products") or ():
+        clean_p = str(p).strip().lower()
+        if clean_p:
+            tokens.add(clean_p)
+            for part in re.findall(r"[a-z0-9]{3,}", clean_p):
+                if part not in ("google", "cloud", "for", "and", "the"):
+                    tokens.add(part)
+    for t in nd.get("tags") or ():
+        for part in re.findall(r"[a-z0-9]{3,}", str(t).lower()):
+            if part not in (
+                "ace",
+                "brain",
+                "okf",
+                "cohort",
+                "live",
+                "submission",
+                "bootstrap",
+                "drive",
+                "author",
+                "federated",
+                "gcp",
+                "cloud",
+                "architecture",
+                "architectures",
+            ):
+                tokens.add(part)
+    lbl = str(nd.get("label") or "").lower()
+    for part in re.findall(r"[a-z0-9]{3,}", lbl):
+        if part not in ("ace", "product", "slice", "cluster", "google", "cloud", "the", "and", "for"):
+            tokens.add(part)
+    return tokens
+
+
+def _link_remote_tier_hierarchy(raw_nodes: dict[str, dict[str, Any]]) -> None:
+    """Connect L3 -> L2 -> L1 -> L0 Remote Tier nodes into a navigable constellation."""
+    ace_by_tier: dict[str, list[tuple[str, dict[str, Any], set[str]]]] = {
+        "L3": [],
+        "L2": [],
+        "L1": [],
+        "L0": [],
+    }
+    for nid, nd in raw_nodes.items():
+        if nd.get("source_plane") != "remote_tier":
+            continue
+        tier = str(nd.get("tier") or "L0").upper()
+        if tier not in ace_by_tier:
+            tier = "L0"
+        ace_by_tier[tier].append((nid, nd, _tokenize_ace_key_terms(nd)))
+
+    l3_list = ace_by_tier["L3"]
+    l2_list = ace_by_tier["L2"]
+    l1_list = ace_by_tier["L1"]
+    l0_list = ace_by_tier["L0"]
+
+    if len(l3_list) + len(l2_list) + len(l1_list) + len(l0_list) < 2:
+        return
+
+    # L3 golden paths -> L2 clusters
+    for l3_id, l3_nd, l3_toks in l3_list:
+        matched_l2 = [l2_id for l2_id, _nd, l2_toks in l2_list if l3_toks & l2_toks]
+        targets = matched_l2 or [l2_id for l2_id, _, _ in l2_list]
+        for tid in targets:
+            l3_nd["outbound_typed"].append((tid, "EXTENDS"))
+
+    # L2 clusters -> L1 product slices
+    l1_linked: set[str] = set()
+    for l2_id, l2_nd, l2_toks in l2_list:
+        for l1_id, _nd, l1_toks in l1_list:
+            if l2_toks & l1_toks:
+                l2_nd["outbound_typed"].append((l1_id, "COMPLEMENTS"))
+                l1_linked.add(l1_id)
+    if l2_list:
+        default_l2_id, default_l2_nd, _ = l2_list[0]
+        for l1_id, _, _ in l1_list:
+            if l1_id not in l1_linked:
+                default_l2_nd["outbound_typed"].append((l1_id, "COMPLEMENTS"))
+    elif l3_list:
+        _, default_l3_nd, _ = l3_list[0]
+        for l1_id, _, _ in l1_list:
+            default_l3_nd["outbound_typed"].append((l1_id, "COMPLEMENTS"))
+
+    # L0 concepts -> up to 2 best-matching L1 product slices (or L2/L3 fallback hub)
+    fallback_hub = (
+        l2_list[0][0]
+        if l2_list
+        else (l1_list[0][0] if l1_list else (l3_list[0][0] if l3_list else None))
+    )
+    for l0_id, l0_nd, l0_toks in l0_list:
+        scored_l1: list[tuple[int, str]] = []
+        for l1_id, _, l1_toks in l1_list:
+            overlap = len(l0_toks & l1_toks)
+            if overlap > 0:
+                scored_l1.append((overlap, l1_id))
+        scored_l1.sort(key=lambda item: (-item[0], item[1]))
+        if scored_l1:
+            for _, hub_id in scored_l1[:2]:
+                l0_nd["outbound_typed"].append((hub_id, "CORROBORATES"))
+            continue
+
+        scored_l2: list[tuple[int, str]] = []
+        for l2_id, _, l2_toks in l2_list:
+            overlap = len(l0_toks & l2_toks)
+            if overlap > 0:
+                scored_l2.append((overlap, l2_id))
+        scored_l2.sort(key=lambda item: (-item[0], item[1]))
+        if scored_l2:
+            for _, hub_id in scored_l2[:2]:
+                l0_nd["outbound_typed"].append((hub_id, "COMPLEMENTS"))
+            continue
+
+        if fallback_hub and fallback_hub != l0_id:
+            l0_nd["outbound_typed"].append((fallback_hub, "COMPLEMENTS"))
+
+
 def build_vault_graph(
     vault_root: Path,
     ce_patterns_root: Path | None = None,
     *,
     include_remote_tier: bool = False,
+    has_sample_vault: bool = False,
+    is_sample_mode: bool = False,
     **_extra_kwargs: Any,
 ) -> dict[str, Any]:
     """Parse an OKF v0.2 Obsidian Vault + sanitized `shared-okf-patterns` + shared OKF patterns overlay into a graph topology."""
@@ -692,8 +932,9 @@ def build_vault_graph(
             fm, yaml_text, has_valid_fm, wikilink_pattern
         )
 
-        # 2. Wikilinks inside masked body with explicit-only `rel::[[Target]]` classification
+        # 2. Wikilinks and relative Markdown `.md` links inside masked body
         outbound_typed.extend(_extract_masked_body_wikilinks(cleaned, wikilink_pattern))
+        outbound_typed.extend(_extract_masked_body_markdown_links(cleaned, rel_path))
 
         body_md, excerpt = extract_clean_body_and_excerpt(content)
         group = classify_note(rel_path, fm)
@@ -756,6 +997,7 @@ def build_vault_graph(
         )
         masked_pat_md = _mask_markdown_for_graph(pat["markdown"])
         typed_links.extend(_extract_masked_body_wikilinks(masked_pat_md, wikilink_pattern))
+        typed_links.extend(_extract_masked_body_markdown_links(masked_pat_md, pat["rel_path"]))
 
         raw_nodes[pat_id] = {
             "id": pat_id,
@@ -818,6 +1060,8 @@ def build_vault_graph(
             "author_id": ace_nd.get("author_id", ""),
             "drive_url": ace_nd.get("drive_url", ""),
         }
+    if ace_nodes:
+        _link_remote_tier_hierarchy(raw_nodes)
 
     # Add title and alias lookups into name_to_rel
     for rel_path, nd in raw_nodes.items():
@@ -941,11 +1185,16 @@ def build_vault_graph(
     )
     orphan_count = sum(1 for n in nodes_list if n["isOrphan"])
 
+    is_starter = (not is_sample_mode) and _is_starter_vault(nodes_list)
+
     return {
         "vaultPath": str(vault_root),
         "cePatternsPath": str(ce_root),
-        "vaultName": vault_root.name,
+        "vaultName": "Sample Vault (21 Notes)" if is_sample_mode else vault_root.name,
         "hasRemoteTier": bool(HAS_1P_FED_BRIDGE),
+        "hasSampleVault": bool(has_sample_vault),
+        "isSampleMode": bool(is_sample_mode),
+        "isStarterVault": bool(is_starter),
         "categories": CATEGORY_META,
         "epistemicTypes": EPISTEMIC_EDGE_META,
         "customerNames": sorted(DEFAULT_CUSTOMER_ANONYMIZATIONS.keys(), key=len, reverse=True),
@@ -1275,11 +1524,16 @@ class VaultGraphCache:
         include_remote_tier: bool = False,
         **extra_kwargs: Any,
     ) -> _CachedGraphEntry:
-        fp = compute_vault_graph_fingerprint(
+        fp_base = compute_vault_graph_fingerprint(
             vault_root,
             ce_patterns_root=ce_patterns_root,
             include_remote_tier=include_remote_tier,
             **extra_kwargs,
+        )
+        fp = (
+            fp_base,
+            bool(extra_kwargs.get("has_sample_vault", False)),
+            bool(extra_kwargs.get("is_sample_mode", False)),
         )
         while True:
             ev: threading.Event | None = None
@@ -2664,6 +2918,179 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       font-size: 11.5px;
     }
 
+    /* Sample Vault Switcher & First-Run Welcome Card (Zero-CDN, Zero backdrop-filter) */
+    .sample-toggle-btn {
+      background: rgba(52, 168, 83, 0.14);
+      border: 1px solid rgba(52, 168, 83, 0.45);
+      color: #86efac;
+      border-radius: 7px;
+      padding: 4px 9px;
+      font-size: 11.5px;
+      font-weight: 600;
+      cursor: pointer;
+      font-family: var(--font-sans);
+      white-space: nowrap;
+      transition: background 0.15s ease, border-color 0.15s ease;
+    }
+    .sample-toggle-btn:hover {
+      background: rgba(52, 168, 83, 0.28);
+      border-color: rgba(52, 168, 83, 0.72);
+    }
+    .sample-toggle-btn.active {
+      background: rgba(245, 158, 11, 0.18);
+      border-color: rgba(245, 158, 11, 0.65);
+      color: #fde68a;
+    }
+    .sample-toggle-btn.highlight {
+      background: rgba(66, 133, 244, 0.22);
+      border-color: rgba(96, 165, 250, 0.72);
+      color: #bfdbfe;
+    }
+
+    #sample-mode-banner {
+      position: absolute;
+      top: calc(var(--topbar-offset, 60px) + 2px);
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 19;
+      display: none;
+      align-items: center;
+      gap: 10px;
+      background: rgba(15, 23, 42, 0.97);
+      border: 1px solid rgba(245, 158, 11, 0.55);
+      color: #fef3c7;
+      border-radius: 9px;
+      padding: 6px 12px;
+      font-size: 12px;
+      box-shadow: var(--shadow-lg);
+      max-width: calc(100vw - 40px);
+      flex-wrap: wrap;
+    }
+    #sample-mode-banner.visible {
+      display: flex;
+    }
+    .sample-banner-badge {
+      background: rgba(245, 158, 11, 0.22);
+      color: #fcd34d;
+      border: 1px solid rgba(245, 158, 11, 0.48);
+      border-radius: 5px;
+      padding: 1px 6px;
+      font-size: 10.5px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+    }
+
+    #onboarding-card {
+      position: absolute;
+      bottom: 54px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 18;
+      display: none;
+      flex-direction: column;
+      gap: 12px;
+      width: min(510px, calc(100vw - 36px));
+      background: rgba(15, 23, 42, 0.98);
+      border: 1px solid rgba(96, 165, 250, 0.42);
+      border-radius: 14px;
+      padding: 16px 18px;
+      box-shadow: var(--shadow-lg);
+      user-select: text;
+    }
+    #onboarding-card.visible {
+      display: flex;
+    }
+    .onboard-hdr {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .onboard-title {
+      font-size: 14.5px;
+      font-weight: 700;
+      color: var(--text-main);
+      line-height: 1.3;
+    }
+    .onboard-sub {
+      font-size: 12px;
+      color: var(--text-muted);
+      line-height: 1.45;
+      margin-top: 3px;
+    }
+    .onboard-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .onboard-primary-btn {
+      background: var(--accent-blue);
+      color: #ffffff;
+      border: 1px solid rgba(147, 197, 253, 0.5);
+      border-radius: 8px;
+      padding: 7px 13px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      font-family: var(--font-sans);
+      transition: background 0.15s ease;
+    }
+    .onboard-primary-btn:hover {
+      background: #2563eb;
+    }
+    .onboard-secondary-btn {
+      background: rgba(161, 66, 244, 0.16);
+      color: #e9d5ff;
+      border: 1px solid rgba(161, 66, 244, 0.5);
+      border-radius: 8px;
+      padding: 7px 12px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      font-family: var(--font-sans);
+    }
+    .onboard-secondary-btn:hover {
+      background: rgba(161, 66, 244, 0.3);
+    }
+    .onboard-cmds {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      border-top: 1px solid var(--border-subtle);
+      padding-top: 10px;
+    }
+    .onboard-cmd-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border-subtle);
+      border-radius: 7px;
+      padding: 6px 10px;
+      font-size: 11.5px;
+      cursor: pointer;
+      transition: border-color 0.15s ease, background 0.15s ease;
+    }
+    .onboard-cmd-row:hover {
+      background: var(--bg-hover);
+      border-color: rgba(96, 165, 250, 0.45);
+    }
+    .onboard-cmd-code {
+      font-family: var(--font-mono);
+      color: #93c5fd;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+    .onboard-cmd-desc {
+      color: var(--text-muted);
+      flex: 1;
+      text-align: right;
+      font-size: 11px;
+    }
+
     @media (max-width: 900px) {
       #left-dock { width: 235px; }
       #right-drawer { width: 340px; }
@@ -2691,6 +3118,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           <span id="vault-title">Knowledge Compiler</span>
         </div>
         <span id="vault-stats-pill" class="stats-pill">Loading...</span>
+        <button id="btn-toggle-sample" class="sample-toggle-btn" style="display:none;" title="Preview the bundled 21-note OKF v0.3 sample vault read-only without modifying your personal vault">
+          ✨ Sample Vault
+        </button>
         <button id="btn-toggle-ace" class="ace-toggle-btn" style="display:none !important;" title="Dynamically Enable or Disable Remote Tier (Personal ObsidianVault is always 100% air-gapped)">
           🛡️ Remote Tier: OFF (Air-Gapped)
         </button>
@@ -2960,6 +3390,48 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       </div>
     </aside>
 
+    <!-- Read-Only Sample Vault Banner -->
+    <div id="sample-mode-banner" role="status">
+      <span class="sample-banner-badge">Read-Only Preview</span>
+      <span>Exploring the 21-note OKF v0.3 sample vault. Your personal vault is untouched.</span>
+      <button id="btn-return-my-vault" class="icon-btn" type="button">← Back to My Vault</button>
+    </div>
+
+    <!-- First-Run Starter Vault Onboarding Card -->
+    <section id="onboarding-card" aria-label="Getting Started with Knowledge Compiler">
+      <div class="onboard-hdr">
+        <div>
+          <div class="onboard-title">Your OKF v0.3 Knowledge Vault is ready</div>
+          <div class="onboard-sub">
+            Initialized with 5 connected starter anchors. Preview the 21-note interactive graph read-only without modifying your files, or compile your first note below:
+          </div>
+        </div>
+        <button id="btn-dismiss-onboarding" class="drawer-close" type="button" title="Dismiss welcome card">✕</button>
+      </div>
+      <div class="onboard-actions">
+        <button id="btn-onboard-sample" class="onboard-primary-btn" type="button" style="display:none;">
+          ✨ Explore 21-Note Sample Vault
+        </button>
+        <button id="btn-onboard-ace" class="onboard-secondary-btn" type="button" style="display:none;">
+          ☁️ Browse Remote Tier
+        </button>
+      </div>
+      <div class="onboard-cmds">
+        <div class="onboard-cmd-row" data-cmd="/ingest " title="Click to copy command">
+          <span class="onboard-cmd-code">/ingest &lt;file or URL&gt;</span>
+          <span class="onboard-cmd-desc">Compile a deck, PDF, or doc into linked OKF notes</span>
+        </div>
+        <div class="onboard-cmd-row" data-cmd="/distill-session" title="Click to copy command">
+          <span class="onboard-cmd-code">/distill-session</span>
+          <span class="onboard-cmd-desc">Save this conversation's findings to your vault</span>
+        </div>
+        <div class="onboard-cmd-row" data-cmd="/vault-pull" title="Click to copy command">
+          <span class="onboard-cmd-code">/vault-pull</span>
+          <span class="onboard-cmd-desc">Sync shared team architecture patterns</span>
+        </div>
+      </div>
+    </section>
+
     <!-- Floating Hover Card -->
     <div id="hover-card">
       <div id="hc-title" class="hc-title"></div>
@@ -3112,12 +3584,23 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     // UI & Simulation Configuration State
     // Notice: aceBrainEnabled is FALSE by default so personal ObsidianVault is 100% air-gapped.
+    let initialOnboardingDismissed = false;
+    try {
+      if (typeof window !== "undefined" && window.sessionStorage) {
+        initialOnboardingDismissed = window.sessionStorage.getItem("kc_onboarding_dismissed") === "1";
+      }
+    } catch (_) {}
+
     const state = {
       mode3D: true,
       searchHubOpen: false,
       aceBrainEnabled: false,
       aceNodesLoaded: false,
       aceNodesLoading: false,
+      sampleMode: Boolean(graphData.isSampleMode),
+      sampleLoading: false,
+      hasSampleVault: Boolean(graphData.hasSampleVault),
+      onboardingDismissed: initialOnboardingDismissed,
       hopDepth: 1,
       localScope: false,
       enabledGroups: new Set(["entity", "concept", "pattern", "synthesis", "ce_pattern", "source", "anchor"]),
@@ -5540,9 +6023,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       if (node._markdownPromise) {
         return node._markdownPromise;
       }
-      const includeAce = state.aceBrainEnabled ? "1" : "0";
+      const includeAce = (!state.sampleMode && state.aceBrainEnabled) ? "1" : "0";
+      const sourceParam = state.sampleMode ? "sample" : "vault";
       node._markdownPromise = fetch(
-        `/api/note?id=${encodeURIComponent(node.id)}&include_ace=${includeAce}`,
+        `/api/note?id=${encodeURIComponent(node.id)}&include_ace=${includeAce}&source=${sourceParam}`,
         {
           method: "GET",
           credentials: "same-origin",
@@ -5706,7 +6190,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       };
     }
 
-    const localStatsSnapshot = cloneStatsSnapshot(graphData.stats);
+    let localStatsSnapshot = cloneStatsSnapshot(graphData.stats);
     let remoteStatsSnapshot = null;
 
     function syncActiveStatsUI() {
@@ -5948,6 +6432,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       }
       state.simAlpha = Math.max(state.simAlpha, 0.55);
       syncActiveStatsUI();
+      updateSampleAndOnboardingUI();
       updateVisibilityAndSpotlight();
       if (!state.aceBrainEnabled && state.inspectedNode && state.inspectedNode.group === "remote_tier") {
         state.inspectedNode =
@@ -5977,12 +6462,22 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     // Tag Select
     const tagSelect = document.getElementById("tag-select");
-    (graphData.tags || []).forEach(tObj => {
-      const opt = document.createElement("option");
-      opt.value = tObj.tag;
-      opt.textContent = `#${tObj.tag} (${tObj.count})`;
-      tagSelect.appendChild(opt);
-    });
+    function rebuildTagDropdown(tagsList) {
+      if (!tagSelect) return;
+      tagSelect.innerHTML = "";
+      const defaultOpt = document.createElement("option");
+      defaultOpt.value = "";
+      defaultOpt.textContent = "All Tags (No Filter)";
+      tagSelect.appendChild(defaultOpt);
+      (tagsList || []).forEach(tObj => {
+        const opt = document.createElement("option");
+        opt.value = tObj.tag;
+        opt.textContent = `#${tObj.tag} (${tObj.count})`;
+        tagSelect.appendChild(opt);
+      });
+      tagSelect.value = "";
+    }
+    rebuildTagDropdown(graphData.tags || []);
     tagSelect.addEventListener("change", () => {
       state.activeTag = tagSelect.value;
       document.getElementById("btn-clear-tag").style.display = state.activeTag ? "inline" : "none";
@@ -5994,6 +6489,257 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       document.getElementById("btn-clear-tag").style.display = "none";
       updateVisibilityAndSpotlight();
     });
+
+    // Bundled 21-Note Sample Vault Preview & First-Run Onboarding Card
+    const btnToggleSample = document.getElementById("btn-toggle-sample");
+    const sampleModeBanner = document.getElementById("sample-mode-banner");
+    const btnReturnMyVault = document.getElementById("btn-return-my-vault");
+    const onboardingCard = document.getElementById("onboarding-card");
+    const btnDismissOnboarding = document.getElementById("btn-dismiss-onboarding");
+    const btnOnboardSample = document.getElementById("btn-onboard-sample");
+    const btnOnboardAce = document.getElementById("btn-onboard-ace");
+
+    function updateSampleAndOnboardingUI() {
+      const hasSample = Boolean(state.hasSampleVault);
+      const isSample = Boolean(state.sampleMode);
+      const isStarter = Boolean(graphData.isStarterVault);
+
+      if (btnToggleSample) {
+        if (hasSample) {
+          btnToggleSample.style.display = "inline-block";
+          btnToggleSample.classList.toggle("active", isSample);
+          btnToggleSample.classList.toggle("highlight", !isSample && isStarter);
+          btnToggleSample.textContent = isSample ? "← My Vault" : "✨ Sample Vault";
+          btnToggleSample.disabled = Boolean(state.sampleLoading);
+        } else {
+          btnToggleSample.style.display = "none";
+        }
+      }
+
+      if (sampleModeBanner) {
+        sampleModeBanner.classList.toggle("visible", isSample);
+      }
+
+      if (btnToggleAce) {
+        if (!hasRemoteTier) {
+          btnToggleAce.style.display = "none";
+        } else {
+          btnToggleAce.style.display = isSample ? "none" : "inline-block";
+        }
+      }
+
+      if (btnOnboardSample) {
+        btnOnboardSample.style.display = hasSample ? "inline-block" : "none";
+      }
+      if (btnOnboardAce) {
+        btnOnboardAce.style.display = hasRemoteTier ? "inline-block" : "none";
+      }
+
+      if (onboardingCard) {
+        const showOnboard = !isSample && isStarter && !state.onboardingDismissed && !state.aceBrainEnabled;
+        onboardingCard.classList.toggle("visible", showOnboard);
+      }
+    }
+
+    function replaceGraphDataset(freshGraph, { isSample = false } = {}) {
+      if (!freshGraph || !Array.isArray(freshGraph.nodes)) return;
+
+      allNodes.length = 0;
+      allEdges.length = 0;
+      resolvedEdges.length = 0;
+      nodeById.clear();
+      nameLookup.clear();
+      outNeighbors.clear();
+      inNeighbors.clear();
+      undirectedNeighbors.clear();
+      resolvedEdgeMap.clear();
+
+      freshGraph.nodes.forEach((nd, idx) => {
+        if (!nd || !nd.id) return;
+        nd.inDegree = 0;
+        nd.outDegree = 0;
+        nd.degree = 0;
+        registerNodeMetadata(nd, idx);
+        allNodes.push(nd);
+      });
+
+      if (Array.isArray(freshGraph.edges)) {
+        freshGraph.edges.forEach(e => {
+          registerResolvedEdge(e, { appendRaw: true });
+        });
+      }
+
+      ensureWebGLBufferCapacity(resolvedEdges.length, allNodes.length);
+
+      graphData.vaultName = freshGraph.vaultName || (isSample ? "Sample Vault (21 Notes)" : "ObsidianVault");
+      graphData.vaultPath = freshGraph.vaultPath || graphData.vaultPath;
+      graphData.isSampleMode = Boolean(isSample);
+      graphData.isStarterVault = Boolean(freshGraph.isStarterVault);
+      if (typeof freshGraph.hasSampleVault === "boolean") {
+        graphData.hasSampleVault = freshGraph.hasSampleVault;
+        state.hasSampleVault = freshGraph.hasSampleVault;
+      }
+      graphData.tags = Array.isArray(freshGraph.tags) ? freshGraph.tags : [];
+
+      localStatsSnapshot = cloneStatsSnapshot(freshGraph.stats);
+      remoteStatsSnapshot = null;
+
+      state.sampleMode = Boolean(isSample);
+      state.aceBrainEnabled = false;
+      state.aceNodesLoaded = false;
+      state.aceNodesLoading = false;
+      state.hoveredNode = null;
+      state.selectedNode = null;
+      state.draggedNode = null;
+      state.localScope = false;
+      state.searchQuery = "";
+      state.activeTag = "";
+      state.enabledGroups = new Set(defaultWikiGroups);
+      state.enabledEdgeTypes = new Set(Object.keys(epistemicTypes));
+
+      if (btnToggleAce) {
+        btnToggleAce.classList.remove("enabled");
+        btnToggleAce.textContent = "🛡️ Remote Tier: OFF (Air-Gapped)";
+      }
+      if (chkPlaneAce) chkPlaneAce.checked = false;
+      if (pillPlaneAce) pillPlaneAce.classList.remove("active");
+      if (lblPlaneAce) lblPlaneAce.textContent = "☁️ OKF Bundles (OFF — Click to Enable)";
+      if (hoverCard) hoverCard.style.display = "none";
+      const sInp = document.getElementById("search-input");
+      if (sInp) sInp.value = "";
+      const sClr = document.getElementById("search-clear");
+      if (sClr) sClr.style.display = "none";
+      const btnClearTagEl = document.getElementById("btn-clear-tag");
+      if (btnClearTagEl) btnClearTagEl.style.display = "none";
+
+      rebuildTagDropdown(graphData.tags);
+      syncActiveStatsUI();
+      updateSampleAndOnboardingUI();
+      updateVisibilityAndSpotlight();
+
+      // Fit camera and pre-warm physics for the new constellation
+      state.panX = 0;
+      state.panY = 0;
+      state.zoom = 0.85;
+      state.yaw = 0.35;
+      state.pitch = 0.25;
+      state.camDist = 920;
+      state.pan3DX = 0;
+      state.pan3DY = 0;
+      state.simAlpha = 1.0;
+      for (let i = 0; i < 85; i++) {
+        stepPhysics();
+      }
+      state.simAlpha = 0.04;
+
+      const showcaseNode = isSample
+        ? (
+            nodeById.get("wiki/synthesis/Google Cloud Serverless Analytics Reference.md") ||
+            nodeById.get("wiki/concepts/Event-Driven PubSub Pipelines.md") ||
+            nodeById.get("index.md") ||
+            visibleNodes[0] ||
+            null
+          )
+        : (
+            nodeById.get("wiki/entities/Knowledge Compiler.md") ||
+            nodeById.get("index.md") ||
+            visibleNodes[0] ||
+            null
+          );
+
+      if (showcaseNode) {
+        const shouldOpenDrawer = isSample || !graphData.isStarterVault;
+        selectAndInspectNode(showcaseNode, false, false, shouldOpenDrawer);
+        if (!shouldOpenDrawer) {
+          const rDrawer = document.getElementById("right-drawer");
+          const btnInsp = document.getElementById("btn-toggle-inspector");
+          if (rDrawer) rDrawer.classList.add("collapsed");
+          if (btnInsp) btnInsp.classList.remove("active");
+        }
+      }
+      if (state.searchHubOpen) executeFederatedSearch();
+    }
+
+    function switchVaultSource(targetSource) {
+      if (state.sampleLoading) return;
+      const wantSample = targetSource === "sample";
+      if (wantSample && !state.hasSampleVault) return;
+      state.sampleLoading = true;
+      updateSampleAndOnboardingUI();
+      const queryUrl = wantSample
+        ? "/api/graph?source=sample&slim=1"
+        : "/api/graph?source=vault&slim=1";
+      fetch(queryUrl, {
+        method: "GET",
+        credentials: "same-origin",
+        headers: { "X-KC-Request": "1" },
+      })
+        .then(r => (r.ok ? r.json() : null))
+        .then(freshGraph => {
+          if (!freshGraph || !Array.isArray(freshGraph.nodes)) return;
+          replaceGraphDataset(freshGraph, { isSample: wantSample });
+        })
+        .catch(() => {})
+        .finally(() => {
+          state.sampleLoading = false;
+          updateSampleAndOnboardingUI();
+        });
+    }
+
+    if (btnToggleSample) {
+      btnToggleSample.addEventListener("click", () => {
+        switchVaultSource(state.sampleMode ? "vault" : "sample");
+      });
+    }
+    if (btnReturnMyVault) {
+      btnReturnMyVault.addEventListener("click", () => {
+        switchVaultSource("vault");
+      });
+    }
+    if (btnOnboardSample) {
+      btnOnboardSample.addEventListener("click", () => {
+        switchVaultSource("sample");
+      });
+    }
+    if (btnOnboardAce) {
+      btnOnboardAce.addEventListener("click", () => {
+        setAceBrainEnabled(true);
+        updateSampleAndOnboardingUI();
+      });
+    }
+    if (btnDismissOnboarding) {
+      btnDismissOnboarding.addEventListener("click", () => {
+        state.onboardingDismissed = true;
+        try {
+          if (typeof window !== "undefined" && window.sessionStorage) {
+            window.sessionStorage.setItem("kc_onboarding_dismissed", "1");
+          }
+        } catch (_) {}
+        updateSampleAndOnboardingUI();
+      });
+    }
+    if (onboardingCard && typeof onboardingCard.querySelectorAll === "function") {
+      onboardingCard.querySelectorAll(".onboard-cmd-row").forEach(rowEl => {
+        rowEl.addEventListener("click", () => {
+          const cmd = rowEl.getAttribute("data-cmd") || "";
+          if (!cmd) return;
+          const descEl = rowEl.querySelector(".onboard-cmd-desc");
+          const origDesc = descEl ? descEl.textContent : "";
+          const showCopied = () => {
+            if (!descEl) return;
+            descEl.textContent = "Copied! Paste into chat";
+            setTimeout(() => {
+              descEl.textContent = origDesc;
+            }, 1400);
+          };
+          if (navigator && navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+            navigator.clipboard.writeText(cmd).then(showCopied).catch(showCopied);
+          } else {
+            showCopied();
+          }
+        });
+      });
+    }
 
     // Mode Search Hub / 2D / 3D Unified Switcher
     const btnSearchMode = document.getElementById("btn-mode-search");
@@ -7190,13 +7936,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     }
     state.simAlpha = 0.02;
 
+    // Sync sample-vault switcher & first-run onboarding card visibility
+    updateSampleAndOnboardingUI();
+
     // Default initial inspection on Knowledge Compiler without dimming the full constellation
     const defaultNode =
       nodeById.get("wiki/entities/Knowledge Compiler.md") ||
       nodeById.get("index.md") ||
       visibleNodes[0];
     if (defaultNode) {
-      selectAndInspectNode(defaultNode, false, false);
+      const openInitialDrawer = !(graphData.isStarterVault && !state.sampleMode);
+      selectAndInspectNode(defaultNode, false, false, openInitialDrawer);
+      if (!openInitialDrawer) {
+        if (rightDrawer) rightDrawer.classList.add("collapsed");
+        if (btnToggleInspector) btnToggleInspector.classList.remove("active");
+      }
     }
 
     // Main 60-120 FPS Animation Loop with FPS Counter
@@ -7665,7 +8419,49 @@ def create_graph_request_handler(
     preload_js_path = SCRIPT_DIR.parent / "sidecars" / "vault_graph" / "preload.js"
     logo_svg_path = SCRIPT_DIR.parent / "assets" / "logo.svg"
     prepared_candidate_cache: dict[tuple[str, str, int], dict[str, Any]] = {}
-    graph_cache = cache if cache is not None else VaultGraphCache(max_entries=4)
+    graph_cache = cache if cache is not None else VaultGraphCache(max_entries=6)
+    resolved_user_vault = find_vault_root(vault_root).resolve()
+    sample_bundle_cache: dict[str, Any] = {"key": None, "graph": None, "json": None, "slim_json": None}
+
+    def _get_sample_vault_root() -> Path | None:
+        s_root = resolve_sample_vault_root()
+        if s_root is None or s_root == resolved_user_vault:
+            return None
+        return s_root
+
+    def _has_sample_vault_source() -> bool:
+        return _get_sample_vault_root() is not None or resolve_sample_vault_bundle() is not None
+
+    def _load_sample_bundle_graph() -> tuple[dict[str, Any] | None, bytes | None, bytes | None]:
+        bundle_path = resolve_sample_vault_bundle()
+        if bundle_path is None:
+            return None, None, None
+        try:
+            st = os.stat(bundle_path, follow_symlinks=False)
+            b_key = (str(bundle_path), st.st_mtime_ns, st.st_size)
+            if sample_bundle_cache["key"] == b_key and sample_bundle_cache["graph"] is not None:
+                return (
+                    sample_bundle_cache["graph"],
+                    sample_bundle_cache["json"],
+                    sample_bundle_cache["slim_json"],
+                )
+            raw_obj = json.loads(bundle_path.read_text(encoding="utf-8"))
+            if not isinstance(raw_obj, dict) or not isinstance(raw_obj.get("nodes"), list):
+                return None, None, None
+            raw_obj["hasRemoteTier"] = bool(HAS_1P_FED_BRIDGE)
+            raw_obj["hasSampleVault"] = True
+            raw_obj["isSampleMode"] = True
+            raw_obj["isStarterVault"] = False
+            raw_obj["vaultName"] = raw_obj.get("vaultName") or "Sample Vault (21 Notes)"
+            full_bytes = json.dumps(raw_obj, ensure_ascii=False).encode("utf-8")
+            slim_bytes = json.dumps(_build_slim_graph_dict(raw_obj), ensure_ascii=False).encode("utf-8")
+            sample_bundle_cache["key"] = b_key
+            sample_bundle_cache["graph"] = raw_obj
+            sample_bundle_cache["json"] = full_bytes
+            sample_bundle_cache["slim_json"] = slim_bytes
+            return raw_obj, full_bytes, slim_bytes
+        except Exception:
+            return None, None, None
 
     class GraphRequestHandler(http.server.BaseHTTPRequestHandler):
         timeout = 10
@@ -7833,12 +8629,15 @@ def create_graph_request_handler(
 
             if path in ("/", "/index.html"):
                 csp_nonce = secrets.token_urlsafe(24)
+                has_sample = _has_sample_vault_source()
                 html_str = graph_cache.get_rendered_html(
                     vault_root,
                     include_remote_tier=False,
                     sidecar_mode=sidecar_mode,
                     csp_nonce=csp_nonce,
                     lazy_markdown=True,
+                    has_sample_vault=has_sample,
+                    is_sample_mode=False,
                 )
                 tok_hdr = "X-Sidecar-Token" if sidecar_mode else "X-Owner-Token"
                 cleanup_script = (
@@ -7882,6 +8681,7 @@ def create_graph_request_handler(
                 self.wfile.write(html_bytes)
             elif path == "/api/graph":
                 q_params = urllib.parse.parse_qs(parsed.query)
+                source_mode = (q_params.get("source", ["vault"])[0] or "vault").strip().lower()
                 include_ace = q_params.get("include_ace", ["0"])[0].lower() in (
                     "1",
                     "true",
@@ -7892,9 +8692,38 @@ def create_graph_request_handler(
                     "true",
                     "yes",
                 )
-                body = graph_cache.get_json_bytes(
-                    vault_root, include_remote_tier=include_ace, slim=slim
-                )
+                sample_root = _get_sample_vault_root()
+                if source_mode == "sample":
+                    if sample_root is not None:
+                        body = graph_cache.get_json_bytes(
+                            sample_root,
+                            ce_patterns_root=sample_root / ".no_shared_patterns",
+                            include_remote_tier=False,
+                            slim=slim,
+                            has_sample_vault=True,
+                            is_sample_mode=True,
+                        )
+                    else:
+                        _bg, full_b, slim_b = _load_sample_bundle_graph()
+                        chosen = slim_b if slim else full_b
+                        if chosen is None:
+                            body = b'{"error": "Sample vault is not bundled"}'
+                            self.send_response(http.HTTPStatus.NOT_FOUND)
+                            self.send_header("Content-Type", "application/json; charset=utf-8")
+                            self.send_header("Content-Length", str(len(body)))
+                            self._cors_headers()
+                            self.end_headers()
+                            self.wfile.write(body)
+                            return
+                        body = chosen
+                else:
+                    body = graph_cache.get_json_bytes(
+                        vault_root,
+                        include_remote_tier=include_ace,
+                        slim=slim,
+                        has_sample_vault=_has_sample_vault_source(),
+                        is_sample_mode=False,
+                    )
                 self.send_response(http.HTTPStatus.OK)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
@@ -7913,14 +8742,41 @@ def create_graph_request_handler(
                     self.end_headers()
                     self.wfile.write(body)
                     return
+                source_mode = (q_params.get("source", ["vault"])[0] or "vault").strip().lower()
                 include_ace = q_params.get("include_ace", ["0"])[0].lower() in (
                     "1",
                     "true",
                     "yes",
                 )
-                graph_snapshot = graph_cache.get_or_build(
-                    vault_root, include_remote_tier=include_ace
-                )
+                sample_root = _get_sample_vault_root()
+                if source_mode == "sample":
+                    if sample_root is not None:
+                        graph_snapshot = graph_cache.get_or_build(
+                            sample_root,
+                            ce_patterns_root=sample_root / ".no_shared_patterns",
+                            include_remote_tier=False,
+                            has_sample_vault=True,
+                            is_sample_mode=True,
+                        )
+                    else:
+                        bundle_graph, _, _ = _load_sample_bundle_graph()
+                        if bundle_graph is None:
+                            body = b'{"error": "Sample vault is not bundled"}'
+                            self.send_response(http.HTTPStatus.NOT_FOUND)
+                            self.send_header("Content-Type", "application/json; charset=utf-8")
+                            self.send_header("Content-Length", str(len(body)))
+                            self._cors_headers()
+                            self.end_headers()
+                            self.wfile.write(body)
+                            return
+                        graph_snapshot = bundle_graph
+                else:
+                    graph_snapshot = graph_cache.get_or_build(
+                        vault_root,
+                        include_remote_tier=include_ace,
+                        has_sample_vault=_has_sample_vault_source(),
+                        is_sample_mode=False,
+                    )
                 matched = next(
                     (
                         nd

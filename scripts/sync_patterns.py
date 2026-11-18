@@ -2210,12 +2210,12 @@ sync-patterns pull
 """
     (target_dir / "README.md").write_text(readme_content, encoding="utf-8")
 
-    # 3. index.md
+    # 3. index.md (OKF v0.3 §8.1 root bundle metadata)
     today = datetime.date.today().isoformat()
-    index_content = f"""---
+    index_content = """---
+okf_version: "0.3"
 title: "Shared Patterns Index"
-type: meta
-updated: {today}
+description: "Curated, de-identified architectural patterns and engineering invariants."
 ---
 
 # 📚 Master Pattern Index
@@ -2234,13 +2234,13 @@ Curated architectural patterns and engineering invariants.
 """
     (target_dir / "index.md").write_text(index_content, encoding="utf-8")
 
-    # 4. log.md
+    # 4. log.md (OKF v0.3 §9: no frontmatter, ## YYYY-MM-DD date headings)
     log_content = f"""# Operations Log
 
 Chronological audit ledger of pattern contributions and updates.
 
-## [{today}] init | Repository Initialized
-- Initialized OKF v0.2 shared-okf-patterns repository.
+## {today}
+- **init** | Repository Initialized: Initialized OKF v0.3 shared-okf-patterns repository.
 """
     (target_dir / "log.md").write_text(log_content, encoding="utf-8")
 

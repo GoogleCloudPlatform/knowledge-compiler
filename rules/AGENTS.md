@@ -11,7 +11,7 @@ When the `knowledge-compiler` plugin is active:
    - **Private Vault Notes**: Personal notes and entity dossiers (`wiki/entities/`, `raw/`) remain strictly local inside the private vault.
 
 3. **Core Operational Commands**:
-   - `/ingest <target>`: Distill raw documents, slide decks, PDFs, or transcripts into structured markdown following OKF v0.2.
+   - `/ingest <target>`: Distill raw documents, slide decks, PDFs, or transcripts into structured markdown following OKF v0.3 (with v0.2 backward compatibility).
    - `/distill-session`: Retrospectively scan the active session transcript and compile newly established concepts and decisions into the vault.
    - `/vault-correct "<fact>"`: Authoritatively update a canonical concept/entity note and refactor living restatements into wikilinks (`[[Target]]`).
    - `/vault-query <query>`: Traverse the knowledge graph to synthesize answers across accumulated notes.

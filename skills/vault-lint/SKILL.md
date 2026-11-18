@@ -1,12 +1,12 @@
 ---
 name: vault-lint
 description: >-
-  Audits graph health, validates Open Knowledge Format (OKF v0.2) frontmatter compliance, detects broken links, finds orphaned notes, repairs escaped table pipes, and verifies freshness across the central Obsidian Vault ($OBSIDIAN_VAULT_PATH or ~/ObsidianVault). Use when the user invokes /vault-lint or /lint, asks to lint the vault, check vault health, audit the vault, repair vault links, or after major batch ingestions and refactors. Don't use for ingesting new raw documents (use ingest) or launching the interactive 3D WebGL graph server (use vault-graph).
+  Audits graph health, validates Open Knowledge Format (OKF v0.3/v0.2) frontmatter compliance, detects broken links, finds orphaned notes, repairs escaped table pipes, upgrades vaults to OKF v0.3, and verifies freshness across the central Obsidian Vault ($OBSIDIAN_VAULT_PATH or ~/ObsidianVault). Use when the user invokes /vault-lint or /lint, asks to lint the vault, check vault health, audit the vault, repair vault links, migrate a vault to OKF v0.3, or after major batch ingestions and refactors. Don't use for ingesting new raw documents (use ingest) or launching the interactive 3D WebGL graph server (use vault-graph).
 ---
 
 # 🧹 Vault Lint & Health-Check Skill (`/vault-lint`)
 
-This skill performs automated graph validation, OKF v0.2 frontmatter schema verification, orphan detection, and link health checks across the central **Knowledge Compiler** Obsidian Vault (`$OBSIDIAN_VAULT_PATH`, defaults to `~/ObsidianVault`).
+This skill performs automated graph validation, OKF v0.3/v0.2 frontmatter schema verification, one-command v0.2 -> v0.3 migration, orphan detection, and link health checks across the central **Knowledge Compiler** Obsidian Vault (`$OBSIDIAN_VAULT_PATH`, defaults to `~/ObsidianVault`).
 
 ---
 
@@ -47,7 +47,7 @@ This skill performs automated graph validation, OKF v0.2 frontmatter schema veri
 ```
 
 ### 1. Run Automated Linter, Strict Mode, Migration & Human Approval
-Execute the OKF v0.2 vault linter script via `run_command` (with `wiki/` as the strict OKF v0.2 bundle root):
+Execute the OKF v0.3/v0.2 vault linter script via `run_command` (with `wiki/` as the strict OKF bundle root):
 ```bash
 # Standard health & OKF conformance audit (plus optional upstream spec check)
 python3 <plugin_dir>/scripts/vault_lint.py "${OBSIDIAN_VAULT_PATH:-$HOME/ObsidianVault}" --check-okf-upstream
@@ -57,6 +57,9 @@ python3 <plugin_dir>/scripts/vault_lint.py "${OBSIDIAN_VAULT_PATH:-$HOME/Obsidia
 
 # Repair escaped table pipes AND opt-in migrate legacy string sources to OKF {id, resource} objects
 python3 <plugin_dir>/scripts/vault_lint.py "${OBSIDIAN_VAULT_PATH:-$HOME/ObsidianVault}" --fix --migrate-sources
+
+# Upgrade an OKF v0.2 vault to OKF v0.3 (root index.md okf_version: "0.3", frontmatter-free newest-first log.md, leading '/' bundle paths)
+python3 <plugin_dir>/scripts/vault_lint.py "${OBSIDIAN_VAULT_PATH:-$HOME/ObsidianVault}" --fix --migrate-v03
 
 # Stamp explicit human verification onto a reviewed wiki/ note (Trust Tier: human-reviewed)
 python3 <plugin_dir>/scripts/vault_lint.py "${OBSIDIAN_VAULT_PATH:-$HOME/ObsidianVault}" \
@@ -69,7 +72,7 @@ python3 <plugin_dir>/scripts/vault_lint.py "${OBSIDIAN_VAULT_PATH:-$HOME/Obsidia
 python3 <plugin_dir>/scripts/vault_lint.py "${OBSIDIAN_VAULT_PATH:-$HOME/ObsidianVault}" --dedup-manifest /tmp/dedup_manifest.json
 python3 <plugin_dir>/scripts/vault_lint.py "${OBSIDIAN_VAULT_PATH:-$HOME/ObsidianVault}" --apply-manifest /tmp/dedup_manifest.json
 ```
-- Pass `--check-okf-upstream` whenever checking whether a newer version of the official Open Knowledge Format specification has been published at [`github.com/GoogleCloudPlatform/open-knowledge-format`](https://github.com/GoogleCloudPlatform/open-knowledge-format) (`SPEC.md`, currently `v0.2`).
+- Pass `--check-okf-upstream` whenever checking whether a newer version of the official Open Knowledge Format specification has been published at [`github.com/open-knowledge-format/open-knowledge-format`](https://github.com/open-knowledge-format/open-knowledge-format) (`SPEC.md`, currently `v0.3`).
 
 #### Exit Codes
 - `0`: Conformant (`is_healthy == True` and zero warnings when `--strict` is active).
