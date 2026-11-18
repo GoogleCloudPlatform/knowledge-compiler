@@ -47,7 +47,7 @@ This skill performs automated graph validation, OKF v0.3/v0.2 frontmatter schema
 ```
 
 ### 1. Run Automated Linter, Strict Mode, Migration & Human Approval
-Execute the OKF v0.3/v0.2 vault linter script via `run_command` (with `wiki/` as the strict OKF bundle root):
+Execute the OKF v0.3/v0.2 vault linter script via `run_command` (OKF v0.3 bundle root `.`, compiled concepts in `wiki/`):
 ```bash
 # Standard health & OKF conformance audit (plus optional upstream spec check)
 python3 <plugin_dir>/scripts/vault_lint.py "${OBSIDIAN_VAULT_PATH:-$HOME/ObsidianVault}" --check-okf-upstream
@@ -58,8 +58,11 @@ python3 <plugin_dir>/scripts/vault_lint.py "${OBSIDIAN_VAULT_PATH:-$HOME/Obsidia
 # Repair escaped table pipes AND opt-in migrate legacy string sources to OKF {id, resource} objects
 python3 <plugin_dir>/scripts/vault_lint.py "${OBSIDIAN_VAULT_PATH:-$HOME/ObsidianVault}" --fix --migrate-sources
 
-# Upgrade an OKF v0.2 vault to OKF v0.3 (root index.md okf_version: "0.3", frontmatter-free newest-first log.md, leading '/' bundle paths)
+# Upgrade an OKF v0.2 vault to OKF v0.3 (root index.md okf_version: "0.3", frontmatter-free log.md & wiki/**/index.md, leading '/' bundle paths, x-kc-* epistemic keys)
 python3 <plugin_dir>/scripts/vault_lint.py "${OBSIDIAN_VAULT_PATH:-$HOME/ObsidianVault}" --fix --migrate-v03
+
+# Also rewrite resolved Obsidian [[wikilinks]] to portable OKF v0.3 RFC 3986 relative Markdown links and x-kc-* bundle-root paths
+python3 <plugin_dir>/scripts/vault_lint.py "${OBSIDIAN_VAULT_PATH:-$HOME/ObsidianVault}" --fix --migrate-v03 --portable-links
 
 # Stamp explicit human verification onto a reviewed wiki/ note (Trust Tier: human-reviewed)
 python3 <plugin_dir>/scripts/vault_lint.py "${OBSIDIAN_VAULT_PATH:-$HOME/ObsidianVault}" \

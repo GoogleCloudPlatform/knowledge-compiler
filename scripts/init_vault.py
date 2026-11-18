@@ -77,10 +77,28 @@ aliases: []
 > **Trust-Tier Integrity (OKF v0.3 §5.3)**: Omit `verified:` on agent-authored notes until explicit human review (`vault-lint --approve-human <note>`). Only verification events with `verified[].at >= generated.at` confer `human-reviewed` or `machine-confirmed` trust.
 
 ### Linking Rules
-- Use Obsidian `[[wikilinks]]` generously for all concepts, entities, and source cross-references.
+- Prefer standard **OKF v0.3 relative Markdown links** (`[Label](../concepts/Target%20Name.md)`) for cross-tool portability across generic OKF consumers, GitHub, and Obsidian. Obsidian `[[wikilinks]]` remain fully supported and can be converted deterministically via `vault-lint --fix --portable-links`.
+- For typed epistemic relationships in frontmatter, use OKF v0.3 §4.1 `x-kc-*` extension keys (`x-kc-corroborates`, `x-kc-complements`, `x-kc-extends`, `x-kc-contradicts`, `x-kc-supersedes`) with bundle-root paths (`"/wiki/concepts/Target.md"`).
 - For OKF path fields (`resource`, `sources[].resource`, `superseded_by`, `computation`, `executor.resource`, `attester.resource`), start bundle-root paths with `/` (e.g. `"/raw/deck.pptx"`).
 - Ensure reciprocal connections: when note A links to note B as a key dependency/relation, verify note B reflects the relationship.
 - **Table Formatting Invariant**: Inside Markdown tables, NEVER escape the pipe character within a wikilink alias (always use `[[Target|Alias]]`, never `[[Target\\|Alias]]`). Escaped pipes break Obsidian link graph resolution and vault linters.
+"""
+
+DEFAULT_WIKI_INDEX_MD = """# Wiki Index
+
+Compiled knowledge directory for this OKF v0.3 bundle (see [Master Index](../index.md)).
+
+## Sections
+
+- `wiki/sources/`: Distilled summaries of ingested sources.
+- `wiki/entities/`: Entity dossiers (organizations, platforms, products, tools).
+- `wiki/concepts/`: Topic and concept deep-dives.
+- `wiki/patterns/`: Reusable architectural patterns and engineering invariants.
+- `wiki/synthesis/`: Cross-cutting analyses and decision matrices.
+
+## Ledgers
+
+- [Skill Impact & Evolution Ledger](skill-impact.md): Tracks WikiSkill evolution proposals and validation outcomes.
 """
 
 DEFAULT_INDEX_MD = """---
@@ -128,6 +146,7 @@ Welcome to the **Knowledge Compiler** index. This document provides a high-level
 | Ledger | Category | Purpose |
 | :--- | :--- | :--- |
 | [Vault Teleology & Strategic Anchors](purpose.md) | `meta/teleology` | Active engagements, architectural pillars, and open theses. |
+| [Wiki Directory Index](wiki/index.md) | `meta/index` | Frontmatter-free OKF v0.3 §8 progressive-disclosure index for `wiki/`. |
 | [Skill Impact & Evolution Ledger](wiki/skill-impact.md) | `skill-evolution/ledger` | Tracks WikiSkill evolution proposals and validation outcomes. |
 | [Vault Schema & Compiler Protocol](GEMINI.md) | `meta/schema` | OKF v0.3 frontmatter rules, linking invariants, and directory architecture. |
 | [Vault Activity Log](log.md) | `meta/audit` | Chronological log of ingest, query, correction, and lint runs. |
@@ -522,6 +541,7 @@ def init_vault(
             (target_path / "GEMINI.md", DEFAULT_GEMINI_MD),
             (target_path / "index.md", DEFAULT_INDEX_MD.format(today=today_str)),
             (target_path / "log.md", DEFAULT_LOG_MD.format(today=today_str)),
+            (target_path / "wiki" / "index.md", DEFAULT_WIKI_INDEX_MD),
             (
                 target_path / "wiki" / "skill-impact.md",
                 DEFAULT_SKILL_IMPACT_MD.format(today=today_str),

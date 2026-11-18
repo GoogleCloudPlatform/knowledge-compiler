@@ -182,19 +182,22 @@ EPISTEMIC_EDGE_META: dict[str, dict[str, str]] = {
 }
 
 
-_EPISTEMIC_FM_KEYS: tuple[str, ...] = (
+_EPISTEMIC_FM_BASE_KEYS: tuple[str, ...] = (
     "corroborates",
     "complements",
     "extends",
     "contradicts",
     "supersedes",
 )
+_EPISTEMIC_FM_KEYS: tuple[str, ...] = tuple(
+    f"x-kc-{k}" for k in _EPISTEMIC_FM_BASE_KEYS
+) + _EPISTEMIC_FM_BASE_KEYS
 _INLINE_EPISTEMIC_PREFIX_RE = re.compile(
     r"(?<![A-Za-z0-9_-])\b(corroborates|complements|extends|contradicts|supersedes)[ \t]{0,32}::(?:[ \t]{0,32}\[\[[ \t]{0,32}|[ \t]{0,32})$",
     re.IGNORECASE,
 )
 _INLINE_EPISTEMIC_COMPLETE_RE = re.compile(
-    r"(?<![A-Za-z0-9_-])\b(corroborates|complements|extends|contradicts|supersedes)[ \t]{0,32}::[ \t]{0,32}\[\[[^\[\]\n]{1,512}\]\][ \t]{0,32}[.,;:]?[ \t]{0,32}$",
+    r"(?<![A-Za-z0-9_-])\b(corroborates|complements|extends|contradicts|supersedes)[ \t]{0,32}::[ \t]{0,32}(?:\[\[[^\[\]\n]{1,512}\]\]|\[[^\[\]\n]{1,256}\]\([^()\n]{1,512}\))[ \t]{0,32}[.,;:]?[ \t]{0,32}$",
     re.IGNORECASE,
 )
 _GRAPH_FENCE_OPEN_RE = re.compile(
@@ -420,7 +423,12 @@ def classify_note(rel_path: str, fm: dict[str, Any] | None) -> str:
 
     if rel_path.startswith("raw/"):
         return "raw"
-    if rel_path in ("index.md", "purpose.md", "log.md", "GEMINI.md", "wiki/skill-impact.md") or rel_path.startswith("tables/"):
+    base_name_lower = Path(rel_path).name.lower()
+    if (
+        rel_path in ("index.md", "purpose.md", "log.md", "GEMINI.md", "wiki/skill-impact.md")
+        or base_name_lower in ("index.md", "log.md")
+        or rel_path.startswith("tables/")
+    ):
         return "anchor"
     if rel_path.startswith("wiki/patterns/") or fm_type == "pattern":
         return "pattern"
@@ -449,6 +457,7 @@ def extract_clean_body_and_excerpt(content: str, max_body_chars: int = 18000) ->
     plain = re.sub(r"^#+[ \t]+[^\n]*$", "", plain, flags=re.MULTILINE)
     plain = re.sub(r"\[\[([^\[\]\n|]{1,512})\\?\|([^\[\]\n]{1,512})\]\]", r"\2", plain)
     plain = re.sub(r"\[\[([^\[\]\n]{1,512})\]\]", r"\1", plain)
+    plain = re.sub(r"(?<!!)\[([^\[\]\n]{1,512})\]\([^()\n]{1,512}\)", r"\1", plain)
     plain = re.sub(r"[*_`>|#-]", " ", plain)
     plain = re.sub(r"\s+", " ", plain).strip()
     excerpt = plain[:260] + ("..." if len(plain) > 260 else "")
@@ -558,11 +567,13 @@ def _extract_fm_epistemic_targets(
     has_valid_fm: bool,
     wikilink_re: re.Pattern[str],
 ) -> list[tuple[str, str]]:
-    """Extract explicit 5-way epistemic targets from YAML frontmatter fields."""
+    """Extract explicit 5-way epistemic targets from YAML frontmatter (`x-kc-*` and legacy keys)."""
     outbound: list[tuple[str, str]] = []
+    seen_pairs: set[tuple[str, str]] = set()
     fm_lower = {str(k).lower(): v for k, v in fm.items()} if fm else {}
     yaml_lower = yaml_text.lower() if yaml_text else ""
     for ep_key in _EPISTEMIC_FM_KEYS:
+        edge_type = ep_key.removeprefix("x-kc-").upper()
         items = _flatten_fm_epistemic_items(fm_lower.get(ep_key))
         if not items and yaml_text and (not has_valid_fm or ep_key in yaml_lower):
             items = okf.extract_string_list(yaml_text, ep_key)
@@ -571,28 +582,42 @@ def _extract_fm_epistemic_targets(
             if not raw_str:
                 continue
             bracket_matches = wikilink_re.findall(raw_str)
-            candidates = bracket_matches if bracket_matches else [raw_str]
+            if bracket_matches:
+                candidates = bracket_matches
+            else:
+                md_matches = _MD_REL_LINK_RE.findall(raw_str)
+                candidates = md_matches if md_matches else [raw_str]
             for cand in candidates:
                 clean_target = re.sub(r"^\[\[|\]\]$", "", cand.strip())
                 clean_target = re.split(r"\\?\|", clean_target)[0].strip()
                 if not clean_target or clean_target.startswith("#"):
                     continue
-                if "#" in clean_target:
-                    clean_target = clean_target.split("#", 1)[0].strip()
+                if clean_target.startswith("<") and ">" in clean_target:
+                    clean_target = clean_target[1 : clean_target.index(">")].strip()
+                clean_target = clean_target.split("#", 1)[0].split("?", 1)[0].strip()
+                if not clean_target or clean_target.startswith("//") or _URI_SCHEME_RE.match(clean_target):
+                    continue
+                clean_target = urllib.parse.unquote(clean_target).replace("\\", "/").lstrip("/")
                 if clean_target:
-                    outbound.append((clean_target, ep_key.upper()))
+                    pair = (clean_target.lower(), edge_type)
+                    if pair not in seen_pairs:
+                        seen_pairs.add(pair)
+                        outbound.append((clean_target, edge_type))
 
     # OKF v0.3 §5.4 & §6.4: `superseded_by` path field resolves to a replacement concept edge
     sup_by = fm_lower.get("superseded_by")
     if isinstance(sup_by, str) and sup_by.strip():
         clean_sup = re.sub(r"^\[\[|\]\]$", "", sup_by.strip())
-        clean_sup = re.split(r"\\?\|", clean_sup)[0].split("#", 1)[0].strip()
-        if clean_sup and not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", clean_sup):
-            clean_sup = clean_sup.lstrip("/")
+        clean_sup = re.split(r"\\?\|", clean_sup)[0].split("#", 1)[0].split("?", 1)[0].strip()
+        if clean_sup and not _URI_SCHEME_RE.match(clean_sup) and not clean_sup.startswith("//"):
+            clean_sup = urllib.parse.unquote(clean_sup).replace("\\", "/").lstrip("/")
             if clean_sup.lower().endswith(".md"):
                 clean_sup = clean_sup[:-3]
             if clean_sup:
-                outbound.append((clean_sup, "SUPERSEDES"))
+                pair = (clean_sup.lower(), "SUPERSEDES")
+                if pair not in seen_pairs:
+                    seen_pairs.add(pair)
+                    outbound.append((clean_sup, "SUPERSEDES"))
     return outbound
 
 
@@ -894,19 +919,25 @@ def build_vault_graph(
                 "rel_path": rel_path,
             }
 
-    # Build lookup index for resolving wikilinks
+    # Build lookup index for resolving wikilinks (shallower paths win collisions, e.g. index.md > wiki/index.md)
     name_to_rel: dict[str, str] = {}
+
+    def _set_graph_alias(key: str, target_rel: str) -> None:
+        existing = name_to_rel.get(key)
+        if existing is None or target_rel.count("/") < existing.count("/"):
+            name_to_rel[key] = target_rel
+
     for rel_path, data in all_md_files.items():
-        name_to_rel[data["base_name"].lower()] = rel_path
+        _set_graph_alias(data["base_name"].lower(), rel_path)
         name_to_rel[rel_path.lower()] = rel_path
         if rel_path.endswith(".md"):
-            name_to_rel[rel_path[:-3].lower()] = rel_path
+            _set_graph_alias(rel_path[:-3].lower(), rel_path)
         for prefix in ("wiki/", "raw/", "tables/"):
             if rel_path.startswith(prefix):
                 sub = rel_path[len(prefix) :]
-                name_to_rel[sub.lower()] = rel_path
+                _set_graph_alias(sub.lower(), rel_path)
                 if sub.endswith(".md"):
-                    name_to_rel[sub[:-3].lower()] = rel_path
+                    _set_graph_alias(sub[:-3].lower(), rel_path)
 
     raw_nodes: dict[str, dict[str, Any]] = {}
     wikilink_pattern = re.compile(r"\[\[([^\[\]\n]{1,512})\]\]")
@@ -3413,7 +3444,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           ✨ Explore 21-Note Sample Vault
         </button>
         <button id="btn-onboard-ace" class="onboard-secondary-btn" type="button" style="display:none;">
-          ☁️ Browse Remote Tier
+          ☁️ Browse Remote Tier (42+ Shared Patterns)
         </button>
       </div>
       <div class="onboard-cmds">
@@ -3427,7 +3458,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         </div>
         <div class="onboard-cmd-row" data-cmd="/vault-pull" title="Click to copy command">
           <span class="onboard-cmd-code">/vault-pull</span>
-          <span class="onboard-cmd-desc">Sync shared team architecture patterns</span>
+          <span class="onboard-cmd-desc">Auto-clone &amp; sync shared team architecture patterns</span>
         </div>
       </div>
     </section>
@@ -3508,8 +3539,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       computeNodeLabelMetrics(n);
       nodeById.set(n.id, n);
       nameLookup.set(n.id.toLowerCase(), n.id);
-      if (n.baseName) nameLookup.set(String(n.baseName).toLowerCase(), n.id);
-      if (n.label) nameLookup.set(String(n.label).toLowerCase(), n.id);
+      if (n.baseName) {
+        const bk = String(n.baseName).toLowerCase();
+        const prev = nameLookup.get(bk);
+        if (!prev || n.id.split("/").length < prev.split("/").length) {
+          nameLookup.set(bk, n.id);
+        }
+      }
+      if (n.label) {
+        const lk = String(n.label).toLowerCase();
+        const prev = nameLookup.get(lk);
+        if (!prev || n.id.split("/").length < prev.split("/").length) {
+          nameLookup.set(lk, n.id);
+        }
+      }
       if (n.id.endsWith(".md")) {
         nameLookup.set(n.id.slice(0, -3).toLowerCase(), n.id);
       }
@@ -5873,6 +5916,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         const display = (parts[1] || parts[0]).trim();
         return `<a class="md-wikilink" data-wikilink="${targetRaw}">${display}</a>`;
       });
+      out = out.replace(/(?<!!)\[([^\[\]\n]+)\]\(([^)\s]+)(?:\s+&quot;[^&]*&quot;)?\)/g, (full, display, href) => {
+        const cleanHref = href.trim();
+        if (/^https?:\/\//i.test(cleanHref)) {
+          return `<a class="md-extlink" href="${cleanHref}" target="_blank" rel="noopener noreferrer">${display}</a>`;
+        }
+        const noFrag = cleanHref.split("#")[0].split("?")[0];
+        if (noFrag.toLowerCase().endsWith(".md")) {
+          return `<a class="md-wikilink" data-wikilink="${noFrag}">${display}</a>`;
+        }
+        return full;
+      });
       out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
       out = out.replace(/\*([^*\n]+)\*/g, "<em>$1</em>");
       return out;
@@ -5989,13 +6043,50 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       mModal.classList.add("visible");
     }
 
+    function _resolveRelativeNotePath(currentNodeId, rawHref) {
+      let decoded = rawHref;
+      try {
+        decoded = decodeURIComponent(rawHref);
+      } catch (_e) {
+        decoded = rawHref;
+      }
+      decoded = decoded.replace(/\\/g, "/").trim();
+      if (decoded.startsWith("/")) {
+        return decoded.replace(/^\/+/, "");
+      }
+      const baseParts = String(currentNodeId || "").replace(/\\/g, "/").split("/");
+      baseParts.pop();
+      for (const seg of decoded.split("/")) {
+        if (!seg || seg === ".") continue;
+        if (seg === "..") {
+          if (baseParts.length > 0) baseParts.pop();
+        } else {
+          baseParts.push(seg);
+        }
+      }
+      return baseParts.join("/");
+    }
+
     function bindInspectorWikilinks(mdEl) {
       mdEl.querySelectorAll(".md-wikilink").forEach(linkEl => {
         linkEl.addEventListener("click", e => {
           e.preventDefault();
-          const rawTarget = (linkEl.getAttribute("data-wikilink") || "").toLowerCase();
+          const rawAttr = (linkEl.getAttribute("data-wikilink") || "").trim();
+          let decodedTarget = rawAttr;
+          try {
+            decodedTarget = decodeURIComponent(rawAttr);
+          } catch (_e) {
+            decodedTarget = rawAttr;
+          }
+          const rawTarget = decodedTarget.toLowerCase();
+          const relResolved = (
+            state.inspectedNode && rawAttr.toLowerCase().endsWith(".md")
+              ? _resolveRelativeNotePath(state.inspectedNode.id, rawAttr).toLowerCase()
+              : ""
+          );
           const baseTarget = rawTarget.split("/").pop().replace(/\.md$/, "");
           const resolvedId =
+            (relResolved && (nameLookup.get(relResolved) || nameLookup.get(relResolved.replace(/\.md$/, "")))) ||
             nameLookup.get(rawTarget) ||
             nameLookup.get(rawTarget.replace(/\.md$/, "")) ||
             nameLookup.get(baseTarget);
@@ -6974,8 +7065,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           <span class="stats-pill">${ceHits.length} patterns</span>
         </div>
       `;
+      const hasAnyCeNodes = allNodes.some(n => n.category === "ce-pattern");
       if (ceHits.length === 0) {
-        colCe.innerHTML += `<div style="color:var(--text-dim);font-size:12px;">No matching shared patterns.</div>`;
+        if (!hasAnyCeNodes) {
+          colCe.innerHTML += hasRemoteTier
+            ? `<div style="color:var(--text-dim);font-size:12px;line-height:1.5;">No local <code>shared-okf-patterns</code> clone detected yet.<br>Run <code>/vault-pull</code> to auto-clone <code>~/shared-okf-patterns</code>, or browse all 42 curated patterns live in <strong>Remote Tier</strong> (Column 3) with zero cloning.</div>`
+            : `<div style="color:var(--text-dim);font-size:12px;line-height:1.5;">No local <code>shared-okf-patterns</code> clone detected yet.<br>Run <code>/vault-pull --repo-url &lt;git-url&gt;</code> to sync shared team patterns.</div>`;
+        } else {
+          colCe.innerHTML += `<div style="color:var(--text-dim);font-size:12px;">No matching shared patterns.</div>`;
+        }
       } else {
         ceHits.forEach(({ n }) => {
           const card = document.createElement("div");

@@ -1,6 +1,6 @@
 # Knowledge Compiler (`knowledge-compiler`)
 
-[![Version](https://img.shields.io/badge/version-1.2.0-1A73E8?style=flat-square)](https://github.com/GoogleCloudPlatform/knowledge-compiler/releases)
+[![Version](https://img.shields.io/badge/version-1.3.0-1A73E8?style=flat-square)](https://github.com/GoogleCloudPlatform/knowledge-compiler/releases)
 [![CI](https://github.com/GoogleCloudPlatform/knowledge-compiler/actions/workflows/ci.yml/badge.svg)](https://github.com/GoogleCloudPlatform/knowledge-compiler/actions/workflows/ci.yml)
 [![OKF Standard](https://img.shields.io/badge/Open_Knowledge_Format-OKF_v0.3-34A853?style=flat-square)](https://github.com/open-knowledge-format/open-knowledge-format)
 [![License](https://img.shields.io/badge/license-Apache_2.0-FBBC04?style=flat-square)](LICENSE)
@@ -24,10 +24,10 @@ python3 -m pip install -e ".[extract]"
 ```
 
 ### 1. Explore the Included OKF v0.3 Starter Vault
-The repository includes a clean-room Google Cloud starter vault in [`examples/starter-vault/`](examples/starter-vault/index.md) compiling 2 `raw/` briefs into **21 OKF v0.3 wiki notes** across `wiki/sources/` (2), `wiki/entities/` (5), `wiki/concepts/` (7, including `status: deprecated` + `superseded_by` and an `Attested Computation`), `wiki/patterns/` (4), and `wiki/synthesis/` (3), complete with inline Mermaid `flowchart`/`sequenceDiagram`/`pie` diagrams and GFM tables:
+The repository includes a clean-room Google Cloud starter vault in [`examples/starter-vault/`](examples/starter-vault/index.md) compiling 2 `raw/` briefs into **21 OKF v0.3 wiki notes** across `wiki/sources/` (2), `wiki/entities/` (5), `wiki/concepts/` (7, including `status: deprecated` + `superseded_by` and an `Attested Computation`), `wiki/patterns/` (4), and `wiki/synthesis/` (3), complete with standard **OKF v0.3 relative Markdown links**, frontmatter-free `wiki/index.md` & `wiki/*/index.md` progressive-disclosure indexes (§8), namespaced `x-kc-*` epistemic extension keys (§4.1), inline Mermaid diagrams, and GFM tables (verified `0 errors, 0 warnings, 0 info` under the official OKF v0.3 `validate.py --strict`):
 
 ```bash
-# Audit strict OKF v0.3 conformance, links, and footnotes
+# Audit strict OKF v0.3 conformance, relative Markdown links, [[wikilinks]], and footnotes
 vault-lint examples/starter-vault --strict
 
 # Query with zero-index-file BM25 ranking
@@ -40,14 +40,17 @@ vault-graph examples/starter-vault
 ### 2. Initialize or Upgrade Your Own Vault
 
 ```bash
-# Scaffold a fresh OKF v0.3 Knowledge Vault
+# Scaffold a fresh OKF v0.3 Knowledge Vault (bundle root '.', compiled concepts in wiki/)
 vault-init --target ~/ObsidianVault
 
 # Extract a slide deck, PDF, or web page into raw/ (with SHA-256 caching)
 vault-extract /path/to/architecture-deck.pptx --vault ~/ObsidianVault
 
-# Already using an OKF v0.2 vault? Upgrade index.md, log.md, and bundle paths in one command
+# Upgrade an OKF v0.2 vault (index.md, log.md, bundle paths, x-kc-* keys, wiki/**/index.md)
 vault-lint ~/ObsidianVault --fix --migrate-v03
+
+# Optional: also convert Obsidian [[wikilinks]] to portable OKF v0.3 relative Markdown links
+vault-lint ~/ObsidianVault --fix --migrate-v03 --portable-links
 
 # Optional: install skills & opt-in lifecycle hooks for non-Marketplace setups
 kc-install-plugin
@@ -104,6 +107,7 @@ vault-hooks enable
 ## Hooks & Local Data Privacy
 
 - **100% Local Default Operation**: All compiled Markdown notes (`wiki/`, `index.md`, `log.md`), SHA-256 ingestion caches (`.ingest_cache.json`), and redacted error traces remain on your local filesystem.
+- **Verifiable Offline Guarantee**: Run `python3 -m unittest tests.test_v1_release_gates.TestV1ReleaseGates.test_gate1_offline_plane1_socket_blocked` to independently verify that `vault-init`, `vault-lint`, `vault-query`, `vault-correct`, and `vault-graph` succeed with `socket.socket` monkeypatched to raise on any network call.
 - **User-Initiated Network Calls Only**: Outbound HTTP requests occur only when you explicitly pass a web URL to `scripts/extract_source.py`, pass `--check-okf-upstream` to `scripts/vault_lint.py`, run `vault-sync-patterns share --open-pr`, or manually enable the opt-in Git `origin` sync hooks via `vault-hooks enable`.
 
 ---
@@ -120,7 +124,13 @@ vault-hooks enable
 
 ## Release History
 
-### **v1.2.0** (`Latest`)
+### **v1.3.0** (`Latest`)
+- **Full OKF v0.3 Interoperability (`vault-lint`, `vault-graph`, `vault-init`, `examples/starter-vault/`)**:
+  - **Portable Standard Relative Markdown Links (`--portable-links`)**: First-class validation, orphan/index tracking, BM25 excerpt unwrapping, and clickable WebGL Reader navigation for standard RFC 3986 `%20`-encoded relative Markdown links (`[Label](../dir/Note%20Name.md)`) alongside full backward compatibility for Obsidian `[[wikilinks]]`. Adds deterministic `vault-lint --fix --portable-links` conversion and upgrades `examples/starter-vault/` (434+ inter-note Markdown links, 0 prose wikilinks) so generic OKF consumers (`okf-consume`, `viz.html`, GitHub, and Obsidian) all see the complete graph.
+  - **Unambiguous OKF v0.3 Bundle Root (`.`) & Subdirectory Indexes (§8)**: Reports `"bundle_root": "."` and `"concepts_dir": "wiki"` in `vault-lint`, scaffolds frontmatter-free `wiki/index.md` on `vault-init`, and generates frontmatter-free `wiki/index.md` + `wiki/<subdir>/index.md` progressive-disclosure indexes in `examples/starter-vault/` and `--fix --migrate-v03`.
+  - **OKF v0.3 §4.1 Namespaced `x-kc-*` Epistemic Extensions**: Adopts `x-kc-corroborates`, `x-kc-complements`, `x-kc-extends`, `x-kc-contradicts`, and `x-kc-supersedes` as canonical v0.3 frontmatter keys (migrated automatically by `--fix --migrate-v03` while remaining 100% backward-compatible with legacy unprefixed keys). `examples/starter-vault/` passes the official OKF v0.3 `validate.py --strict` with **0 errors, 0 warnings, and 0 info**.
+
+### **v1.2.0**
 - **Native Open Knowledge Format (`OKF v0.3`) Support with Full `v0.2` Backward Compatibility**: Upgrades `scripts/okf.py`, `scripts/init_vault.py`, `scripts/vault_lint.py`, `scripts/vault_graph.py`, `scripts/sync_patterns.py`, and `scripts/hooks/auto_sync_vault.py` to conform to the [OKF v0.3 specification](https://github.com/open-knowledge-format/open-knowledge-format):
   - **Root Bundle Metadata & Reserved Files (§8, §9)**: Fresh vaults emit `okf_version: "0.3"` with `title`/`description` in root `index.md` and frontmatter-free `log.md` using newest-first `## YYYY-MM-DD` date headings (with union merge support for both `v0.3` and legacy `v0.2` logs).
   - **Verification Currency & Fail-Closed Staleness (§5.3, §5.5, §11.2)**: `derive_trust_tier()` ignores verifications older than `generated.at` (`stale_verification_notes` tracked in `vault-lint --json`), unparseable `stale_after` fails closed as stale, and `parse_iso_datetime(..., require_offset=True)` enforces RFC 3339 offsets (date-only values map to UTC midnight).

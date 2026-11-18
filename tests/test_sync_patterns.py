@@ -508,6 +508,134 @@ Prevents infinite LLM recursion loops.
         self.assertNotIn("raw-deck", shared_text)
         self.assertNotIn("local-log", shared_text)
 
+    def test_ensure_patterns_repo_auto_clones_fast_forwards_and_bootstraps_vault(self):
+        """Auto-clone from a git remote, bootstrap missing vault boilerplate, and fast-forward new commits."""
+        import subprocess
+
+        remote_repo = Path(self.test_dir) / "remote_patterns_src"
+        sync_patterns.init_patterns_repo(remote_repo, init_git=True)
+        subprocess.run(
+            ["git", "-C", str(remote_repo), "config", "user.email", "test@example.com"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(remote_repo), "config", "user.name", "Test User"],
+            check=True,
+            capture_output=True,
+        )
+        note1 = remote_repo / "wiki" / "concepts" / "Pattern One.md"
+        note1.write_text(
+            "---\ntitle: Pattern One\ntype: concept\nstatus: stable\nupdated: 2026-11-18\n---\n\n# Pattern One\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "-C", str(remote_repo), "add", "-A"], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(remote_repo), "commit", "-m", "Add Pattern One"],
+            check=True,
+            capture_output=True,
+        )
+
+        clone_target = Path(self.test_dir) / "auto_cloned_patterns"
+        ensured = sync_patterns.ensure_patterns_repo(
+            repo_dir=clone_target,
+            repo_url=str(remote_repo),
+            auto_clone=True,
+            pull_latest=True,
+        )
+        self.assertTrue(ensured["ok"], ensured)
+        self.assertTrue(ensured["cloned"])
+        self.assertTrue((clone_target / "wiki" / "concepts" / "Pattern One.md").is_file())
+
+        # Pull into a brand-new non-existent vault dir -> scaffolds boilerplate + pulls pattern
+        fresh_vault = Path(self.test_dir) / "BrandNewVault"
+        pull_res = sync_patterns.pull_patterns(Path(ensured["path"]), vault_root=fresh_vault)
+        self.assertEqual(pull_res["pulled_count"], 1)
+        self.assertTrue((fresh_vault / "index.md").is_file())
+        self.assertTrue((fresh_vault / "GEMINI.md").is_file())
+        self.assertTrue((fresh_vault / "log.md").is_file())
+        self.assertTrue((fresh_vault / "wiki" / "concepts" / "Pattern One.md").is_file())
+
+        # Add a second commit upstream and verify subsequent call fast-forwards
+        note2 = remote_repo / "wiki" / "patterns" / "Pattern Two.md"
+        note2.write_text(
+            "---\ntitle: Pattern Two\ntype: pattern\nstatus: stable\nupdated: 2026-11-18\n---\n\n# Pattern Two\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "-C", str(remote_repo), "add", "-A"], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(remote_repo), "commit", "-m", "Add Pattern Two"],
+            check=True,
+            capture_output=True,
+        )
+
+        ensured2 = sync_patterns.ensure_patterns_repo(
+            repo_dir=clone_target,
+            auto_clone=True,
+            pull_latest=True,
+        )
+        self.assertTrue(ensured2["ok"], ensured2)
+        self.assertFalse(ensured2["cloned"])
+        self.assertTrue(ensured2["updated_remote"])
+        self.assertTrue((clone_target / "wiki" / "patterns" / "Pattern Two.md").is_file())
+
+    def test_ensure_patterns_repo_dry_run_failure_and_url_validation(self):
+        """Verify dry-run never clones, missing dir fails loudly, bad URLs are rejected, and clone failure includes hint."""
+        missing_target = Path(self.test_dir) / "not_cloned_yet"
+        dry = sync_patterns.ensure_patterns_repo(
+            repo_dir=missing_target,
+            repo_url="https://example.invalid/org/patterns.git",
+            auto_clone=True,
+            dry_run=True,
+        )
+        self.assertFalse(dry["ok"])
+        self.assertTrue(dry.get("dry_run_missing"))
+        self.assertFalse(missing_target.exists())
+        self.assertTrue(dry.get("fallback_hint"))
+
+        with self.assertRaises(FileNotFoundError):
+            sync_patterns.pull_patterns(missing_target, vault_root=self.mock_vault)
+
+        with self.assertRaises(ValueError):
+            sync_patterns._validate_clone_repo_url("--upload-pack=evil")
+
+        with self.assertRaises(ValueError):
+            sync_patterns._validate_clone_repo_url("javascript:alert(1)")
+
+        failed = sync_patterns.ensure_patterns_repo(
+            repo_dir=missing_target,
+            repo_url="file:///nonexistent_okf_patterns_repo_xyz",
+            auto_clone=True,
+            dry_run=False,
+        )
+        self.assertFalse(failed["ok"])
+        self.assertTrue(failed.get("fallback_hint"))
+
+    def test_x_kc_epistemic_frontmatter_prunes_private_entities_and_paths(self):
+        """Verify x-kc-* frontmatter epistemic keys prune private wiki/entities/ paths (plain or percent-encoded)."""
+        note = (
+            "---\n"
+            "title: Shared Serverless Pattern\n"
+            "type: pattern\n"
+            "status: stable\n"
+            "x-kc-corroborates:\n"
+            '  - "/wiki/entities/Acme%20Corp.md"\n'
+            '  - "/wiki/concepts/Public%20Concept.md"\n'
+            "---\n\n"
+            "# Shared Serverless Pattern\n\n"
+            "Clean cloud pattern.\n"
+        )
+        sanitized, notes = sync_patterns.sanitize_markdown(
+            note,
+            vault_root=self.mock_vault,
+            custom_anonymizations={"Acme Corp": "Enterprise Retail Account"},
+            valid_shared_targets={"Public Concept", "wiki/concepts/Public Concept"},
+        )
+        self.assertNotIn("Acme", sanitized)
+        self.assertIn("x-kc-corroborates:", sanitized)
+        self.assertIn("/wiki/concepts/Public%20Concept.md", sanitized)
+        self.assertTrue(any("x-kc-corroborates" in n for n in notes))
+
 
 if __name__ == "__main__":
     unittest.main()

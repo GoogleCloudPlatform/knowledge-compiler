@@ -26,15 +26,15 @@ sources:
 generated:
   by: "knowledge-compiler/1.2.0"
   at: "2026-11-18T00:00:00Z"
-extends:
-  - "[[Cloud Run Serverless Containers]]"
-complements:
-  - "[[OpenTelemetry Trace Propagation Across Services]]"
+x-kc-extends:
+  - "/wiki/concepts/Cloud Run Serverless Containers.md"
+x-kc-complements:
+  - "/wiki/patterns/OpenTelemetry Trace Propagation Across Services.md"
 ---
 
 # Revision Traffic Splitting and Canary Rollback
 
-Every deployment to [[Cloud Run]] creates a new revision. This pattern releases that revision with no traffic, shifts a small share of requests to it, and moves forward only while health signals stay inside the service-level objective. Rolling back is a routing change, not a rebuild.
+Every deployment to [Cloud Run](../entities/Cloud%20Run.md) creates a new revision. This pattern releases that revision with no traffic, shifts a small share of requests to it, and moves forward only while health signals stay inside the service-level objective. Rolling back is a routing change, not a rebuild.
 
 ## Problem
 
@@ -56,7 +56,7 @@ flowchart TD
 
 - **Deploy dark**: Deploy with `--no-traffic` and a tag. The tag gives the revision its own URL, so it can be tested directly without serving production requests.[^run-rollouts]
 - **Shift a small share**: Assign a low percentage, for example 5 percent, to the tagged revision. Changing the split does not require a redeploy.[^run-rollouts]
-- **Hold at the gate**: Keep the split for a fixed observation window and compare the canary with the stable revision. The rollout in [[Event Analytics Design Brief Summary]] holds each step for 15 minutes and watches the error rate and the 95th percentile latency of the new revision.
+- **Hold at the gate**: Keep the split for a fixed observation window and compare the canary with the stable revision. The rollout in [Event Analytics Design Brief Summary](../sources/Event%20Analytics%20Design%20Brief%20Summary.md) holds each step for 15 minutes and watches the error rate and the 95th percentile latency of the new revision.
 - **Promote in steps**: Repeat the gate at each increment until the canary serves all traffic.
 - **Roll back by routing**: Send 100 percent of traffic to the previous revision by name. Requests already in flight are not dropped during the change.[^run-rollouts]
 
@@ -82,7 +82,7 @@ gcloud run services update-traffic events-ingest --to-revisions STABLE_REVISION=
 | Server error ratio | Request count for the `cloud_run_revision` resource, compared per revision[^run-monitoring] | The canary error ratio exceeds the stable revision by an agreed margin |
 | Latency | Request latencies for the same resource[^run-monitoring] | The canary 95th percentile crosses the objective |
 | Error budget | The service-level objective and its error budget in service monitoring[^slo-monitoring] | The budget is consumed faster than the agreed rate during the rollout |
-| Downstream pressure | Connection counts on [[Cloud SQL for PostgreSQL]] and backlog age on [[Cloud PubSub|Pub/Sub]] | Either grows only after the traffic shift |
+| Downstream pressure | Connection counts on [Cloud SQL for PostgreSQL](../entities/Cloud%20SQL%20for%20PostgreSQL.md) and backlog age on [Pub/Sub](../entities/Cloud%20PubSub.md) | Either grows only after the traffic shift |
 
 The margins and window lengths are team decisions derived from the service's own objective. They are not platform defaults.
 
@@ -92,15 +92,15 @@ Cloud Deploy can run the same sequence as a pipeline. Its canary strategy create
 
 ## Preconditions and Trade-offs
 
-- **Schema changes must be backward compatible**: Both revisions run at the same time against the same [[Cloud SQL for PostgreSQL]] database. Add columns first, switch readers and writers, and remove old columns in a later release.
-- **Handlers must be idempotent**: A request or event retried during a rollback may be handled by either revision. [[Idempotent Event Consumer and Dead-Letter Queue]] makes that safe.
+- **Schema changes must be backward compatible**: Both revisions run at the same time against the same [Cloud SQL for PostgreSQL](../entities/Cloud%20SQL%20for%20PostgreSQL.md) database. Add columns first, switch readers and writers, and remove old columns in a later release.
+- **Handlers must be idempotent**: A request or event retried during a rollback may be handled by either revision. [Idempotent Event Consumer and Dead-Letter Queue](Idempotent%20Event%20Consumer%20and%20Dead-Letter%20Queue.md) makes that safe.
 - **The split is per request**: One user can reach both revisions during a rollout, so responses must stay compatible. Session affinity changes how the split behaves and should be tested on purpose.[^run-rollouts]
 - **Low traffic weakens the signal**: A 5 percent share of a few requests per minute says little. Lengthen the window or drive synthetic requests at the tag URL.
-- **Traces need the revision name**: Record the `K_REVISION` environment variable as a resource attribute so canary spans can be filtered, as described in [[OpenTelemetry Trace Propagation Across Services]].
+- **Traces need the revision name**: Record the `K_REVISION` environment variable as a resource attribute so canary spans can be filtered, as described in [OpenTelemetry Trace Propagation Across Services](OpenTelemetry%20Trace%20Propagation%20Across%20Services.md).
 
 ## Related Notes
 
-- [[Cloud Run Serverless Containers]] explains revisions and request-driven scaling.
-- [[Event Analytics Design Brief Summary]] is the source of the four-step rollout used as the example here.
-- [[Cloud Run vs GKE Autopilot Decision Matrix]] compares this rollout model with Kubernetes rolling updates.
-- [[Production Readiness and Observability Checklist]] requires a tested rollback before launch.
+- [Cloud Run Serverless Containers](../concepts/Cloud%20Run%20Serverless%20Containers.md) explains revisions and request-driven scaling.
+- [Event Analytics Design Brief Summary](../sources/Event%20Analytics%20Design%20Brief%20Summary.md) is the source of the four-step rollout used as the example here.
+- [Cloud Run vs GKE Autopilot Decision Matrix](../synthesis/Cloud%20Run%20vs%20GKE%20Autopilot%20Decision%20Matrix.md) compares this rollout model with Kubernetes rolling updates.
+- [Production Readiness and Observability Checklist](../synthesis/Production%20Readiness%20and%20Observability%20Checklist.md) requires a tested rollback before launch.

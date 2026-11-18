@@ -37,10 +37,10 @@ sources:
 generated:
   by: "knowledge-compiler/1.2.0"
   at: "2026-11-18T00:00:00Z"
-complements:
-  - "[[BigQuery Partitioning and Clustering]]"
-  - "[[Partition Filter Enforcement Guardrail]]"
-  - "[[BigQuery Partition Pruning Check]]"
+x-kc-complements:
+  - "/wiki/concepts/BigQuery Partitioning and Clustering.md"
+  - "/wiki/patterns/Partition Filter Enforcement Guardrail.md"
+  - "/wiki/concepts/BigQuery Partition Pruning Check.md"
 ---
 
 # BigQuery
@@ -61,26 +61,26 @@ BigQuery is the analytical store in the design brief and the subject of the gove
 
 | Decision | Setting | Stated in |
 | :--- | :--- | :--- |
-| Partitioning | Daily, on `event_ts` | [[Event Analytics Design Brief Summary|Design brief]] |
-| Clustering | `tenant_id`, then `event_type` | [[Event Analytics Design Brief Summary|Design brief]] |
-| Ingestion | Storage Write API appends from the loader | [[Event Analytics Design Brief Summary|Design brief]] |
-| Partition filter | Required on every partitioned table in the `analytics` dataset | [[BigQuery Governance Notes Summary|Governance notes]] |
-| Retention | Raw event partitions expire after 400 days | [[BigQuery Governance Notes Summary|Governance notes]] |
-| Verification | Weekly pruning check over the last 7 days of jobs | [[BigQuery Governance Notes Summary|Governance notes]] |
+| Partitioning | Daily, on `event_ts` | [Design brief](../sources/Event%20Analytics%20Design%20Brief%20Summary.md) |
+| Clustering | `tenant_id`, then `event_type` | [Design brief](../sources/Event%20Analytics%20Design%20Brief%20Summary.md) |
+| Ingestion | Storage Write API appends from the loader | [Design brief](../sources/Event%20Analytics%20Design%20Brief%20Summary.md) |
+| Partition filter | Required on every partitioned table in the `analytics` dataset | [Governance notes](../sources/BigQuery%20Governance%20Notes%20Summary.md) |
+| Retention | Raw event partitions expire after 400 days | [Governance notes](../sources/BigQuery%20Governance%20Notes%20Summary.md) |
+| Verification | Weekly pruning check over the last 7 days of jobs | [Governance notes](../sources/BigQuery%20Governance%20Notes%20Summary.md) |
 
-Three notes build on this table layout. [[BigQuery Partitioning and Clustering]] explains it, [[Partition Filter Enforcement Guardrail]] enforces it, and [[BigQuery Partition Pruning Check]] measures whether queries benefit from it. The table it replaces is described in [[Legacy Unpartitioned Daily Batch Table]].
+Three notes build on this table layout. [BigQuery Partitioning and Clustering](../concepts/BigQuery%20Partitioning%20and%20Clustering.md) explains it, [Partition Filter Enforcement Guardrail](../patterns/Partition%20Filter%20Enforcement%20Guardrail.md) enforces it, and [BigQuery Partition Pruning Check](../concepts/BigQuery%20Partition%20Pruning%20Check.md) measures whether queries benefit from it. The table it replaces is described in [Legacy Unpartitioned Daily Batch Table](../concepts/Legacy%20Unpartitioned%20Daily%20Batch%20Table.md).
 
 ## Operating Notes
 
-- **Expect duplicates upstream**: Delivery into the events table is at-least-once. Consumers that need exact counts read through a view that keeps one row per `event_id`.[^design-brief] See [[Idempotent Event Consumer and Dead-Letter Queue]].
+- **Expect duplicates upstream**: Delivery into the events table is at-least-once. Consumers that need exact counts read through a view that keeps one row per `event_id`.[^design-brief] See [Idempotent Event Consumer and Dead-Letter Queue](../patterns/Idempotent%20Event%20Consumer%20and%20Dead-Letter%20Queue.md).
 - **Grant to groups, write as services**: Analysts read through group grants at dataset level, and only pipeline service accounts can write.[^governance-notes]
 - **Protect personal columns**: The governance notes put policy tags on user-level columns and row-level policies on tenant-facing reports.[^governance-notes]
 - **Label for attribution**: Datasets and query jobs carry `team`, `env`, and `data_domain` labels, so the job history can be grouped by owner.[^governance-notes]
-- **Know the upstream path**: Events reach BigQuery from [[Cloud PubSub|Pub/Sub]] through a loader on [[Cloud Run]]. See [[Event-Driven PubSub Pipelines]].
+- **Know the upstream path**: Events reach BigQuery from [Pub/Sub](Cloud%20PubSub.md) through a loader on [Cloud Run](Cloud%20Run.md). See [Event-Driven PubSub Pipelines](../concepts/Event-Driven%20PubSub%20Pipelines.md).
 
 ## Related Notes
 
-- Concepts: [[BigQuery Partitioning and Clustering]], [[BigQuery Partition Pruning Check]], [[Legacy Unpartitioned Daily Batch Table]]
-- Pattern: [[Partition Filter Enforcement Guardrail]]
-- Sources: [[BigQuery Governance Notes Summary]], [[Event Analytics Design Brief Summary]]
-- Synthesis: [[Google Cloud Serverless Analytics Reference]], [[Production Readiness and Observability Checklist]]
+- Concepts: [BigQuery Partitioning and Clustering](../concepts/BigQuery%20Partitioning%20and%20Clustering.md), [BigQuery Partition Pruning Check](../concepts/BigQuery%20Partition%20Pruning%20Check.md), [Legacy Unpartitioned Daily Batch Table](../concepts/Legacy%20Unpartitioned%20Daily%20Batch%20Table.md)
+- Pattern: [Partition Filter Enforcement Guardrail](../patterns/Partition%20Filter%20Enforcement%20Guardrail.md)
+- Sources: [BigQuery Governance Notes Summary](../sources/BigQuery%20Governance%20Notes%20Summary.md), [Event Analytics Design Brief Summary](../sources/Event%20Analytics%20Design%20Brief%20Summary.md)
+- Synthesis: [Google Cloud Serverless Analytics Reference](../synthesis/Google%20Cloud%20Serverless%20Analytics%20Reference.md), [Production Readiness and Observability Checklist](../synthesis/Production%20Readiness%20and%20Observability%20Checklist.md)

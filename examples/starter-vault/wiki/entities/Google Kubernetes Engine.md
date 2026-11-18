@@ -30,11 +30,11 @@ sources:
 generated:
   by: "knowledge-compiler/1.2.0"
   at: "2026-11-18T00:00:00Z"
-complements:
-  - "[[GKE Autopilot]]"
-  - "[[Cloud Run]]"
-extends:
-  - "[[Workload Identity Federation]]"
+x-kc-complements:
+  - "/wiki/concepts/GKE Autopilot.md"
+  - "/wiki/entities/Cloud Run.md"
+x-kc-extends:
+  - "/wiki/concepts/Workload Identity Federation.md"
 ---
 
 # Google Kubernetes Engine
@@ -50,34 +50,34 @@ extends:
 | Baseline configuration | Google's best practices applied by default | Chosen by the cluster operator |
 | Typical fit | Teams that want Kubernetes APIs without node operations | Workloads that need manual control of nodes |
 
-Autopilot is the recommended way to use GKE.[^gke-autopilot] The mode is covered in depth in [[GKE Autopilot]].
+Autopilot is the recommended way to use GKE.[^gke-autopilot] The mode is covered in depth in [GKE Autopilot](../concepts/GKE%20Autopilot.md).
 
 ## Key Capabilities
 
 - **Managed upgrades**: A cluster enrolls in a release channel (Rapid, Regular, Stable, or Extended) and receives Kubernetes versions at the pace that channel defines.[^gke-release-channels]
 - **Autoscaling on workload signals**: Horizontal Pod autoscaling changes the replica count in response to CPU, memory, custom metrics, or external metrics such as the backlog of a message subscription.[^gke-hpa]
-- **Keyless workload identity**: Workload Identity Federation for GKE lets IAM policies grant Kubernetes workloads access to Google Cloud APIs without service account key files. It applies the model in [[Workload Identity Federation]] to pods inside a cluster.[^gke-workload-identity]
+- **Keyless workload identity**: Workload Identity Federation for GKE lets IAM policies grant Kubernetes workloads access to Google Cloud APIs without service account key files. It applies the model in [Workload Identity Federation](../concepts/Workload%20Identity%20Federation.md) to pods inside a cluster.[^gke-workload-identity]
 - **Full Kubernetes surface**: Deployments, StatefulSets, Jobs, and custom resources work as they do on any Kubernetes cluster.[^gke-overview]
 
 ## Role in the Reference Architecture
 
-The design brief runs one component on GKE: the sessionizer, deployed to an Autopilot cluster.[^design-brief] Three properties moved it off [[Cloud Run]]:
+The design brief runs one component on GKE: the sessionizer, deployed to an Autopilot cluster.[^design-brief] Three properties moved it off [Cloud Run](Cloud%20Run.md):
 
 1. It holds open sessions in memory between messages.
-2. It keeps a long-lived streaming pull connection to [[Cloud PubSub|Pub/Sub]] and does not receive one HTTP request per message.
+2. It keeps a long-lived streaming pull connection to [Pub/Sub](Cloud%20PubSub.md) and does not receive one HTTP request per message.
 3. It scales on subscription backlog, not on request rate.
 
-The brief also records an open question: Cloud Run worker pools were not evaluated, and the decision should be revisited if they meet the same needs.[^design-brief] [[Cloud Run vs GKE Autopilot Decision Matrix]] compares the two runtimes criterion by criterion.
+The brief also records an open question: Cloud Run worker pools were not evaluated, and the decision should be revisited if they meet the same needs.[^design-brief] [Cloud Run vs GKE Autopilot Decision Matrix](../synthesis/Cloud%20Run%20vs%20GKE%20Autopilot%20Decision%20Matrix.md) compares the two runtimes criterion by criterion.
 
 ## Operating Notes
 
 - **Size from measurements**: In Autopilot mode you configure resource requests, not nodes, so requests that match real usage matter more than they do when spare node capacity hides a bad estimate.
-- **Shut down cleanly**: On a termination signal, a pull subscriber should stop receiving, finish in-flight messages, and acknowledge them. Anything left unacknowledged is delivered again. See [[Event-Driven PubSub Pipelines]] and [[Idempotent Event Consumer and Dead-Letter Queue]].
-- **Reach databases without keys**: Pods connect to [[Cloud SQL for PostgreSQL]] with their workload identity.
-- **Continue the trace**: Pull consumers read trace context from message attributes. See [[OpenTelemetry Trace Propagation Across Services]].
+- **Shut down cleanly**: On a termination signal, a pull subscriber should stop receiving, finish in-flight messages, and acknowledge them. Anything left unacknowledged is delivered again. See [Event-Driven PubSub Pipelines](../concepts/Event-Driven%20PubSub%20Pipelines.md) and [Idempotent Event Consumer and Dead-Letter Queue](../patterns/Idempotent%20Event%20Consumer%20and%20Dead-Letter%20Queue.md).
+- **Reach databases without keys**: Pods connect to [Cloud SQL for PostgreSQL](Cloud%20SQL%20for%20PostgreSQL.md) with their workload identity.
+- **Continue the trace**: Pull consumers read trace context from message attributes. See [OpenTelemetry Trace Propagation Across Services](../patterns/OpenTelemetry%20Trace%20Propagation%20Across%20Services.md).
 
 ## Related Notes
 
-- Concepts: [[GKE Autopilot]], [[Workload Identity Federation]]
-- Source: [[Event Analytics Design Brief Summary]]
-- Synthesis: [[Google Cloud Serverless Analytics Reference]], [[Production Readiness and Observability Checklist]]
+- Concepts: [GKE Autopilot](../concepts/GKE%20Autopilot.md), [Workload Identity Federation](../concepts/Workload%20Identity%20Federation.md)
+- Source: [Event Analytics Design Brief Summary](../sources/Event%20Analytics%20Design%20Brief%20Summary.md)
+- Synthesis: [Google Cloud Serverless Analytics Reference](../synthesis/Google%20Cloud%20Serverless%20Analytics%20Reference.md), [Production Readiness and Observability Checklist](../synthesis/Production%20Readiness%20and%20Observability%20Checklist.md)

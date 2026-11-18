@@ -55,11 +55,19 @@ The pull engine guarantees:
 
 ### 1. Preview Incoming Patterns (Dry-Run)
 ```bash
-python3 <plugin_dir>/scripts/sync_patterns.py pull --repo-dir "${OKF_PATTERNS_PATH:-$HOME/shared-okf-patterns}" --dry-run
+python3 <plugin_dir>/scripts/sync_patterns.py pull --dry-run
 ```
 
-### 2. Pull Patterns into Personal Vault
+### 2. Auto-Clone & Pull Patterns into Personal Vault
+If the shared patterns repository is not cloned locally yet, `sync_patterns.py pull` can clone it automatically via `--repo-url` (or `$OKF_PATTERNS_REPO_URL`, or the default configured team repository) and fast-forward it on subsequent runs:
+
 ```bash
-python3 <plugin_dir>/scripts/sync_patterns.py pull --repo-dir "${OKF_PATTERNS_PATH:-$HOME/shared-okf-patterns}" --vault ~/ObsidianVault
+python3 <plugin_dir>/scripts/sync_patterns.py pull --vault "${OBSIDIAN_VAULT_PATH:-$HOME/ObsidianVault}"
+```
+
+To point at an explicit shared Git repository URL or local directory:
+
+```bash
+python3 <plugin_dir>/scripts/sync_patterns.py pull --repo-url https://github.com/your-org/shared-okf-patterns.git --vault "${OBSIDIAN_VAULT_PATH:-$HOME/ObsidianVault}"
 ```
 

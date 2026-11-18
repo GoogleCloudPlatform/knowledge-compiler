@@ -38,17 +38,17 @@ sources:
 generated:
   by: "knowledge-compiler/1.2.0"
   at: "2026-11-18T00:00:00Z"
-complements:
-  - "[[Cloud Run Serverless Containers]]"
-  - "[[GKE Autopilot]]"
+x-kc-complements:
+  - "/wiki/concepts/Cloud Run Serverless Containers.md"
+  - "/wiki/concepts/GKE Autopilot.md"
 ---
 
 # Workload Identity Federation
 
 A service account key is a long-lived bearer credential: anyone who copies the JSON file can act as that service account until someone notices and revokes the key. Keyless authentication removes the file. Each workload proves who it is with a credential its platform already issues, and Google Cloud trades that credential for a short-lived access token.[^iam-key-practices]
 
-- **On Google Cloud Runtimes**: [[Cloud Run]] and similar platforms do this for you. The workload runs as an attached service account, and the metadata server issues its tokens.[^run-identity]
-- **Everywhere Else**: For [[Google Kubernetes Engine]] Pods and workloads outside Google Cloud, Workload Identity Federation does the trade. The workload presents a Kubernetes ServiceAccount token, an OIDC token, or a SAML assertion to the Security Token Service, which verifies it and returns a federated token under the OAuth 2.0 token exchange specification.[^iam-wif]
+- **On Google Cloud Runtimes**: [Cloud Run](../entities/Cloud%20Run.md) and similar platforms do this for you. The workload runs as an attached service account, and the metadata server issues its tokens.[^run-identity]
+- **Everywhere Else**: For [Google Kubernetes Engine](../entities/Google%20Kubernetes%20Engine.md) Pods and workloads outside Google Cloud, Workload Identity Federation does the trade. The workload presents a Kubernetes ServiceAccount token, an OIDC token, or a SAML assertion to the Security Token Service, which verifies it and returns a federated token under the OAuth 2.0 token exchange specification.[^iam-wif]
 
 ## How the Exchange Works
 
@@ -74,10 +74,10 @@ flowchart LR
 
 | Runtime | Keyless mechanism | Identity that IAM sees |
 | :--- | :--- | :--- |
-| [[Cloud Run]] service or job | Attached service account, tokens from the metadata server | The attached service account |
-| [[Google Kubernetes Engine]] Pod | Workload Identity Federation for GKE, enabled by default on [[GKE Autopilot]] | A principal for the Kubernetes ServiceAccount, or a service account it impersonates |
+| [Cloud Run](../entities/Cloud%20Run.md) service or job | Attached service account, tokens from the metadata server | The attached service account |
+| [Google Kubernetes Engine](../entities/Google%20Kubernetes%20Engine.md) Pod | Workload Identity Federation for GKE, enabled by default on [GKE Autopilot](GKE%20Autopilot.md) | A principal for the Kubernetes ServiceAccount, or a service account it impersonates |
 | CI/CD or on-premises job | Workload identity pool with an OIDC or SAML 2.0 provider | A federated principal built from mapped token attributes |
-| [[Cloud SQL for PostgreSQL]] login | Automatic IAM database authentication through the Cloud SQL Auth Proxy or a language connector | An IAM database user named after the service account |
+| [Cloud SQL for PostgreSQL](../entities/Cloud%20SQL%20for%20PostgreSQL.md) login | Automatic IAM database authentication through the Cloud SQL Auth Proxy or a language connector | An IAM database user named after the service account |
 
 - **Cloud Run**: Give each service and job its own user-managed service account instead of the Compute Engine default account, and never point `GOOGLE_APPLICATION_CREDENTIALS` at a key file. Client libraries request tokens from the instance metadata server automatically.[^run-identity]
 - **GKE**: Enabling the feature creates a fixed workload identity pool named `PROJECT_ID.svc.id.goog`. Grant roles to principals such as `principal://iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/PROJECT_ID.svc.id.goog/subject/ns/NAMESPACE/sa/KSA_NAME`. The GKE metadata server on every node intercepts credential requests from Pods and obtains tokens for the Pod's Kubernetes ServiceAccount rather than the node's service account.[^gke-wif]
@@ -96,10 +96,10 @@ Federation covers calls to Google Cloud APIs. For calls between workloads, manag
 
 ## Related Notes
 
-- [[Cloud Run]]
-- [[Google Kubernetes Engine]]
-- [[Cloud SQL for PostgreSQL]]
-- [[Cloud Run Serverless Containers]]
-- [[GKE Autopilot]]
-- [[Production Readiness and Observability Checklist]]
-- [[Event Analytics Design Brief Summary]]
+- [Cloud Run](../entities/Cloud%20Run.md)
+- [Google Kubernetes Engine](../entities/Google%20Kubernetes%20Engine.md)
+- [Cloud SQL for PostgreSQL](../entities/Cloud%20SQL%20for%20PostgreSQL.md)
+- [Cloud Run Serverless Containers](Cloud%20Run%20Serverless%20Containers.md)
+- [GKE Autopilot](GKE%20Autopilot.md)
+- [Production Readiness and Observability Checklist](../synthesis/Production%20Readiness%20and%20Observability%20Checklist.md)
+- [Event Analytics Design Brief Summary](../sources/Event%20Analytics%20Design%20Brief%20Summary.md)

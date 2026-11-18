@@ -33,10 +33,10 @@ sources:
 generated:
   by: "knowledge-compiler/1.2.0"
   at: "2026-11-18T00:00:00Z"
-complements:
-  - "[[Cloud Run Serverless Containers]]"
-  - "[[Revision Traffic Splitting and Canary Rollback]]"
-  - "[[Google Kubernetes Engine]]"
+x-kc-complements:
+  - "/wiki/concepts/Cloud Run Serverless Containers.md"
+  - "/wiki/patterns/Revision Traffic Splitting and Canary Rollback.md"
+  - "/wiki/entities/Google Kubernetes Engine.md"
 ---
 
 # Cloud Run
@@ -57,22 +57,22 @@ In the event analytics design brief, two of the three components run on Cloud Ru
 
 | Component | Trigger | Scales with | Related pattern |
 | :--- | :--- | :--- | :--- |
-| Ingest API | HTTPS requests from clients | Request concurrency | [[Revision Traffic Splitting and Canary Rollback|Canary rollout]] |
-| Loader | Push delivery from [[Cloud PubSub|Pub/Sub]] | Delivery rate | [[Idempotent Event Consumer and Dead-Letter Queue|Idempotent consumer]] |
+| Ingest API | HTTPS requests from clients | Request concurrency | [Canary rollout](../patterns/Revision%20Traffic%20Splitting%20and%20Canary%20Rollback.md) |
+| Loader | Push delivery from [Pub/Sub](Cloud%20PubSub.md) | Delivery rate | [Idempotent consumer](../patterns/Idempotent%20Event%20Consumer%20and%20Dead-Letter%20Queue.md) |
 
-The brief keeps two ingest instances warm during business hours and lets the service scale to zero overnight. The third component, a stateful sessionizer, runs on [[Google Kubernetes Engine]] instead. The brief's rule is to start on Cloud Run and move a component only when it needs something Cloud Run does not offer for that workload shape. [[Cloud Run vs GKE Autopilot Decision Matrix]] generalizes that rule.
+The brief keeps two ingest instances warm during business hours and lets the service scale to zero overnight. The third component, a stateful sessionizer, runs on [Google Kubernetes Engine](Google%20Kubernetes%20Engine.md) instead. The brief's rule is to start on Cloud Run and move a component only when it needs something Cloud Run does not offer for that workload shape. [Cloud Run vs GKE Autopilot Decision Matrix](../synthesis/Cloud%20Run%20vs%20GKE%20Autopilot%20Decision%20Matrix.md) generalizes that rule.
 
 ## Operating Notes
 
-- **Keep services stateless**: Idle instances can be removed at any time, so anything that must survive belongs in an external store such as [[Cloud SQL for PostgreSQL]] or [[BigQuery]].
+- **Keep services stateless**: Idle instances can be removed at any time, so anything that must survive belongs in an external store such as [Cloud SQL for PostgreSQL](Cloud%20SQL%20for%20PostgreSQL.md) or [BigQuery](BigQuery.md).
 - **Protect downstream limits**: Fast scale-out multiplies database connections. The brief caps the loader's maximum instance count and keeps a small connection pool per instance.[^design-brief]
-- **Acknowledge after the work is durable**: For push delivery, the HTTP status is the acknowledgement. Return success only once the write has succeeded. See [[Event-Driven PubSub Pipelines]].
-- **Roll out in steps**: The brief moves traffic to a new revision at 5, 25, 50, and 100 percent, with a hold at each step.[^design-brief] See [[Revision Traffic Splitting and Canary Rollback]].
-- **Continue the trace**: Pass the incoming trace context on every outbound call. See [[OpenTelemetry Trace Propagation Across Services]].
-- **Stay keyless**: The attached service identity is one case of the model described in [[Workload Identity Federation]].
+- **Acknowledge after the work is durable**: For push delivery, the HTTP status is the acknowledgement. Return success only once the write has succeeded. See [Event-Driven PubSub Pipelines](../concepts/Event-Driven%20PubSub%20Pipelines.md).
+- **Roll out in steps**: The brief moves traffic to a new revision at 5, 25, 50, and 100 percent, with a hold at each step.[^design-brief] See [Revision Traffic Splitting and Canary Rollback](../patterns/Revision%20Traffic%20Splitting%20and%20Canary%20Rollback.md).
+- **Continue the trace**: Pass the incoming trace context on every outbound call. See [OpenTelemetry Trace Propagation Across Services](../patterns/OpenTelemetry%20Trace%20Propagation%20Across%20Services.md).
+- **Stay keyless**: The attached service identity is one case of the model described in [Workload Identity Federation](../concepts/Workload%20Identity%20Federation.md).
 
 ## Related Notes
 
-- Concept: [[Cloud Run Serverless Containers]]
-- Source: [[Event Analytics Design Brief Summary]]
-- Synthesis: [[Google Cloud Serverless Analytics Reference]], [[Production Readiness and Observability Checklist]]
+- Concept: [Cloud Run Serverless Containers](../concepts/Cloud%20Run%20Serverless%20Containers.md)
+- Source: [Event Analytics Design Brief Summary](../sources/Event%20Analytics%20Design%20Brief%20Summary.md)
+- Synthesis: [Google Cloud Serverless Analytics Reference](../synthesis/Google%20Cloud%20Serverless%20Analytics%20Reference.md), [Production Readiness and Observability Checklist](../synthesis/Production%20Readiness%20and%20Observability%20Checklist.md)

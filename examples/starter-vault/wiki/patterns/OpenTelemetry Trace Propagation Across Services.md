@@ -41,14 +41,14 @@ sources:
 generated:
   by: "knowledge-compiler/1.2.0"
   at: "2026-11-18T00:00:00Z"
-complements:
-  - "[[Idempotent Event Consumer and Dead-Letter Queue]]"
-  - "[[Event-Driven PubSub Pipelines]]"
+x-kc-complements:
+  - "/wiki/patterns/Idempotent Event Consumer and Dead-Letter Queue.md"
+  - "/wiki/concepts/Event-Driven PubSub Pipelines.md"
 ---
 
 # OpenTelemetry Trace Propagation Across Services
 
-OpenTelemetry is a vendor-neutral framework for generating and exporting traces, metrics, and logs.[^otel-docs] This pattern uses it to carry one W3C `traceparent` context from the first HTTP request through [[Cloud Run]], across [[Cloud PubSub|Pub/Sub]], and into [[Cloud SQL for PostgreSQL]], so Cloud Trace can show the whole path of an event as one trace.[^cloud-trace-docs]
+OpenTelemetry is a vendor-neutral framework for generating and exporting traces, metrics, and logs.[^otel-docs] This pattern uses it to carry one W3C `traceparent` context from the first HTTP request through [Cloud Run](../entities/Cloud%20Run.md), across [Pub/Sub](../entities/Cloud%20PubSub.md), and into [Cloud SQL for PostgreSQL](../entities/Cloud%20SQL%20for%20PostgreSQL.md), so Cloud Trace can show the whole path of an event as one trace.[^cloud-trace-docs]
 
 ## Problem
 
@@ -88,10 +88,10 @@ sequenceDiagram
 
 | Hop | Carrier | Design rule |
 | :--- | :--- | :--- |
-| Client to [[Cloud Run]] | HTTP `traceparent` header | Server instrumentation extracts the context and starts a server span. Cloud Run also records its own request spans, sampled at no more than 0.1 requests per second for each instance.[^run-tracing] |
-| [[Cloud Run]] to [[Cloud PubSub|Pub/Sub]] | Message attribute | The publisher injects the context into a message attribute. Pub/Sub client libraries do this when tracing is enabled, using an attribute with the `googclient_` prefix.[^pubsub-otel-tracing] |
-| [[Cloud PubSub|Pub/Sub]] to consumer | Message attribute | The consumer extracts the creation context and starts a process span that links to it.[^otel-messaging-spans] |
-| Consumer to [[Cloud SQL for PostgreSQL|Cloud SQL]] | Client span and SQL comment | Database instrumentation starts a client span. Sqlcommenter adds `traceparent` to the statement as a comment, and query insights can then show the query inside the application trace.[^sql-query-insights] |
+| Client to [Cloud Run](../entities/Cloud%20Run.md) | HTTP `traceparent` header | Server instrumentation extracts the context and starts a server span. Cloud Run also records its own request spans, sampled at no more than 0.1 requests per second for each instance.[^run-tracing] |
+| [Cloud Run](../entities/Cloud%20Run.md) to [Pub/Sub](../entities/Cloud%20PubSub.md) | Message attribute | The publisher injects the context into a message attribute. Pub/Sub client libraries do this when tracing is enabled, using an attribute with the `googclient_` prefix.[^pubsub-otel-tracing] |
+| [Pub/Sub](../entities/Cloud%20PubSub.md) to consumer | Message attribute | The consumer extracts the creation context and starts a process span that links to it.[^otel-messaging-spans] |
+| Consumer to [Cloud SQL](../entities/Cloud%20SQL%20for%20PostgreSQL.md) | Client span and SQL comment | Database instrumentation starts a client span. Sqlcommenter adds `traceparent` to the statement as a comment, and query insights can then show the query inside the application trace.[^sql-query-insights] |
 | Every hop to logs | Structured log fields | Each service writes the trace and span identifiers into its log entries so they are linked to the trace.[^trace-log-link] |
 
 ## Parent or Link Across the Queue
@@ -100,7 +100,7 @@ The messaging conventions use span links as the default way to correlate produce
 
 - **Single-message handlers**: Use the creation context as the parent. The trace reads top to bottom from the HTTP request to the database write.
 - **Batch consumers**: Start one span for the batch and add a link for each message.
-- **Redeliveries**: Each delivery attempt starts a new process span tied to the same creation context. Retries and dead-lettering in [[Idempotent Event Consumer and Dead-Letter Queue]] then appear as repeated spans instead of disappearing.
+- **Redeliveries**: Each delivery attempt starts a new process span tied to the same creation context. Retries and dead-lettering in [Idempotent Event Consumer and Dead-Letter Queue](Idempotent%20Event%20Consumer%20and%20Dead-Letter%20Queue.md) then appear as repeated spans instead of disappearing.
 
 ## Sampling
 
@@ -111,8 +111,8 @@ The messaging conventions use span links as the default way to correlate produce
 ## Implementation Notes
 
 - **One propagator everywhere**: Configure W3C trace context in every service. Mixed propagators break the chain at the first boundary.
-- **Keyless export**: Exporters authenticate with the identity attached to the workload, which needs the Cloud Trace agent role.[^pubsub-otel-tracing] No key file is involved, in line with [[Workload Identity Federation]].
-- **Name the revision**: Add the service name and the Cloud Run revision as resource attributes so canary traffic can be compared in [[Revision Traffic Splitting and Canary Rollback]].
+- **Keyless export**: Exporters authenticate with the identity attached to the workload, which needs the Cloud Trace agent role.[^pubsub-otel-tracing] No key file is involved, in line with [Workload Identity Federation](../concepts/Workload%20Identity%20Federation.md).
+- **Name the revision**: Add the service name and the Cloud Run revision as resource attributes so canary traffic can be compared in [Revision Traffic Splitting and Canary Rollback](Revision%20Traffic%20Splitting%20and%20Canary%20Rollback.md).
 - **Keep payloads out**: Put identifiers in span attributes, never message bodies, credentials, or personal data.
 - **Test the chain**: Send one synthetic request and confirm that a single trace contains the server span, the publish span, the process span, and the database client span.
 
@@ -124,8 +124,8 @@ The messaging conventions use span links as the default way to correlate produce
 
 ## Related Notes
 
-- [[Event Analytics Design Brief Summary]] sets the goal this pattern meets: one trace from the client request to the warehouse write.
-- [[Event-Driven PubSub Pipelines]] describes the delivery paths that carry the context.
-- [[Idempotent Event Consumer and Dead-Letter Queue]] uses the trace to explain retries.
-- [[Revision Traffic Splitting and Canary Rollback]] uses per-revision traces as rollout evidence.
-- [[Production Readiness and Observability Checklist]] requires one end-to-end trace before launch.
+- [Event Analytics Design Brief Summary](../sources/Event%20Analytics%20Design%20Brief%20Summary.md) sets the goal this pattern meets: one trace from the client request to the warehouse write.
+- [Event-Driven PubSub Pipelines](../concepts/Event-Driven%20PubSub%20Pipelines.md) describes the delivery paths that carry the context.
+- [Idempotent Event Consumer and Dead-Letter Queue](Idempotent%20Event%20Consumer%20and%20Dead-Letter%20Queue.md) uses the trace to explain retries.
+- [Revision Traffic Splitting and Canary Rollback](Revision%20Traffic%20Splitting%20and%20Canary%20Rollback.md) uses per-revision traces as rollout evidence.
+- [Production Readiness and Observability Checklist](../synthesis/Production%20Readiness%20and%20Observability%20Checklist.md) requires one end-to-end trace before launch.

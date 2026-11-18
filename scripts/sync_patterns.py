@@ -157,6 +157,15 @@ try:
 except ImportError:  # pragma: no cover
     from . import okf  # type: ignore[import-not-found]
 
+_DEFAULT_PATTERNS_ENV_KEYS: Tuple[str, ...] = ("OKF_PATTERNS_PATH",)
+_DEFAULT_PATTERNS_DIR_NAMES: Tuple[str, ...] = ("shared-okf-patterns",)
+_DEFAULT_PATTERNS_CACHE_SUBDIRS: Tuple[str, ...] = ()
+_DEFAULT_PATTERNS_REPO_URL: str = ""
+_DEFAULT_PATTERNS_FALLBACK_HINT: str = (
+    "Pass --repo-dir <local-clone> or --repo-url <git-url> "
+    "(or set OKF_PATTERNS_PATH / OKF_PATTERNS_REPO_URL)."
+)
+
 HAS_1P_DLP_HASHES = False
 CUSTOMER_SHA256_ARCHETYPES: Dict[str, str] = {}
 _INTERNAL_1P_FORBIDDEN_REFS: list[str] = []
@@ -251,6 +260,11 @@ def load_custom_denylist(vault_root: Optional[Path] = None) -> Dict[str, str]:
     return merged
 
 EPISTEMIC_FRONTMATTER_KEYS = (
+    "x-kc-corroborates",
+    "x-kc-complements",
+    "x-kc-extends",
+    "x-kc-contradicts",
+    "x-kc-supersedes",
     "corroborates",
     "complements",
     "extends",
@@ -601,16 +615,17 @@ def is_private_frontmatter_item_block(
 ) -> bool:
     """Return True if a single-line or multi-line YAML sequence item references private vault paths or entities."""
     block_text = "\n".join(item_lines)
-    low = block_text.lower()
+    decoded_block = urllib.parse.unquote(block_text)
+    low = decoded_block.lower()
     if any(frag in low for frag in _PRIVATE_FM_ITEM_FRAGMENTS):
         return True
-    if LOCAL_PATH_REGEX.search(block_text):
+    if LOCAL_PATH_REGEX.search(decoded_block):
         return True
 
-    for wl_m in re.finditer(r"\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]", block_text):
-        wl_raw = wl_m.group(1).strip().lstrip("/")
-        wl_low = wl_raw.lower()
-        if wl_low.startswith(
+    def _is_private_target_ref(raw_ref: str) -> bool:
+        ref_raw = urllib.parse.unquote(raw_ref).strip().lstrip("/")
+        ref_low = ref_raw.lower()
+        if ref_low.startswith(
             (
                 "raw/",
                 "wiki/entities/",
@@ -623,24 +638,39 @@ def is_private_frontmatter_item_block(
             )
         ):
             return True
-        wl_stem = wl_raw.removesuffix(".md").split("/")[-1].strip()
-        if _lookup_archetype(wl_stem, archetypes, lower_archetypes):
+        ref_stem = ref_raw.removesuffix(".md").split("/")[-1].strip()
+        if _lookup_archetype(ref_stem, archetypes, lower_archetypes):
             return True
         if vault_root and (
-            (vault_root / "wiki" / "entities" / f"{wl_stem}.md").is_file()
-            or (vault_root / "wiki" / "synthesis" / f"{wl_stem}.md").is_file()
-            or (vault_root / "wiki" / "sources" / f"{wl_stem}.md").is_file()
+            (vault_root / "wiki" / "entities" / f"{ref_stem}.md").is_file()
+            or (vault_root / "wiki" / "synthesis" / f"{ref_stem}.md").is_file()
+            or (vault_root / "wiki" / "sources" / f"{ref_stem}.md").is_file()
         ):
             return True
         if (
             valid_targets is not None
-            and wl_stem not in valid_targets
-            and wl_raw.removesuffix(".md") not in valid_targets
+            and ref_stem not in valid_targets
+            and ref_raw.removesuffix(".md") not in valid_targets
         ):
             return True
+        return False
 
-    dehyphen_block = re.sub(r"[-_/]+", " ", block_text)
-    for variant in (block_text, dehyphen_block):
+    for wl_m in re.finditer(r"\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]", block_text):
+        if _is_private_target_ref(wl_m.group(1)):
+            return True
+
+    for md_m in re.finditer(r"(?<!!)\[[^\]\n]+\]\(([^)\s]+)\)", block_text):
+        href = md_m.group(1).strip()
+        if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", href) and href.split("#", 1)[0].lower().endswith(".md"):
+            if _is_private_target_ref(href.split("#", 1)[0]):
+                return True
+
+    for path_m in re.finditer(r"['\"]?(/wiki/[^'\"\n]+\.md)['\"]?", decoded_block, re.IGNORECASE):
+        if _is_private_target_ref(path_m.group(1)):
+            return True
+
+    dehyphen_block = re.sub(r"[-_/]+", " ", decoded_block)
+    for variant in (decoded_block, dehyphen_block):
         if scan_sha256_entities_in_text(variant):
             return True
         for cust_name in archetypes:
@@ -1998,6 +2028,210 @@ def _extract_updated_date(text: str) -> str:
     return m.group(1) if m else ""
 
 
+_ALLOWED_CLONE_URL_PREFIXES: Tuple[str, ...] = (
+    "https://",
+    "ssh://",
+    "git@",
+    "file://",
+)
+
+
+def _validate_clone_repo_url(repo_url: str) -> str:
+    """Validate a git remote URL or local bare/git directory path against option injection."""
+    cleaned = str(repo_url or "").strip()
+    if not cleaned:
+        raise ValueError("Shared patterns repository URL cannot be empty.")
+    if cleaned.startswith("-"):
+        raise ValueError(f"Invalid repository URL (leading dash rejected): {cleaned!r}")
+    if any(cleaned.startswith(pfx) for pfx in _ALLOWED_CLONE_URL_PREFIXES):
+        return cleaned
+    candidate = Path(cleaned).expanduser()
+    if candidate.exists() and candidate.is_dir():
+        return str(candidate.resolve())
+    raise ValueError(
+        f"Unsupported shared patterns repository URL scheme: {cleaned!r}. "
+        "Use https://, ssh://, git@, file://, or an existing local git directory."
+    )
+
+
+def resolve_patterns_repo_dir(
+    explicit_dir: Optional[str | Path] = None,
+    vault_root: Optional[Path] = None,
+) -> Optional[Path]:
+    """Return the first existing local shared patterns repository clone, or None."""
+    if explicit_dir is not None and str(explicit_dir).strip():
+        cand = Path(explicit_dir).expanduser().resolve()
+        return cand if cand.exists() else None
+
+    candidates: List[Path] = []
+    for env_key in _DEFAULT_PATTERNS_ENV_KEYS:
+        env_val = (os.environ.get(env_key) or "").strip()
+        if env_val:
+            candidates.append(Path(env_val).expanduser())
+
+    home = Path.home()
+    for dir_name in _DEFAULT_PATTERNS_DIR_NAMES:
+        candidates.append(home / dir_name)
+        if vault_root is not None:
+            candidates.append(vault_root.parent / dir_name)
+        candidates.append(home / ".cache" / "knowledge-compiler" / dir_name)
+    for cache_sub in _DEFAULT_PATTERNS_CACHE_SUBDIRS:
+        candidates.append(home / cache_sub)
+
+    seen: Set[str] = set()
+    for cand in candidates:
+        key = str(cand)
+        if key in seen:
+            continue
+        seen.add(key)
+        if cand.exists() and cand.is_dir():
+            return cand.resolve()
+    return None
+
+
+def default_patterns_clone_target(explicit_dir: Optional[str | Path] = None) -> Path:
+    """Return the canonical local directory where the shared patterns repo should be cloned."""
+    if explicit_dir is not None and str(explicit_dir).strip():
+        return Path(explicit_dir).expanduser().resolve()
+    for env_key in _DEFAULT_PATTERNS_ENV_KEYS:
+        env_val = (os.environ.get(env_key) or "").strip()
+        if env_val:
+            return Path(env_val).expanduser().resolve()
+    return (Path.home() / _DEFAULT_PATTERNS_DIR_NAMES[0]).resolve()
+
+
+def ensure_patterns_repo(
+    repo_dir: Optional[str | Path] = None,
+    repo_url: Optional[str] = None,
+    vault_root: Optional[Path] = None,
+    auto_clone: bool = True,
+    pull_latest: bool = True,
+    dry_run: bool = False,
+    timeout_sec: int = 30,
+) -> Dict:
+    """Locate, optionally auto-clone, and fast-forward the shared patterns repository.
+
+    Never prompts interactively for git credentials (`GIT_TERMINAL_PROMPT=0`), and never
+    mutates disk when `dry_run=True`.
+    """
+    existing = resolve_patterns_repo_dir(repo_dir, vault_root=vault_root)
+    git_env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+
+    if existing is not None:
+        result: Dict = {
+            "ok": True,
+            "path": existing,
+            "cloned": False,
+            "updated_remote": False,
+            "warning": "",
+            "fallback_hint": _DEFAULT_PATTERNS_FALLBACK_HINT,
+        }
+        if pull_latest and not dry_run and (existing / ".git").exists():
+            try:
+                proc = subprocess.run(
+                    ["git", "-C", str(existing), "pull", "--ff-only"],
+                    capture_output=True,
+                    text=True,
+                    env=git_env,
+                    timeout=timeout_sec,
+                    check=False,
+                )
+                if proc.returncode == 0:
+                    result["updated_remote"] = True
+                else:
+                    err_txt = (proc.stderr or proc.stdout or "").strip().splitlines()
+                    result["warning"] = (
+                        f"Skipped upstream git pull ({err_txt[-1] if err_txt else 'non-zero exit'}); "
+                        "using existing local clone."
+                    )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                result["warning"] = (
+                    f"Skipped upstream git pull ({exc}); using existing local clone."
+                )
+        return result
+
+    clone_target = default_patterns_clone_target(repo_dir)
+    resolved_url = (
+        (repo_url or "").strip()
+        or (os.environ.get("OKF_PATTERNS_REPO_URL") or "").strip()
+        or _DEFAULT_PATTERNS_REPO_URL
+    )
+
+    if dry_run:
+        return {
+            "ok": False,
+            "dry_run_missing": True,
+            "path": clone_target,
+            "repo_url": resolved_url,
+            "cloned": False,
+            "error": f"Shared patterns repository is not cloned at {clone_target} yet.",
+            "fallback_hint": _DEFAULT_PATTERNS_FALLBACK_HINT,
+        }
+
+    if not auto_clone:
+        return {
+            "ok": False,
+            "path": clone_target,
+            "repo_url": resolved_url,
+            "cloned": False,
+            "error": f"Shared patterns repository not found at {clone_target} (auto-clone disabled).",
+            "fallback_hint": _DEFAULT_PATTERNS_FALLBACK_HINT,
+        }
+
+    if not resolved_url:
+        return {
+            "ok": False,
+            "path": clone_target,
+            "repo_url": "",
+            "cloned": False,
+            "error": "Shared patterns repository not found locally and no --repo-url was configured.",
+            "fallback_hint": _DEFAULT_PATTERNS_FALLBACK_HINT,
+        }
+
+    safe_url = _validate_clone_repo_url(resolved_url)
+    clone_target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        proc = subprocess.run(
+            ["git", "clone", "--depth", "1", "--", safe_url, str(clone_target)],
+            capture_output=True,
+            text=True,
+            env=git_env,
+            timeout=timeout_sec,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {
+            "ok": False,
+            "path": clone_target,
+            "repo_url": safe_url,
+            "cloned": False,
+            "error": f"Auto-clone of {safe_url} failed: {exc}",
+            "fallback_hint": _DEFAULT_PATTERNS_FALLBACK_HINT,
+        }
+
+    if proc.returncode != 0:
+        err_lines = (proc.stderr or proc.stdout or "").strip().splitlines()
+        detail = err_lines[-1] if err_lines else f"git clone exited with code {proc.returncode}"
+        return {
+            "ok": False,
+            "path": clone_target,
+            "repo_url": safe_url,
+            "cloned": False,
+            "error": f"Could not auto-clone {safe_url} into {clone_target}: {detail}",
+            "fallback_hint": _DEFAULT_PATTERNS_FALLBACK_HINT,
+        }
+
+    return {
+        "ok": True,
+        "path": clone_target.resolve(),
+        "repo_url": safe_url,
+        "cloned": True,
+        "updated_remote": True,
+        "warning": "",
+        "fallback_hint": _DEFAULT_PATTERNS_FALLBACK_HINT,
+    }
+
+
 def pull_patterns(
     source_repo_path: Path,
     vault_root: Optional[Path] = None,
@@ -2010,8 +2244,20 @@ def pull_patterns(
     existing local notes unless the shared pattern has a strictly newer `updated:`
     frontmatter date (or `overwrite=True` is explicitly passed).
     """
+    if not source_repo_path.exists() or not source_repo_path.is_dir():
+        raise FileNotFoundError(
+            f"Shared patterns repository directory does not exist: {source_repo_path}"
+        )
+
     if vault_root is None:
         vault_root = find_vault_root()
+
+    if not dry_run and not vault_root.exists():
+        try:
+            import init_vault as _init_vault_mod  # type: ignore[import-not-found]
+            _init_vault_mod.init_vault(vault_root)
+        except Exception:
+            vault_root.mkdir(parents=True, exist_ok=True)
 
     pulled_files = []
     skipped_up_to_date = []
@@ -2404,7 +2650,22 @@ def main():
         "--patterns-repo",
         dest="repo_dir",
         default=None,
-        help="Local directory of the shared patterns clone.",
+        help="Local directory of the shared patterns clone (auto-resolved or auto-cloned if omitted).",
+    )
+    p_pull.add_argument(
+        "--repo-url",
+        default=None,
+        help="Optional Git URL to auto-clone if the shared patterns repository is not present locally.",
+    )
+    p_pull.add_argument(
+        "--no-auto-clone",
+        action="store_true",
+        help="Disable automatic git clone when the shared patterns repository is not found locally.",
+    )
+    p_pull.add_argument(
+        "--no-git-pull",
+        action="store_true",
+        help="Skip running `git pull --ff-only` on an existing local shared patterns clone.",
     )
     p_pull.add_argument(
         "--overwrite",
@@ -2515,24 +2776,12 @@ def main():
                 print(sanitized)
 
         elif args.command == "share":
-            target_dir = Path(args.repo_dir).resolve() if args.repo_dir else None
-
-            if not target_dir:
-                env_pat = os.environ.get("OKF_PATTERNS_PATH")
-                candidate_dirs = [
-                    Path(env_pat).expanduser() if env_pat else None,
-                    Path.home() / "shared-okf-patterns",
-                    (v_root.parent / "shared-okf-patterns") if v_root else None,
-                    Path.home() / ".cache" / "knowledge-compiler" / "shared-okf-patterns",
-                ]
-                for cand in candidate_dirs:
-                    if cand and cand.exists():
-                        target_dir = cand.resolve()
-                        break
+            target_dir = resolve_patterns_repo_dir(args.repo_dir, vault_root=v_root)
 
             if not target_dir:
                 print(
-                    "❌ Target patterns repository directory not specified. Use --repo-dir or set OKF_PATTERNS_PATH.",
+                    "❌ Target patterns repository directory not found. "
+                    f"{_DEFAULT_PATTERNS_FALLBACK_HINT}",
                     file=sys.stderr,
                 )
                 sys.exit(1)
@@ -2606,26 +2855,35 @@ def main():
                         print(f"   - {n}")
 
         elif args.command == "pull":
-            source_dir = Path(args.repo_dir).resolve() if args.repo_dir else None
-            if not source_dir:
-                env_pat = os.environ.get("OKF_PATTERNS_PATH")
-                candidate_dirs = [
-                    Path(env_pat).expanduser() if env_pat else None,
-                    Path.home() / "shared-okf-patterns",
-                    (v_root.parent / "shared-okf-patterns") if v_root else None,
-                    Path.home() / ".cache" / "knowledge-compiler" / "shared-okf-patterns",
-                ]
-                for cand in candidate_dirs:
-                    if cand and cand.exists():
-                        source_dir = cand.resolve()
-                        break
-
-            if not source_dir:
-                print(
-                    "❌ Source patterns repository directory not specified. Use --repo-dir.",
-                    file=sys.stderr,
-                )
+            ensured = ensure_patterns_repo(
+                repo_dir=args.repo_dir,
+                repo_url=args.repo_url,
+                vault_root=v_root,
+                auto_clone=not args.no_auto_clone,
+                pull_latest=not args.no_git_pull,
+                dry_run=args.dry_run,
+            )
+            if not ensured["ok"]:
+                if ensured.get("dry_run_missing"):
+                    print(f"ℹ️ {ensured['error']}")
+                    if ensured.get("repo_url"):
+                        print(
+                            f"   Run without --dry-run to auto-clone from {ensured['repo_url']} "
+                            f"into {ensured['path']}."
+                        )
+                    if ensured.get("fallback_hint"):
+                        print(f"   {ensured['fallback_hint']}")
+                    return
+                print(f"❌ {ensured['error']}", file=sys.stderr)
+                if ensured.get("fallback_hint"):
+                    print(f"ℹ️ {ensured['fallback_hint']}", file=sys.stderr)
                 sys.exit(1)
+
+            source_dir = Path(ensured["path"])
+            if ensured.get("cloned"):
+                print(f"📥 Auto-cloned shared patterns repository into {source_dir}")
+            elif ensured.get("warning"):
+                print(f"⚠️ {ensured['warning']}", file=sys.stderr)
 
             res = pull_patterns(
                 source_dir,
@@ -2648,7 +2906,7 @@ def main():
     except SecurityException as e:
         print(f"🚨 Security Violation: {e}", file=sys.stderr)
         sys.exit(1)
-    except ValueError as e:
+    except (ValueError, FileNotFoundError) as e:
         print(f"❌ Error: {e}", file=sys.stderr)
         sys.exit(1)
 
