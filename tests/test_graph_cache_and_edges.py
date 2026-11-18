@@ -2041,6 +2041,492 @@ vm.runInContext(appScript, vmCtx);
         # 6. Unsupported gantt gracefully falls back to <pre>
         self.assertIn('<pre class="md-mermaid-fallback"><code>gantt', md_html)
 
+    def test_okf_v03_superseded_by_graph_edge(self) -> None:
+        """OKF v0.3 `superseded_by` frontmatter path field emits a SUPERSEDES graph edge."""
+        vault = self._tmp_dir / "SupersededEdgeVault"
+        init_vault.init_vault(vault, quiet=True)
+        self._create_note(
+            vault,
+            "wiki/concepts/Replacement.md",
+            "---\ntitle: Replacement\ntype: concept\nstatus: stable\n---\n# Replacement\n",
+        )
+        self._create_note(
+            vault,
+            "wiki/concepts/Legacy.md",
+            "---\n"
+            "title: Legacy\n"
+            "type: concept\n"
+            "status: deprecated\n"
+            "superseded_by: /wiki/concepts/Replacement.md\n"
+            "---\n"
+            "# Legacy\n",
+        )
+        graph = vault_graph.build_vault_graph(vault, ce_patterns_root=self._patterns_dir)
+        edge_map = {(e["source"], e["target"]): e["type"] for e in graph["edges"]}
+        self.assertEqual(
+            edge_map.get(("wiki/concepts/Legacy.md", "wiki/concepts/Replacement.md")),
+            "SUPERSEDES",
+        )
+
+    def test_fresh_init_vault_relative_markdown_links_and_starter_flag(self) -> None:
+        """Fresh init_vault links all 5 anchors via relative Markdown links with 0 orphans and sets isStarterVault."""
+        vault = self._tmp_dir / "FreshStarterVault"
+        init_vault.init_vault(vault, quiet=True)
+        graph = vault_graph.build_vault_graph(
+            vault,
+            ce_patterns_root=self._patterns_dir,
+            has_sample_vault=True,
+        )
+        self.assertTrue(graph["isStarterVault"])
+        self.assertTrue(graph["hasSampleVault"])
+        self.assertFalse(graph["isSampleMode"])
+        self.assertEqual(graph["stats"]["orphanNotes"], 0)
+        edge_pairs = {(e["source"], e["target"]) for e in graph["edges"]}
+        self.assertIn(("index.md", "purpose.md"), edge_pairs)
+        self.assertIn(("index.md", "wiki/skill-impact.md"), edge_pairs)
+        self.assertIn(("index.md", "GEMINI.md"), edge_pairs)
+        self.assertIn(("index.md", "log.md"), edge_pairs)
+
+        # Adding one real concept note flips isStarterVault to False and ignores external/escaped links
+        self._create_note(
+            vault,
+            "wiki/concepts/FirstNote.md",
+            "---\ntitle: First Note\ntype: concept\nstatus: stable\n---\n"
+            "See [Purpose](../purpose.md), [Web](https://example.com/a.md), "
+            "[Escape](../../../etc/passwd.md), and `[Ignored](../log.md)`.\n"
+            "```markdown\n[Fenced](../GEMINI.md)\n```\n",
+        )
+        graph2 = vault_graph.build_vault_graph(
+            vault,
+            ce_patterns_root=self._patterns_dir,
+            has_sample_vault=True,
+        )
+        self.assertFalse(graph2["isStarterVault"])
+        edge_pairs2 = {(e["source"], e["target"]) for e in graph2["edges"]}
+        self.assertIn(("wiki/concepts/FirstNote.md", "purpose.md"), edge_pairs2)
+        self.assertNotIn(("wiki/concepts/FirstNote.md", "log.md"), edge_pairs2)
+        self.assertNotIn(("wiki/concepts/FirstNote.md", "GEMINI.md"), edge_pairs2)
+
+    def test_remote_tier_hierarchy_edges_connect_empty_vault_constellation(self) -> None:
+        """Multi-tier remote nodes link L3 -> L2 -> L1 -> L0 even when the user's vault has zero concepts."""
+        vault = self._tmp_dir / "RemoteHierarchyVault"
+        init_vault.init_vault(vault, quiet=True)
+        fake_remote_nodes = [
+            {
+                "id": "remote://l3/root-golden",
+                "concept_uid": "cid_l3_001",
+                "label": "[L3] Enterprise Agent Golden Path",
+                "tier": "L3",
+                "source_tier": "tier_1",
+                "maturity_score": 0.96,
+                "products": ["Cloud Run", "Vertex AI"],
+                "tags": ["agents"],
+                "excerpt": "L3 root synthesis",
+                "markdown": "# L3 Root",
+                "epistemic_edges": [],
+            },
+            {
+                "id": "remote://l2/cluster-agents",
+                "concept_uid": "cid_l2_001",
+                "label": "[L2] Agent Runtime Cluster",
+                "tier": "L2",
+                "source_tier": "tier_1",
+                "maturity_score": 0.92,
+                "products": ["Cloud Run"],
+                "tags": ["agents"],
+                "excerpt": "L2 cluster",
+                "markdown": "# L2 Cluster",
+                "epistemic_edges": [],
+            },
+            {
+                "id": "remote://l1/product-cloud-run",
+                "concept_uid": "cid_l1_001",
+                "label": "[L1] Product Slice: Cloud Run",
+                "tier": "L1",
+                "source_tier": "tier_1",
+                "maturity_score": 0.90,
+                "products": ["Cloud Run"],
+                "tags": ["serverless"],
+                "excerpt": "L1 slice",
+                "markdown": "# L1 Cloud Run",
+                "epistemic_edges": [],
+            },
+            {
+                "id": "remote://l0/cloud-run-sidecar",
+                "concept_uid": "cid_l0_001",
+                "label": "[L0] Cloud Run Sidecar Auth",
+                "tier": "L0",
+                "source_tier": "tier_2",
+                "maturity_score": 0.85,
+                "products": ["Cloud Run"],
+                "tags": ["serverless"],
+                "excerpt": "L0 concept",
+                "markdown": "# L0 Concept",
+                "epistemic_edges": [],
+            },
+        ]
+        with mock.patch.object(
+            vault_graph,
+            _DISCOVER_REMOTE_FN_NAME,
+            return_value=fake_remote_nodes,
+        ):
+            graph = vault_graph.build_vault_graph(
+                vault,
+                ce_patterns_root=self._patterns_dir,
+                **{_REMOTE_PARAM_NAME: True},
+            )
+        remote_nodes = [n for n in graph["nodes"] if n["group"] == _REMOTE_GROUP_KEY]
+        self.assertEqual(len(remote_nodes), 4)
+        self.assertTrue(all(n["degree"] > 0 for n in remote_nodes))
+        edge_map = {(e["source"], e["target"]): e["type"] for e in graph["edges"]}
+        self.assertEqual(
+            edge_map.get(("remote://l3/root-golden", "remote://l2/cluster-agents")),
+            "EXTENDS",
+        )
+        self.assertEqual(
+            edge_map.get(("remote://l2/cluster-agents", "remote://l1/product-cloud-run")),
+            "COMPLEMENTS",
+        )
+        self.assertEqual(
+            edge_map.get(("remote://l0/cloud-run-sidecar", "remote://l1/product-cloud-run")),
+            "CORROBORATES",
+        )
+
+    def test_sample_vault_readonly_http_endpoints_and_ui_onboarding_switch(self) -> None:
+        """Live server exposes read-only /api/graph?source=sample and /api/note?source=sample without mutating user vault."""
+        sample_root = vault_graph.resolve_sample_vault_root()
+        if sample_root is None:
+            self.skipTest("Bundled examples/starter-vault not found")
+
+        vault = self._tmp_dir / "FirstRunUserVault"
+        init_vault.init_vault(vault, quiet=True)
+        before_files = sorted(p.relative_to(vault).as_posix() for p in vault.rglob("*") if p.is_file())
+
+        tok = "tok_sample_preview_guard_0123456789abcdef"
+        handler_cls = vault_graph.create_graph_request_handler(
+            vault_root=vault,
+            port=0,
+            sidecar_mode=True,
+            ui_token=tok,
+            cache=vault_graph.VaultGraphCache(max_entries=6),
+        )
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            # 1. Unauthenticated /api/graph?source=sample is rejected (401 in sidecar mode)
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            conn.request("GET", "/api/graph?source=sample&slim=1")
+            unauth = conn.getresponse()
+            unauth.read()
+            self.assertEqual(unauth.status, 401)
+
+            headers = {"X-Sidecar-Token": tok, "X-KC-Request": "1"}
+            # 2. Initial HTML reflects fresh starter vault with sample toggle available
+            conn.request("GET", "/", headers=headers)
+            resp_html = conn.getresponse()
+            html_doc = resp_html.read().decode("utf-8")
+            self.assertEqual(resp_html.status, 200)
+            self.assertIn('"isStarterVault": true', html_doc)
+            self.assertIn('"hasSampleVault": true', html_doc)
+            self.assertIn('id="onboarding-card"', html_doc)
+            self.assertIn('id="btn-toggle-sample"', html_doc)
+
+            # 3. GET /api/graph?source=sample&slim=1 returns 26-node, 257-edge clean-room sample vault
+            conn.request("GET", "/api/graph?source=sample&slim=1", headers=headers)
+            resp_sample = conn.getresponse()
+            sample_payload = json.loads(resp_sample.read().decode("utf-8"))
+            self.assertEqual(resp_sample.status, 200)
+            self.assertTrue(sample_payload["isSampleMode"])
+            self.assertFalse(sample_payload["isStarterVault"])
+            self.assertGreaterEqual(len(sample_payload["nodes"]), 26)
+            self.assertGreaterEqual(sample_payload["stats"]["totalEdges"], 250)
+            self.assertEqual(sample_payload["stats"]["orphanNotes"], 0)
+            self.assertTrue(all(n.get("lazyMarkdown") for n in sample_payload["nodes"]))
+
+            # 4. GET /api/note?source=sample&id=... returns full Markdown including Mermaid block
+            showcase_id = "wiki/synthesis/Google Cloud Serverless Analytics Reference.md"
+            conn.request(
+                "GET",
+                f"/api/note?id={vault_graph.urllib.parse.quote(showcase_id)}&source=sample",
+                headers=headers,
+            )
+            resp_note = conn.getresponse()
+            note_payload = json.loads(resp_note.read().decode("utf-8"))
+            self.assertEqual(resp_note.status, 200)
+            self.assertEqual(note_payload["id"], showcase_id)
+            self.assertIn("```mermaid", note_payload["markdown"])
+
+            # 5. GET /api/graph?source=vault&slim=1 returns the user's untouched 5-node vault
+            conn.request("GET", "/api/graph?source=vault&slim=1", headers=headers)
+            resp_user = conn.getresponse()
+            user_payload = json.loads(resp_user.read().decode("utf-8"))
+            self.assertEqual(resp_user.status, 200)
+            self.assertFalse(user_payload["isSampleMode"])
+            self.assertTrue(user_payload["isStarterVault"])
+            self.assertEqual(len(user_payload["nodes"]), 5)
+            conn.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        # Verify zero files were written into the user's personal vault
+        after_files = sorted(p.relative_to(vault).as_posix() for p in vault.rglob("*") if p.is_file())
+        self.assertEqual(before_files, after_files)
+
+        # 6. Browser DOM VM verification of onboarding card -> Sample Vault -> Back to My Vault
+        node_bin = _find_node_binary()
+        if node_bin is None:
+            return
+
+        scripts = re.findall(r"<script[^>]*>([\s\S]*?)</script>", html_doc)
+        payload_js = next(s for s in scripts if "INITIAL_GRAPH_DATA" in s)
+        app_js = next(s for s in scripts if "replaceGraphDataset" in s)
+
+        harness_js = f"""
+const vm = require("vm");
+const payloadScript = {json.dumps(payload_js)};
+const appScript = {json.dumps(app_js)};
+const samplePayload = {json.dumps(sample_payload)};
+const userPayload = {json.dumps(user_payload)};
+const notePayload = {json.dumps(note_payload)};
+const fetchedUrls = [];
+
+const elements = new Map();
+function makeClassList() {{
+  const set = new Set();
+  return {{
+    add: (...cs) => cs.forEach(c => set.add(c)),
+    remove: (...cs) => cs.forEach(c => set.delete(c)),
+    contains: (c) => set.has(c),
+    toggle: (c, force) => {{
+      if (typeof force === "boolean") {{
+        if (force) set.add(c); else set.delete(c);
+        return force;
+      }}
+      if (set.has(c)) {{ set.delete(c); return false; }}
+      set.add(c); return true;
+    }},
+  }};
+}}
+function makeEl(id, tag = "DIV") {{
+  const listeners = new Map();
+  const el = {{
+    id,
+    tagName: tag,
+    value: "",
+    checked: false,
+    disabled: false,
+    style: {{ setProperty() {{}} }},
+    classList: makeClassList(),
+    children: [],
+    textContent: "",
+    innerHTML: "",
+    width: 1200,
+    height: 800,
+    getBoundingClientRect: () => ({{ left: 0, top: 0, width: 1200, height: 800, bottom: 56 }}),
+    getContext: (kind) => kind === "2d" ? ({{
+      save() {{}}, restore() {{}}, scale() {{}}, clearRect() {{}}, beginPath() {{}},
+      moveTo() {{}}, lineTo() {{}}, arc() {{}}, ellipse() {{}}, stroke() {{}}, fill() {{}},
+      translate() {{}}, rotate() {{}}, fillText() {{}}, strokeText() {{}}, setLineDash() {{}},
+      measureText: (t) => ({{ width: String(t || "").length * 7 }}),
+      fillRect() {{}},
+    }}) : null,
+    appendChild(child) {{ this.children.push(child); return child; }},
+    addEventListener(ev, fn) {{
+      if (!listeners.has(ev)) listeners.set(ev, []);
+      listeners.get(ev).push(fn);
+    }},
+    dispatchEvent(ev) {{
+      const fns = listeners.get(ev.type) || [];
+      fns.forEach(fn => fn(ev));
+    }},
+    click() {{ this.dispatchEvent({{ type: "click", preventDefault() {{}}, stopPropagation() {{}} }}); }},
+    querySelector: () => null,
+    querySelectorAll: () => [],
+    getAttribute: () => "",
+  }};
+  return el;
+}}
+function getEl(id) {{
+  if (!elements.has(id)) elements.set(id, makeEl(id, "DIV"));
+  return elements.get(id);
+}}
+
+const vmCtx = {{
+  document: {{
+    documentElement: makeEl("html", "HTML"),
+    activeElement: null,
+    getElementById: getEl,
+    createElement: (t) => makeEl("", t),
+    querySelector: () => null,
+    querySelectorAll: () => [],
+  }},
+  devicePixelRatio: 1,
+  addEventListener() {{}},
+  removeEventListener() {{}},
+  ResizeObserver: class {{ observe() {{}} disconnect() {{}} }},
+  performance: {{ now: () => 100 }},
+  requestAnimationFrame: () => 1,
+  setTimeout,
+  clearTimeout,
+  URL,
+  Headers: class {{ constructor() {{}} has() {{ return false; }} set() {{}} }},
+  fetch: async (url) => {{
+    fetchedUrls.push(String(url));
+    if (String(url).includes("/api/graph?source=sample")) {{
+      return {{ ok: true, json: async () => JSON.parse(JSON.stringify(samplePayload)) }};
+    }}
+    if (String(url).includes("/api/graph?source=vault")) {{
+      return {{ ok: true, json: async () => JSON.parse(JSON.stringify(userPayload)) }};
+    }}
+    if (String(url).includes("/api/note?") && String(url).includes("source=sample")) {{
+      return {{ ok: true, json: async () => JSON.parse(JSON.stringify(notePayload)) }};
+    }}
+    return {{ ok: false, json: async () => ({{}}) }};
+  }},
+  navigator: {{ clipboard: {{ writeText: async () => {{}} }} }},
+  alert(msg) {{ throw new Error("Unexpected alert: " + msg); }},
+  console,
+}};
+vmCtx.window = vmCtx;
+vmCtx.globalThis = vmCtx;
+vmCtx.self = vmCtx;
+vm.createContext(vmCtx);
+vm.runInContext(payloadScript, vmCtx);
+vm.runInContext(appScript, vmCtx);
+
+(async () => {{
+  const initialOnboardVisible = getEl("onboarding-card").classList.contains("visible");
+  const initialDrawerCollapsed = getEl("right-drawer").classList.contains("collapsed");
+  const initialSampleBtnDisplay = getEl("btn-toggle-sample").style.display;
+
+  getEl("btn-onboard-sample").click();
+  await new Promise(r => setTimeout(r, 40));
+
+  const sampleBannerVisible = getEl("sample-mode-banner").classList.contains("visible");
+  const sampleOnboardVisible = getEl("onboarding-card").classList.contains("visible");
+  const sampleStatsText = getEl("vault-stats-pill").textContent;
+  const sampleTitle = getEl("vault-title").textContent;
+  const sampleDrawerCollapsed = getEl("right-drawer").classList.contains("collapsed");
+  const sampleMdHtml = getEl("inspector-markdown").innerHTML;
+
+  getEl("btn-return-my-vault").click();
+  await new Promise(r => setTimeout(r, 40));
+
+  const backBannerVisible = getEl("sample-mode-banner").classList.contains("visible");
+  const backOnboardVisible = getEl("onboarding-card").classList.contains("visible");
+  const backStatsText = getEl("vault-stats-pill").textContent;
+
+  console.log(JSON.stringify({{
+    initialOnboardVisible,
+    initialDrawerCollapsed,
+    initialSampleBtnDisplay,
+    sampleBannerVisible,
+    sampleOnboardVisible,
+    sampleStatsText,
+    sampleTitle,
+    sampleDrawerCollapsed,
+    hasMermaidSvg: sampleMdHtml.includes("Mermaid"),
+    backBannerVisible,
+    backOnboardVisible,
+    backStatsText,
+    fetchedUrls,
+  }}));
+}})().catch((err) => {{
+  console.error(err && err.stack ? err.stack : String(err));
+  process.exit(1);
+}});
+"""
+        harness_path = self._tmp_dir / "verify_sample_onboarding.js"
+        harness_path.write_text(harness_js, encoding="utf-8")
+        proc = subprocess.run(
+            [str(node_bin), str(harness_path)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(
+            proc.returncode,
+            0,
+            msg=f"Node onboarding VM test failed:\nSTDERR:\n{proc.stderr}\nSTDOUT:\n{proc.stdout}",
+        )
+        vm_res = json.loads(proc.stdout)
+        self.assertTrue(vm_res["initialOnboardVisible"])
+        self.assertTrue(vm_res["initialDrawerCollapsed"])
+        self.assertEqual(vm_res["initialSampleBtnDisplay"], "inline-block")
+        self.assertTrue(vm_res["sampleBannerVisible"])
+        self.assertFalse(vm_res["sampleOnboardVisible"])
+        self.assertIn("Sample Vault (21 Notes)", vm_res["sampleTitle"])
+        self.assertIn("257 Links", vm_res["sampleStatsText"])
+        self.assertFalse(vm_res["sampleDrawerCollapsed"])
+        self.assertTrue(vm_res["hasMermaidSvg"])
+        self.assertFalse(vm_res["backBannerVisible"])
+        self.assertTrue(vm_res["backOnboardVisible"])
+        self.assertIn("5 Notes", vm_res["backStatsText"])
+        self.assertTrue(any("source=sample" in u for u in vm_res["fetchedUrls"]))
+        self.assertTrue(any("source=vault" in u for u in vm_res["fetchedUrls"]))
+
+    def test_sample_vault_json_bundle_fallback(self) -> None:
+        """Space-free assets/starter_vault.json bundle serves /api/graph?source=sample and /api/note?source=sample when examples/ is absent."""
+        sample_root = vault_graph.resolve_sample_vault_root()
+        if sample_root is None:
+            self.skipTest("Bundled examples/starter-vault not found")
+
+        bundle_out = self._tmp_dir / "assets" / "starter_vault.json"
+        res = vault_graph.export_sample_vault_bundle(sample_root, bundle_out)
+        self.assertTrue(res["success"])
+        self.assertGreaterEqual(res["nodes"], 26)
+        self.assertGreaterEqual(res["edges"], 250)
+        raw_txt = bundle_out.read_text(encoding="utf-8")
+        self.assertNotIn(str(sample_root), raw_txt)
+
+        vault = self._tmp_dir / "BundleFallbackVault"
+        init_vault.init_vault(vault, quiet=True)
+        tok = "tok_bundle_fallback_guard_0123456789abcdef"
+        with (
+            mock.patch.object(vault_graph, "resolve_sample_vault_root", return_value=None),
+            mock.patch.object(vault_graph, "resolve_sample_vault_bundle", return_value=bundle_out),
+        ):
+            handler_cls = vault_graph.create_graph_request_handler(
+                vault_root=vault,
+                port=0,
+                sidecar_mode=True,
+                ui_token=tok,
+                cache=vault_graph.VaultGraphCache(max_entries=6),
+            )
+            server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+            port = server.server_address[1]
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                headers = {"X-Sidecar-Token": tok, "X-KC-Request": "1"}
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+                conn.request("GET", "/api/graph?source=sample&slim=1", headers=headers)
+                r1 = conn.getresponse()
+                p1 = json.loads(r1.read().decode("utf-8"))
+                self.assertEqual(r1.status, 200)
+                self.assertTrue(p1["isSampleMode"])
+                self.assertGreaterEqual(len(p1["nodes"]), 26)
+                self.assertTrue(all(n.get("lazyMarkdown") for n in p1["nodes"]))
+
+                showcase_id = "wiki/synthesis/Google Cloud Serverless Analytics Reference.md"
+                conn.request(
+                    "GET",
+                    f"/api/note?id={vault_graph.urllib.parse.quote(showcase_id)}&source=sample",
+                    headers=headers,
+                )
+                r2 = conn.getresponse()
+                p2 = json.loads(r2.read().decode("utf-8"))
+                self.assertEqual(r2.status, 200)
+                self.assertIn("```mermaid", p2["markdown"])
+                conn.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

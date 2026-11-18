@@ -13,16 +13,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Open Knowledge Format (OKF v0.2) Core Parser, Conformance Validator, and YAML Engine.
+Open Knowledge Format (OKF v0.3, with full v0.2 backward compatibility) Core Parser,
+Conformance Validator, and YAML Engine.
 
 Provides size-capped (16 KiB), anchor/alias-safe YAML frontmatter extraction and parsing
 with 100% behavioral parity between PyYAML (`yaml.safe_load` / YAML 1.2 Core Schema) and
-a pure-Python stdlib fallback parser. Also implements OKF v0.2 §5–§11 semantic helpers:
+a pure-Python stdlib fallback parser. Also implements OKF v0.3 §4–§12 semantic helpers:
 - `normalize_verified_list`: normalizes bare `verified: {by, at}` mapping to 1-element list.
-- `derive_trust_tier`: computes `"unverified"`, `"machine-confirmed"`, or `"human-reviewed"`.
-- `is_stale`: evaluates `stale_after` ISO-8601 date/datetime against reference UTC time.
+- `derive_trust_tier`: computes `"unverified"`, `"machine-confirmed"`, or `"human-reviewed"`
+  strictly from current verification events (`verified[].at >= generated.at`, OKF v0.3 §5.3).
+- `has_stale_verifications`: detects concepts whose verifications are all older than `generated.at`.
+- `is_stale`: evaluates `stale_after` RFC 3339 date/datetime against reference UTC time
+  (treating unparseable `stale_after` values as stale per OKF v0.3 §5.5 & §11.2).
+- `is_current_status`: treats missing/`stable`/`draft` as current and `deprecated`/unknown as not current (§5.4).
+- `resolve_okf_path`: resolves relative vs `/`-rooted bundle paths with `v0.2` fallback (§6.2, §12.1).
 - `canonical_content_hash`: computes no-churn SHA-256 over canonical frontmatter + body.
-- `validate_okf_concept`: validates OKF v0.2 §10.2 & §11 conformance and body `[^id]` citations.
+- `validate_okf_concept`: validates OKF v0.3 §4–§11 conformance, citations, and Attested Computations.
 - `migrate_legacy_sources_in_frontmatter`: deterministically upgrades string `sources:` to `{id, resource}`.
 - `stamp_human_verification`: deterministically records `human:<id>` verification in frontmatter.
 """
@@ -32,16 +38,21 @@ from datetime import date, datetime, timezone
 import hashlib
 import json
 import math
+import os
+from pathlib import Path
 import re
 import sys
 from typing import Any
+import urllib.parse
 
 try:
     import yaml  # type: ignore[import-untyped]
 except ImportError:  # pragma: no cover
     yaml = None  # type: ignore[assignment]
 
-SUPPORTED_OKF_VERSION = "0.2"
+SUPPORTED_OKF_VERSION = "0.3"
+SUPPORTED_OKF_VERSIONS = ("0.2", "0.3")
+OKF_VALID_STATUSES = frozenset({"draft", "stable", "deprecated"})
 MAX_FRONTMATTER_BYTES = 16 * 1024  # 16 KiB hard frontmatter cap
 MAX_YAML_NESTING_DEPTH = 64  # Hard cap on flow/block nesting depth
 
@@ -56,6 +67,12 @@ _FLOAT_RE = re.compile(
     r"^[+-]?(?:[0-9]+\.[0-9]*|\.[0-9]+)(?:[eE][+-][0-9]+)?$"
 )
 _ISO_DATE_ONLY_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
+_ISO_DATETIME_WITH_OFFSET_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})$"
+)
+_ACTOR_RE = re.compile(r"^([^\s/:]+/\S+|[A-Za-z][A-Za-z0-9+.-]*:\S+)$")
+_PATH_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
+_ATX_HEADING_RE = re.compile(r"^[ \t]{0,3}(#{1,6})[ \t]+(.*?)[ \t]*#*[ \t]*$")
 
 _FENCE_LINE_RE = re.compile(r"^[ \t]*(?:>[ \t]*)*(`{3,}|~{3,})(.*)$")
 _BACKTICK_RUN_RE = re.compile(r"`+")
@@ -2688,8 +2705,30 @@ def extract_string_list(
     return results
 
 
+def is_valid_actor(val: Any) -> bool:
+    """Validate an OKF v0.3 §7 actor (`<producer>/<version>` or `<scheme>:<id>`)."""
+    if not isinstance(val, str):
+        return False
+    s = val.strip()
+    if not s or not _ACTOR_RE.match(s):
+        return False
+    if ":" in s and not s.split(":", 1)[1].strip():
+        return False
+    return True
+
+
+def _parse_okf_version_tuple(version_val: Any) -> tuple[int, ...] | None:
+    """Parse an `okf_version` string like `'0.2'` or `'0.3'` into an integer tuple."""
+    if version_val is None:
+        return None
+    parts = re.findall(r"\d+", str(version_val).strip())
+    if not parts:
+        return None
+    return tuple(int(p) for p in parts)
+
+
 def normalize_verified_list(verified_val: Any) -> list[dict[str, Any]]:
-    """Normalize frontmatter `verified` value per OKF v0.2 §5.2 & §11.
+    """Normalize frontmatter `verified` value per OKF v0.3 §5.2 & §11.2.
 
     A bare mapping `verified: { by: ..., at: ... }` is treated as a 1-element list.
     """
@@ -2702,17 +2741,51 @@ def normalize_verified_list(verified_val: Any) -> list[dict[str, Any]]:
     return []
 
 
+def _extract_generated_at(frontmatter: dict[str, Any]) -> datetime | None:
+    """Extract parseable `generated.at` UTC datetime if present in frontmatter."""
+    generated = frontmatter.get("generated")
+    if not isinstance(generated, dict):
+        return None
+    gen_at_raw = generated.get("at")
+    if gen_at_raw is None or (isinstance(gen_at_raw, str) and not gen_at_raw.strip()):
+        return None
+    return parse_iso_datetime(gen_at_raw, require_offset=True)
+
+
+def has_stale_verifications(frontmatter: dict[str, Any]) -> bool:
+    """Return True if `verified` events exist but every dated event is older than `generated.at` (OKF v0.3 §5.3 / I204)."""
+    if not isinstance(frontmatter, dict):
+        return False
+    gen_at = _extract_generated_at(frontmatter)
+    if gen_at is None:
+        return False
+    entries = normalize_verified_list(frontmatter.get("verified"))
+    dated_times: list[datetime] = []
+    for entry in entries:
+        by_raw = entry.get("by")
+        if not isinstance(by_raw, str) or not by_raw.strip():
+            continue
+        ver_at = parse_iso_datetime(entry.get("at"), require_offset=True)
+        if ver_at is not None:
+            dated_times.append(ver_at)
+    return bool(dated_times) and all(t < gen_at for t in dated_times)
+
+
 def derive_trust_tier(frontmatter: dict[str, Any]) -> str:
-    """Derive OKF v0.2 §5.3 trust tier from frontmatter `verified` entries.
+    """Derive OKF v0.3 §5.3 trust tier strictly from current `verified` events.
+
+    An event is current when `verified[].at >= generated.at`, or when `generated.at`
+    is absent (preserving full OKF v0.2 backward compatibility).
 
     Returns:
-      - `"human-reviewed"` if any valid entry has `by` starting with `"human:"` and a non-empty ID.
-      - `"machine-confirmed"` if verified only by non-`human:` actors (e.g. `process:...` or `<producer>/<version>`).
-      - `"unverified"` if no valid `verified` entries exist.
+      - `"human-reviewed"` if any current valid entry has `by` starting with `"human:"` and a non-empty ID.
+      - `"machine-confirmed"` if current valid entries contain only non-`human:` actors (e.g. `process:`, `team:`, `<tool>/<ver>`).
+      - `"unverified"` if no current valid `verified` entries exist.
     """
     if not isinstance(frontmatter, dict):
         return "unverified"
     entries = normalize_verified_list(frontmatter.get("verified"))
+    gen_at = _extract_generated_at(frontmatter)
     has_machine = False
     for entry in entries:
         by_raw = entry.get("by")
@@ -2721,6 +2794,10 @@ def derive_trust_tier(frontmatter: dict[str, Any]) -> str:
         by_val = by_raw.strip()
         if not by_val:
             continue
+        if gen_at is not None:
+            ver_at = parse_iso_datetime(entry.get("at"), require_offset=True)
+            if ver_at is None or ver_at < gen_at:
+                continue
         if by_val.startswith("human:"):
             human_id = by_val[len("human:") :].strip()
             if human_id:
@@ -2730,11 +2807,19 @@ def derive_trust_tier(frontmatter: dict[str, Any]) -> str:
     return "machine-confirmed" if has_machine else "unverified"
 
 
-def parse_iso_datetime(val: Any) -> datetime | None:
-    """Parse an ISO-8601 date (`YYYY-MM-DD`) or timestamp (`...Z` / `...+00:00`) into a UTC `datetime`."""
+def parse_iso_datetime(
+    val: Any, *, require_offset: bool = False
+) -> datetime | None:
+    """Parse an RFC 3339 date (`YYYY-MM-DD`, 00:00:00Z UTC) or timestamp (`...Z` / `...+HH:MM`) into UTC `datetime`.
+
+    When `require_offset=True` (OKF v0.3 §5 strict mode), naive date-times without an
+    explicit UTC offset return `None`, while date-only `YYYY-MM-DD` stays valid as UTC midnight.
+    """
     if val is None:
         return None
     if isinstance(val, datetime):
+        if require_offset and val.tzinfo is None:
+            return None
         try:
             if val.tzinfo is None:
                 return val.replace(tzinfo=timezone.utc)
@@ -2771,12 +2856,17 @@ def parse_iso_datetime(val: Any) -> datetime | None:
         except ValueError:
             return None
 
+    if require_offset and not _ISO_DATETIME_WITH_OFFSET_RE.match(s):
+        return None
+
     norm = s
     if norm.endswith(("Z", "z")):
         norm = norm[:-1] + "+00:00"
     try:
         dt = datetime.fromisoformat(norm)
         if dt.tzinfo is None:
+            if require_offset:
+                return None
             return dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
     except (ValueError, OverflowError):
@@ -2784,15 +2874,16 @@ def parse_iso_datetime(val: Any) -> datetime | None:
 
 
 def is_stale(frontmatter: dict[str, Any], now: datetime | None = None) -> bool:
-    """Evaluate OKF v0.2 §5.5 staleness (`now >= stale_after`)."""
+    """Evaluate OKF v0.3 §5.5 & §11.2 staleness (`now >= stale_after`, unparseable counts as stale)."""
     if not isinstance(frontmatter, dict):
         return False
     raw_stale = frontmatter.get("stale_after")
-    if raw_stale is None:
+    if raw_stale is None or (isinstance(raw_stale, str) and not raw_stale.strip()):
         return False
-    stale_dt = parse_iso_datetime(raw_stale)
+    stale_dt = parse_iso_datetime(raw_stale, require_offset=True)
     if stale_dt is None:
-        return False
+        # OKF v0.3 §5.5 & §11.2: MUST NOT treat an unparseable stale_after as fresh.
+        return True
 
     ref_now = now if now is not None else datetime.now(timezone.utc)
     try:
@@ -2801,8 +2892,107 @@ def is_stale(frontmatter: dict[str, Any], now: datetime | None = None) -> bool:
         else:
             ref_now = ref_now.astimezone(timezone.utc)
     except (ValueError, OverflowError):
-        return False
+        return True
     return ref_now >= stale_dt
+
+
+def is_current_status(frontmatter: dict[str, Any]) -> bool:
+    """Return True if concept `status` is current (`stable`, `draft`, or omitted) per OKF v0.3 §5.4."""
+    if not isinstance(frontmatter, dict):
+        return True
+    raw = frontmatter.get("status")
+    if raw is None:
+        return True
+    if not isinstance(raw, str):
+        return False
+    cleaned = raw.strip()
+    if not cleaned:
+        return True
+    return cleaned in ("stable", "draft")
+
+
+def resolve_okf_path(
+    bundle_root: Path,
+    source_file: Path,
+    target: str,
+    *,
+    field: bool = True,
+    okf_version: str | None = None,
+) -> tuple[str, Path | None]:
+    """Resolve an OKF v0.3 §6 link or path field with §12.1 v0.2 bundle-root fallback.
+
+    Returns `(kind, resolved_path)` where `kind` is one of:
+      - `"external"`: URL scheme, protocol-relative URL, or path escaping `bundle_root`.
+      - `"found"`: resolved inside `bundle_root` and exists on disk.
+      - `"fallback"`: bare path field that resolved only from `bundle_root` under `v0.2`/unversioned fallback.
+      - `"missing"`: in-bundle target does not exist on disk.
+    """
+    if not isinstance(target, str):
+        return "missing", None
+    raw = target.strip()
+    if not raw or _PATH_SCHEME_RE.match(raw) or raw.startswith("//"):
+        return "external", None
+    clean = urllib.parse.unquote(raw.split("#", 1)[0].split("?", 1)[0])
+    if not clean:
+        return "found", source_file
+
+    bundle_resolved = bundle_root.resolve()
+    base = bundle_resolved if clean.startswith("/") else source_file.resolve().parent
+    candidate = Path(os.path.normpath(str(base / clean.lstrip("/"))))
+    try:
+        candidate.relative_to(bundle_resolved)
+    except ValueError:
+        return "external", None
+    if candidate.exists():
+        return "found", candidate
+
+    declared = _parse_okf_version_tuple(okf_version)
+    allow_v02_fallback = declared is None or declared <= (0, 2)
+    if field and allow_v02_fallback and not clean.startswith("/"):
+        alt = Path(os.path.normpath(str(bundle_resolved / clean)))
+        try:
+            alt.relative_to(bundle_resolved)
+        except ValueError:
+            return "missing", None
+        if alt.exists():
+            return "fallback", alt
+    return "missing", None
+
+
+def _count_computation_fences(body: str) -> int:
+    """Count fenced code blocks inside a `Computation` heading section (OKF v0.3 §10.3)."""
+    level: int | None = None
+    count = 0
+    fence_ch = ""
+    fence_len = 0
+    in_fence = False
+    for line in body.splitlines():
+        m_fence = _FENCE_LINE_RE.match(line)
+        if in_fence:
+            if m_fence:
+                marker = m_fence.group(1)
+                tail = m_fence.group(2).strip()
+                if marker[0] == fence_ch and len(marker) >= fence_len and not tail:
+                    in_fence = False
+            continue
+        if m_fence:
+            marker = m_fence.group(1)
+            info = m_fence.group(2)
+            if not (marker[0] == "`" and "`" in info):
+                in_fence = True
+                fence_ch = marker[0]
+                fence_len = len(marker)
+                if level is not None:
+                    count += 1
+                continue
+        m_heading = _ATX_HEADING_RE.match(line)
+        if m_heading:
+            depth = len(m_heading.group(1))
+            if level is not None and depth <= level:
+                break
+            if level is None and m_heading.group(2).strip().lower() == "computation":
+                level = depth
+    return count
 
 
 def canonical_content_hash(content: str, *, use_pyyaml: bool = True) -> str:
@@ -2971,8 +3161,11 @@ def validate_okf_concept(
     is_reserved: bool = False,
     now: datetime | None = None,
     use_pyyaml: bool = True,
+    bundle_root: Path | None = None,
+    file_path: Path | None = None,
+    okf_version: str | None = None,
 ) -> dict[str, Any]:
-    """Validate an OKF v0.2 concept document against §4, §5, §10.2, and §11 conformance rules."""
+    """Validate an OKF v0.3 concept document against §4–§11 conformance rules (v0.2 compatible)."""
     if is_reserved:
         _fm_prefix, yaml_text, _body = split_frontmatter(content)
         fm = (
@@ -2991,6 +3184,10 @@ def validate_okf_concept(
             "is_stale": False,
             "stale_after": None,
             "missing_footnotes": [],
+            "is_current_status": is_current_status(fm),
+            "stale_verifications": False,
+            "superseded_by": None,
+            "okf_version": okf_version or SUPPORTED_OKF_VERSION,
         }
 
     errors: list[str] = []
@@ -3010,6 +3207,10 @@ def validate_okf_concept(
             "is_stale": False,
             "stale_after": None,
             "missing_footnotes": [],
+            "is_current_status": True,
+            "stale_verifications": False,
+            "superseded_by": None,
+            "okf_version": okf_version or SUPPORTED_OKF_VERSION,
         }
 
     _fm_prefix, yaml_text, body = split_frontmatter(content)
@@ -3025,6 +3226,10 @@ def validate_okf_concept(
             "is_stale": False,
             "stale_after": None,
             "missing_footnotes": [],
+            "is_current_status": True,
+            "stale_verifications": False,
+            "superseded_by": None,
+            "okf_version": okf_version or SUPPORTED_OKF_VERSION,
         }
 
     try:
@@ -3043,9 +3248,37 @@ def validate_okf_concept(
             "is_stale": False,
             "stale_after": None,
             "missing_footnotes": [],
+            "is_current_status": True,
+            "stale_verifications": False,
+            "superseded_by": None,
+            "okf_version": okf_version or SUPPORTED_OKF_VERSION,
         }
 
-    # 1. Required `type` field (OKF v0.2 §4.1 & §11)
+    def _check_path_field_warn(field_name: str, raw_val: Any) -> None:
+        if bundle_root is None or file_path is None or not isinstance(raw_val, str):
+            return
+        val_s = raw_val.strip()
+        if not val_s or re.search(r"\s", val_s):
+            return
+        if val_s.startswith("[[") and val_s.endswith("]]"):
+            return
+        kind, _resolved = resolve_okf_path(
+            bundle_root,
+            file_path,
+            val_s,
+            field=True,
+            okf_version=okf_version,
+        )
+        if kind == "missing":
+            warnings.append(
+                f"{field_name} {val_s!r} does not resolve to a file in the bundle (OKF v0.3 §6.2)"
+            )
+        elif kind == "fallback":
+            warnings.append(
+                f"{field_name} {val_s!r} resolves only via v0.2 bundle-root fallback; prefix with '/' as '/{val_s}' (OKF v0.3 §6.2)"
+            )
+
+    # 1. Required `type` field (OKF v0.3 §4.1 & §11)
     concept_type = frontmatter.get("type")
     if not isinstance(concept_type, str) or not concept_type.strip():
         errors.append(
@@ -3055,14 +3288,61 @@ def validate_okf_concept(
     else:
         concept_type_str = concept_type.strip()
 
-    # 2. `sources` validation (OKF v0.2 §5.1 & §11 + 1.x Legacy String Profile)
+    # 1b. `tags` scalar warning (§4.1, §11.2)
+    raw_tags = frontmatter.get("tags")
+    if isinstance(raw_tags, str) and raw_tags.strip():
+        if "," in raw_tags:
+            warnings.append(
+                f"Write 'tags' as a YAML list (OKF v0.3 §4.1/§11.2); scalar {raw_tags!r} is read as a single tag"
+            )
+    elif raw_tags is not None and not isinstance(raw_tags, list):
+        warnings.append("Write 'tags' as a YAML list of strings (OKF v0.3 §4.1)")
+
+    # 1c. `status` & `superseded_by` lifecycle (§5.4)
+    raw_status = frontmatter.get("status")
+    status_str = raw_status.strip() if isinstance(raw_status, str) else ""
+    if raw_status is not None and (not isinstance(raw_status, str) or (status_str and status_str not in OKF_VALID_STATUSES)):
+        warnings.append(
+            f"Unknown 'status' value {raw_status!r} (expected draft, stable, or deprecated; treated as not current per OKF v0.3 §5.4)"
+        )
+    superseded_by_raw = frontmatter.get("superseded_by")
+    superseded_by_str: str | None = None
+    if isinstance(superseded_by_raw, str) and superseded_by_raw.strip():
+        superseded_by_str = superseded_by_raw.strip()
+        if status_str != "deprecated":
+            warnings.append(
+                "'superseded_by' has a meaning only with 'status: deprecated' (OKF v0.3 §5.4)"
+            )
+        _check_path_field_warn("superseded_by", superseded_by_str)
+
+    if frontmatter.get("resource"):
+        _check_path_field_warn("resource", frontmatter.get("resource"))
+
+    # 2. `sources` and `usage_window` validation (OKF v0.3 §5.1 & §11.2 + 1.x Legacy String Profile)
+    shared_window = frontmatter.get("usage_window")
+    if shared_window is not None and shared_window != "" and shared_window != []:
+        if (
+            not isinstance(shared_window, dict)
+            or parse_iso_datetime(shared_window.get("from"), require_offset=True) is None
+            or parse_iso_datetime(shared_window.get("to"), require_offset=True) is None
+        ):
+            warnings.append(
+                "'usage_window' must be a {from, to} mapping of RFC 3339 timestamps (OKF v0.3 §5.1)"
+            )
+
     source_ids: set[str] = set()
     if "sources" in frontmatter and frontmatter["sources"] is not None:
         raw_sources = frontmatter["sources"]
-        if not isinstance(raw_sources, list):
-            errors.append("Frontmatter 'sources' must be a list")
+        if isinstance(raw_sources, dict):
+            raw_sources_list: list[Any] | None = [raw_sources]
+        elif isinstance(raw_sources, list):
+            raw_sources_list = raw_sources
         else:
-            for idx, item in enumerate(raw_sources):
+            raw_sources_list = None
+            errors.append("Frontmatter 'sources' must be a list")
+
+        if raw_sources_list is not None:
+            for idx, item in enumerate(raw_sources_list):
                 if isinstance(item, str):
                     if item.strip():
                         legacy_sources = True
@@ -3079,6 +3359,8 @@ def validate_okf_concept(
                         errors.append(
                             f"sources[{idx}] mapping is missing required non-empty 'resource' field"
                         )
+                    else:
+                        _check_path_field_warn(f"sources[{idx}].resource", res_val)
                     if "id" in item and item["id"] is not None:
                         id_val = item["id"]
                         if not isinstance(id_val, str) or not id_val.strip():
@@ -3086,13 +3368,61 @@ def validate_okf_concept(
                                 f"sources[{idx}] mapping 'id' must be a non-empty string"
                             )
                         else:
-                            source_ids.add(id_val.strip())
+                            sid = id_val.strip()
+                            if sid in source_ids:
+                                warnings.append(
+                                    f"sources[{idx}].id {sid!r} is duplicated (OKF v0.3 §5.1)"
+                                )
+                            source_ids.add(sid)
+                    if item.get("author") not in (None, "") and not is_valid_actor(item.get("author")):
+                        warnings.append(
+                            f"sources[{idx}].author {item.get('author')!r} is not a valid OKF actor (OKF v0.3 §7)"
+                        )
+                    if item.get("last_modified") not in (None, "") and parse_iso_datetime(
+                        item.get("last_modified"), require_offset=True
+                    ) is None:
+                        warnings.append(
+                            f"sources[{idx}].last_modified {item.get('last_modified')!r} is not a valid RFC 3339 date/timestamp (OKF v0.3 §5)"
+                        )
+                    item_win = item.get("usage_window")
+                    if item_win not in (None, "", []):
+                        if (
+                            not isinstance(item_win, dict)
+                            or parse_iso_datetime(item_win.get("from"), require_offset=True) is None
+                            or parse_iso_datetime(item_win.get("to"), require_offset=True) is None
+                        ):
+                            warnings.append(
+                                f"sources[{idx}].usage_window must be a {{from, to}} mapping of RFC 3339 timestamps (OKF v0.3 §5.1)"
+                            )
+                    if (
+                        item.get("usage_count") not in (None, "")
+                        and shared_window in (None, "", [])
+                        and item_win in (None, "", [])
+                    ):
+                        warnings.append(
+                            f"sources[{idx}].usage_count requires a 'usage_window' period (OKF v0.3 §5.1)"
+                        )
                 else:
                     errors.append(
                         f"sources[{idx}] must be a mapping or string, got {type(item).__name__}"
                     )
 
-    # 3. `verified` validation (OKF v0.2 §5.2 & §11)
+    # 3. `generated` & `verified` validation (OKF v0.3 §5.2, §5.3 & §11)
+    generated_val = frontmatter.get("generated")
+    if generated_val not in (None, "", []):
+        if not isinstance(generated_val, dict) or not str(generated_val.get("by") or "").strip():
+            warnings.append("'generated' should be a mapping with a non-empty 'by' actor (OKF v0.3 §5.2)")
+        else:
+            if not is_valid_actor(generated_val.get("by")):
+                warnings.append(
+                    f"generated.by {generated_val.get('by')!r} is not a valid OKF actor (OKF v0.3 §7)"
+                )
+            gen_at_raw = generated_val.get("at")
+            if gen_at_raw not in (None, "") and parse_iso_datetime(gen_at_raw, require_offset=True) is None:
+                warnings.append(
+                    f"generated.at {gen_at_raw!r} must be an RFC 3339 date-time with UTC offset (OKF v0.3 §5)"
+                )
+
     if "verified" in frontmatter and frontmatter["verified"] is not None:
         raw_ver = frontmatter["verified"]
         if not isinstance(raw_ver, (dict, list)):
@@ -3112,16 +3442,36 @@ def validate_okf_concept(
                     errors.append(
                         f"verified[{idx}] has empty human actor identifier 'human:'"
                     )
+                elif not is_valid_actor(by_val):
+                    warnings.append(
+                        f"verified[{idx}].by {by_val!r} is not a valid OKF actor (OKF v0.3 §7)"
+                    )
+                at_val = v_entry.get("at")
+                if at_val in (None, ""):
+                    warnings.append(
+                        f"verified[{idx}] is missing 'at' timestamp (OKF v0.3 §5.2)"
+                    )
+                elif parse_iso_datetime(at_val, require_offset=True) is None:
+                    warnings.append(
+                        f"verified[{idx}].at {at_val!r} must be an RFC 3339 date-time with UTC offset (OKF v0.3 §5)"
+                    )
 
-    # 4. `stale_after` validation (OKF v0.2 §5.5)
+    stale_ver_flag = has_stale_verifications(frontmatter)
+    if stale_ver_flag:
+        warnings.append(
+            "No verification is current: every verified[].at is older than generated.at, so trust_tier is unverified (OKF v0.3 §5.3)"
+        )
+
+    # 4. `stale_after` validation (OKF v0.3 §5.5 & §11.2)
     stale_after_raw = frontmatter.get("stale_after")
     stale_after_str: str | None = None
     stale_flag = False
     if stale_after_raw is not None and str(stale_after_raw).strip() != "":
         stale_after_str = str(stale_after_raw).strip()
-        if parse_iso_datetime(stale_after_raw) is None:
+        if parse_iso_datetime(stale_after_raw, require_offset=True) is None:
+            stale_flag = True
             errors.append(
-                f"Invalid ISO-8601 date/datetime in 'stale_after': {stale_after_raw!r}"
+                f"Invalid RFC 3339 date/datetime in 'stale_after': {stale_after_raw!r}"
             )
         else:
             stale_flag = is_stale(frontmatter, now=now)
@@ -3130,7 +3480,7 @@ def validate_okf_concept(
                     f"Concept is stale (stale_after: {stale_after_str})"
                 )
 
-    # 5. Body footnote citation resolution (`[^id]` vs `sources[].id` or `[^id]:` defs, §5.4 & §11)
+    # 5. Body footnote citation resolution (`[^id]` vs `sources[].id` or `[^id]:` defs, §5.1 & §11)
     prose_body = _strip_code_and_comments_from_body(body)
     body_defs = {m.group(1).strip() for m in _FOOTNOTE_DEF_RE.finditer(prose_body)}
     valid_targets = source_ids | body_defs
@@ -3147,7 +3497,7 @@ def validate_okf_concept(
             f"Unresolved footnote citation(s) in body matching neither sources[].id nor [^id]: definitions: {', '.join(missing_footnotes)}"
         )
 
-    # 6. Attested Computation profile (§10.2 & §11)
+    # 6. Attested Computation profile (OKF v0.3 §10.2 & §10.3)
     if concept_type_str == "Attested Computation":
         runtime_val = frontmatter.get("runtime")
         has_runtime = (isinstance(runtime_val, str) and bool(runtime_val.strip())) or (
@@ -3155,17 +3505,61 @@ def validate_okf_concept(
         )
         if not has_runtime:
             errors.append(
-                "Attested Computation concept is missing required 'runtime' field in frontmatter (OKF v0.2 §10.2)"
+                "Attested Computation concept is missing required 'runtime' field in frontmatter (OKF v0.3 §10.2)"
             )
         comp_val = frontmatter.get("computation")
         has_fm_comp = (isinstance(comp_val, str) and bool(comp_val.strip())) or (
             isinstance(comp_val, dict) and len(comp_val) > 0
         )
-        has_body_comp = bool(_COMPUTATION_HEADING_RE.search(prose_body))
-        if not (has_fm_comp or has_body_comp):
+        comp_fences = _count_computation_fences(body)
+        has_body_comp = comp_fences > 0 or bool(_COMPUTATION_HEADING_RE.search(prose_body))
+        if has_fm_comp:
+            if isinstance(comp_val, str):
+                _check_path_field_warn("computation", comp_val)
+            if comp_fences > 0:
+                warnings.append(
+                    "Attested Computation declares both 'computation' file path and an inline fenced block in '# Computation' (OKF v0.3 §10.3)"
+                )
+        elif not has_body_comp:
             errors.append(
-                "Attested Computation concept requires either a 'computation' frontmatter field or a '# Computation' heading in the body (OKF v0.2 §10.2)"
+                "Attested Computation concept requires either a 'computation' frontmatter field or a '# Computation' heading with a fenced code block in the body (OKF v0.3 §10.3)"
             )
+        elif comp_fences == 0:
+            warnings.append(
+                "Attested Computation '# Computation' section has no fenced code block (OKF v0.3 §10.3)"
+            )
+        elif comp_fences > 1:
+            warnings.append(
+                f"Attested Computation '# Computation' section has {comp_fences} fenced blocks; consumers use only the first (OKF v0.3 §10.3)"
+            )
+
+        raw_params = frontmatter.get("parameters")
+        if raw_params not in (None, "", []):
+            param_list = raw_params if isinstance(raw_params, list) else [raw_params]
+            for pidx, pitem in enumerate(param_list):
+                if (
+                    not isinstance(pitem, dict)
+                    or not str(pitem.get("name") or "").strip()
+                    or not str(pitem.get("type") or "").strip()
+                ):
+                    warnings.append(
+                        f"parameters[{pidx}] requires non-empty 'name' and 'type' fields (OKF v0.3 §10.2)"
+                    )
+
+        for ac_key in ("executor", "attester"):
+            ac_val = frontmatter.get(ac_key)
+            if ac_val in (None, "", []):
+                continue
+            if not isinstance(ac_val, dict) or not str(ac_val.get("resource") or "").strip():
+                warnings.append(
+                    f"'{ac_key}' must be a mapping with a non-empty 'resource' path (OKF v0.3 §10.2)"
+                )
+            else:
+                _check_path_field_warn(f"{ac_key}.resource", ac_val.get("resource"))
+                if ac_key == "executor" and ac_val.get("receipt") is not None and not isinstance(ac_val.get("receipt"), list):
+                    warnings.append(
+                        "'executor.receipt' must list the receipt fields returned by a run (OKF v0.3 §10.2)"
+                    )
 
     trust_tier = derive_trust_tier(frontmatter)
     return {
@@ -3179,6 +3573,10 @@ def validate_okf_concept(
         "is_stale": stale_flag,
         "stale_after": stale_after_str,
         "missing_footnotes": missing_footnotes,
+        "is_current_status": is_current_status(frontmatter),
+        "stale_verifications": stale_ver_flag,
+        "superseded_by": superseded_by_str,
+        "okf_version": okf_version or SUPPORTED_OKF_VERSION,
     }
 
 

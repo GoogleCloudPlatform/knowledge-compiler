@@ -554,7 +554,8 @@ class TestOKFConformanceAndYAMLParity(unittest.TestCase):
         self.assertIsNone(okf.parse_iso_datetime("9999-12-31T23:59:59-01:00"))
         self.assertIsNone(okf.parse_iso_datetime("0001-01-01T00:00:00+01:00"))
         self.assertIsNone(okf.parse_iso_datetime("2026-01-01T00:00:00Z\nstatus: bad"))
-        self.assertFalse(okf.is_stale({"stale_after": "9999-12-31T23:59:59-01:00"}))
+        # OKF v0.3 §5.5 / §11.2: unparseable stale_after MUST fail closed as stale
+        self.assertTrue(okf.is_stale({"stale_after": "9999-12-31T23:59:59-01:00"}))
 
     def test_round1_migrate_and_stamp_nested_fields_and_injections(self) -> None:
         doc = (
@@ -751,6 +752,93 @@ class TestOKFConformanceAndYAMLParity(unittest.TestCase):
                     okf.extract_string_list(fm, "aliases", use_pyyaml=use_yaml),
                     f"Missing ZBX for use_pyyaml={use_yaml} on fm={fm[:80]!r}",
                 )
+
+    def test_okf_v03_conformance_and_backward_compat(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        self.assertEqual(okf.SUPPORTED_OKF_VERSION, "0.3")
+        self.assertIn("0.2", okf.SUPPORTED_OKF_VERSIONS)
+        self.assertIn("0.3", okf.SUPPORTED_OKF_VERSIONS)
+
+        # 1. §5.3 verification currency vs generated.at
+        stale_ver_fm = {
+            "generated": {"by": "knowledge-compiler/1.2.0", "at": "2026-11-17T12:00:00Z"},
+            "verified": [{"by": "human:alice", "at": "2026-11-16T12:00:00Z"}],
+        }
+        self.assertEqual(okf.derive_trust_tier(stale_ver_fm), "unverified")
+        self.assertTrue(okf.has_stale_verifications(stale_ver_fm))
+
+        current_ver_fm = {
+            "generated": {"by": "knowledge-compiler/1.2.0", "at": "2026-11-17T12:00:00Z"},
+            "verified": [
+                {"by": "human:alice", "at": "2026-11-16T12:00:00Z"},
+                {"by": "process:ci", "at": "2026-11-17T12:00:00Z"},
+            ],
+        }
+        self.assertEqual(okf.derive_trust_tier(current_ver_fm), "machine-confirmed")
+        self.assertFalse(okf.has_stale_verifications(current_ver_fm))
+
+        # v0.2 backward compatibility: absent generated.at still honors verified entries
+        legacy_ver_fm = {"verified": [{"by": "human:bob", "at": "2026-10-01T00:00:00Z"}]}
+        self.assertEqual(okf.derive_trust_tier(legacy_ver_fm), "human-reviewed")
+        self.assertFalse(okf.has_stale_verifications(legacy_ver_fm))
+
+        # 2. §5 strict RFC 3339 offset vs date-only UTC midnight
+        self.assertIsNotNone(okf.parse_iso_datetime("2026-11-17", require_offset=True))
+        self.assertIsNotNone(okf.parse_iso_datetime("2026-11-17T10:30:00Z", require_offset=True))
+        self.assertIsNone(okf.parse_iso_datetime("2026-11-17T10:30:00", require_offset=True))
+
+        # 3. §5.4 status currency & superseded_by
+        self.assertTrue(okf.is_current_status({"status": "stable"}))
+        self.assertTrue(okf.is_current_status({"status": "draft"}))
+        self.assertTrue(okf.is_current_status({}))
+        self.assertFalse(okf.is_current_status({"status": "deprecated"}))
+        self.assertFalse(okf.is_current_status({"status": "archived"}))
+
+        # 4. §7 team: actor & actor validation
+        self.assertTrue(okf.is_valid_actor("team:platform-eng"))
+        self.assertTrue(okf.is_valid_actor("human:alice"))
+        self.assertTrue(okf.is_valid_actor("knowledge-compiler/1.2.0"))
+        self.assertFalse(okf.is_valid_actor("not an actor"))
+
+        # 5. §6.2 & §12.1 path resolution (v0.3 relative vs v0.2 fallback)
+        with tempfile.TemporaryDirectory(prefix="kc_okf03_paths_") as tmp:
+            root = Path(tmp)
+            (root / "raw").mkdir()
+            (root / "raw" / "deck.pdf").write_text("pdf", encoding="utf-8")
+            (root / "wiki" / "concepts").mkdir(parents=True)
+            note = root / "wiki" / "concepts" / "Note.md"
+            sibling = root / "wiki" / "concepts" / "Sibling.md"
+            note.write_text("# Note\n", encoding="utf-8")
+            sibling.write_text("# Sibling\n", encoding="utf-8")
+
+            self.assertEqual(okf.resolve_okf_path(root, note, "Sibling.md", okf_version="0.3")[0], "found")
+            self.assertEqual(okf.resolve_okf_path(root, note, "/raw/deck.pdf", okf_version="0.3")[0], "found")
+            self.assertEqual(okf.resolve_okf_path(root, note, "raw/deck.pdf", okf_version="0.3")[0], "missing")
+            self.assertEqual(okf.resolve_okf_path(root, note, "raw/deck.pdf", okf_version="0.2")[0], "fallback")
+            self.assertEqual(okf.resolve_okf_path(root, note, "https://example.org", okf_version="0.3")[0], "external")
+            self.assertEqual(okf.resolve_okf_path(root, note, "../../../../etc/passwd", okf_version="0.3")[0], "external")
+
+        # 6. §10.2 & §10.3 Attested Computation checks
+        comp_doc = (
+            "---\n"
+            "type: Attested Computation\n"
+            "runtime: bigquery-sql\n"
+            "parameters:\n"
+            "  - name: start_date\n"
+            "    type: date\n"
+            "executor:\n"
+            "  resource: https://example.org/exec\n"
+            "  receipt: [row_count]\n"
+            "---\n"
+            "# Computation\n\n"
+            "```sql\nSELECT 1;\n```\n\n"
+            "```sql\nSELECT 2;\n```\n"
+        )
+        res_comp = okf.validate_okf_concept(comp_doc)
+        self.assertTrue(res_comp["valid"], res_comp["errors"])
+        self.assertTrue(any("2 fenced blocks" in w for w in res_comp["warnings"]))
 
 
 if __name__ == "__main__":

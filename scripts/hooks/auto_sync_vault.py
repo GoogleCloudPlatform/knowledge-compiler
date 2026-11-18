@@ -52,8 +52,11 @@ FRONTMATTER_RE = re.compile(r"\A(---\r?\n.*?\r?\n---\r?\n?)(.*)\Z", re.DOTALL)
 UPDATED_LINE_RE = re.compile(
     r"^(updated:\s*['\"]?)(\d{4}-\d{2}-\d{2})(['\"]?\s*)$", re.MULTILINE
 )
-LOG_HEADING_SPLIT_RE = re.compile(r"(?=^## \[\d{4}-\d{2}-\d{2}\])", re.MULTILINE)
-LOG_DATE_RE = re.compile(r"^## \[(\d{4}-\d{2}-\d{2})\]")
+LOG_HEADING_SPLIT_RE = re.compile(
+    r"(?=^## (?:\[\d{4}-\d{2}-\d{2}\]|\d{4}-\d{2}-\d{2}(?=\s|$)))", re.MULTILINE
+)
+LOG_DATE_RE = re.compile(r"^## (?:\[(\d{4}-\d{2}-\d{2})\]|(\d{4}-\d{2}-\d{2})(?=\s|$))")
+_PLAIN_V03_LOG_HEADING_RE = re.compile(r"^## (\d{4}-\d{2}-\d{2})\s*$")
 SECTION_SPLIT_RE = re.compile(r"(?=^## )", re.MULTILINE)
 WIKILINK_TARGET_RE = re.compile(r"\[\[([^\]|#]+)")
 
@@ -311,9 +314,10 @@ def _normalize_updated_frontmatter(text: str, target_date: str) -> str:
 def merge_log_markdown(remote_text: str, local_text: str) -> str:
     """Union-merge two versions of OKF `log.md` cleanly without conflict markers.
 
-    Keeps the newer `updated:` date in YAML frontmatter and preserves all unique
-    `## [YYYY-MM-DD] ...` entries sorted newest-date first (placing local entries
-    ahead of remote entries on same-day ties).
+    Supports both OKF v0.3 (`## YYYY-MM-DD` with no frontmatter) and legacy OKF v0.2
+    (`## [YYYY-MM-DD] ...` with optional YAML frontmatter). Preserves all unique entries
+    sorted newest-date first, merging distinct bullets under identical `## YYYY-MM-DD`
+    date headings (local bullets ahead of remote bullets).
     """
     max_date = max(_extract_updated_date(remote_text), _extract_updated_date(local_text))
     base_doc = _normalize_updated_frontmatter(remote_text, max_date)
@@ -334,6 +338,8 @@ def merge_log_markdown(remote_text: str, local_text: str) -> str:
 
     entries: list[tuple[str, int, str]] = []
     seen_signatures: set[str] = set()
+    v03_date_blocks: dict[str, list[str]] = {}
+    v03_date_seen_lines: dict[str, set[str]] = {}
 
     # Order: local entries first (priority 1 on same-day ties), then remote entries (priority 0)
     for source_priority, blocks in ((1, local_parts[1:]), (0, remote_parts[1:])):
@@ -343,13 +349,30 @@ def merge_log_markdown(remote_text: str, local_text: str) -> str:
                 continue
             lines = cleaned.splitlines()
             heading = lines[0].strip()
+            plain_m = _PLAIN_V03_LOG_HEADING_RE.match(heading)
+            if plain_m:
+                date_key = plain_m.group(1)
+                if date_key not in v03_date_blocks:
+                    v03_date_blocks[date_key] = [f"## {date_key}"]
+                    v03_date_seen_lines[date_key] = set()
+                for body_line in lines[1:]:
+                    norm_line = body_line.strip()
+                    if not norm_line:
+                        continue
+                    if norm_line not in v03_date_seen_lines[date_key]:
+                        v03_date_seen_lines[date_key].add(norm_line)
+                        v03_date_blocks[date_key].append(body_line.rstrip())
+                continue
             sig_body = "\n".join(line.strip() for line in lines[:3])
             if sig_body in seen_signatures:
                 continue
             seen_signatures.add(sig_body)
             date_m = LOG_DATE_RE.match(heading)
-            date_key = date_m.group(1) if date_m else "0000-00-00"
+            date_key = (date_m.group(1) or date_m.group(2)) if date_m else "0000-00-00"
             entries.append((date_key, source_priority, cleaned))
+
+    for date_key, block_lines in v03_date_blocks.items():
+        entries.append((date_key, 1, "\n".join(block_lines)))
 
     # Stable sort: newest date first; on same date, local (1) before remote (0), preserving internal order
     entries.sort(key=lambda item: (item[0], item[1]), reverse=True)

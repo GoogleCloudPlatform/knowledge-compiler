@@ -436,33 +436,15 @@ class TestKnowledgeCompilerSuite(unittest.TestCase):
         """Test upstream Open Knowledge Format (OKF) version parsing and comparison."""
         from unittest.mock import MagicMock, patch
 
-        self.assertEqual(vault_lint._parse_version_tuple("0.2"), (0, 2))
+        self.assertEqual(vault_lint._parse_version_tuple("0.3"), (0, 3))
         self.assertLess(
-            vault_lint._parse_version_tuple("0.2"),
             vault_lint._parse_version_tuple("0.3"),
+            vault_lint._parse_version_tuple("0.4"),
         )
 
-        # Mock SPEC.md returning Version 0.2 (up to date)
-        mock_spec_v02 = b"# Open Knowledge Format Specification\n\n**Version 0.2**\n"
-        mock_commit = b'{"sha": "ad30107123456", "commit": {"author": {"date": "2026-08-21T20:08:36Z"}, "message": "Merge PR #6"}}'
-
-        def fake_urlopen_v02(req, timeout=5.0):
-            m = MagicMock()
-            url = req.full_url if hasattr(req, "full_url") else str(req)
-            m.read.return_value = mock_spec_v02 if "SPEC.md" in url else mock_commit
-            m.__enter__.return_value = m
-            return m
-
-        with patch("urllib.request.urlopen", side_effect=fake_urlopen_v02):
-            rep = vault_lint.check_upstream_okf_version()
-            self.assertEqual(rep["upstream_version"], "0.2")
-            self.assertEqual(rep["status"], "up_to_date")
-            self.assertTrue(rep["is_up_to_date"])
-            self.assertFalse(rep["newer_version_available"])
-            self.assertEqual(rep["latest_commit_sha"], "ad30107")
-
-        # Mock SPEC.md returning Version 0.3 (update available)
-        mock_spec_v03 = b"# Open Knowledge Format Specification\n\n**Version 0.3**\n"
+        # Mock SPEC.md returning Version 0.3 (draft) -> up to date
+        mock_spec_v03 = b"# Open Knowledge Format Specification\n\n**Version 0.3 (draft)**\n"
+        mock_commit = b'{"sha": "e1b14f4123456", "commit": {"author": {"date": "2026-11-17T20:08:36Z"}, "message": "Release OKF v0.3"}}'
 
         def fake_urlopen_v03(req, timeout=5.0):
             m = MagicMock()
@@ -472,8 +454,26 @@ class TestKnowledgeCompilerSuite(unittest.TestCase):
             return m
 
         with patch("urllib.request.urlopen", side_effect=fake_urlopen_v03):
+            rep = vault_lint.check_upstream_okf_version()
+            self.assertEqual(rep["upstream_version"], "0.3")
+            self.assertEqual(rep["status"], "up_to_date")
+            self.assertTrue(rep["is_up_to_date"])
+            self.assertFalse(rep["newer_version_available"])
+            self.assertEqual(rep["latest_commit_sha"], "e1b14f4")
+
+        # Mock SPEC.md returning Version 0.4 (update available)
+        mock_spec_v04 = b"# Open Knowledge Format Specification\n\n**Version 0.4**\n"
+
+        def fake_urlopen_v04(req, timeout=5.0):
+            m = MagicMock()
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            m.read.return_value = mock_spec_v04 if "SPEC.md" in url else mock_commit
+            m.__enter__.return_value = m
+            return m
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen_v04):
             rep2 = vault_lint.check_upstream_okf_version()
-            self.assertEqual(rep2["upstream_version"], "0.3")
+            self.assertEqual(rep2["upstream_version"], "0.4")
             self.assertEqual(rep2["status"], "update_available")
             self.assertFalse(rep2["is_up_to_date"])
             self.assertTrue(rep2["newer_version_available"])

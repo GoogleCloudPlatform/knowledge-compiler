@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Initialize an Open Knowledge Format (OKF v0.2) compliant Knowledge Compiler Obsidian Vault.
+Initialize an Open Knowledge Format (OKF v0.3) compliant Knowledge Compiler Obsidian Vault.
 Scaffolds directory hierarchy, starter templates, and configuration.
 """
 from __future__ import annotations
@@ -28,7 +28,7 @@ DEFAULT_GEMINI_MD = """# Vault Schema & Knowledge Compiler Protocol (GEMINI.md)
 
 Welcome to the **Knowledge Compiler** vault. This repository is maintained collaboratively where **Obsidian is the IDE, the LLM is the maintenance programmer, and the markdown wiki is the persistent codebase**.
 
-This vault follows the open standard defined by the **Open Knowledge Format (OKF v0.2)** and Andrej Karpathy's compiled LLM-wiki paradigm.
+This vault follows the open standard defined by the **Open Knowledge Format (OKF v0.3)** and Andrej Karpathy's compiled LLM-wiki paradigm.
 
 ---
 
@@ -47,44 +47,46 @@ This vault follows the open standard defined by the **Open Knowledge Format (OKF
    - `wiki/synthesis/`: Cross-cutting analyses, comparisons, thesis documents, and durable query answers.
 
 3. **Navigation & Audit**:
-   - `index.md`: Content-oriented master index categorizing all wiki pages with one-line summaries (supporting progressive disclosure).
-   - `log.md`: Machine-parseable, chronological log of all vault operations (`ingest`, `query`, `lint`, `refactor`).
+   - `index.md`: Content-oriented master index declaring `okf_version: "0.3"` and categorizing all wiki pages with one-line summaries (supporting progressive disclosure).
+   - `log.md`: Chronological audit log (no frontmatter, `## YYYY-MM-DD` date headings newest-first per OKF v0.3 §9) tracking all vault operations (`ingest`, `query`, `lint`, `refactor`).
 
 ---
 
-## 📐 Note Formatting & OKF v0.2 Metadata Standard
+## 📐 Note Formatting & OKF v0.3 Metadata Standard
 
-Every note created in `wiki/` must include YAML frontmatter compliant with **OKF v0.2**:
+Every note created in `wiki/` must include YAML frontmatter compliant with **OKF v0.3**:
 
 ```yaml
 ---
 title: "Note Title"
 type: entity | concept | source-summary | synthesis
-created: YYYY-MM-DD
-updated: YYYY-MM-DD
+description: "One-sentence summary of this concept."
+created: "YYYY-MM-DD"
+updated: "YYYY-MM-DD"
 tags:
   - domain/topic
-status: stable # draft | stable | deprecated
+status: stable # draft | stable | deprecated (add superseded_by: "/wiki/..." when deprecated)
 sources:
   - id: source-slug
-    resource: "raw/source.md"
+    resource: "/raw/source.md"
 generated: { by: knowledge-compiler/gemini-pro, at: YYYY-MM-DDTHH:MM:SSZ }
 aliases: []
 ---
 ```
 
-> **Trust-Tier Integrity (OKF v0.2 §5.3)**: Omit `verified:` on agent-authored notes until explicit human review (`vault-lint --approve-human <note>`).
+> **Trust-Tier Integrity (OKF v0.3 §5.3)**: Omit `verified:` on agent-authored notes until explicit human review (`vault-lint --approve-human <note>`). Only verification events with `verified[].at >= generated.at` confer `human-reviewed` or `machine-confirmed` trust.
 
 ### Linking Rules
 - Use Obsidian `[[wikilinks]]` generously for all concepts, entities, and source cross-references.
+- For OKF path fields (`resource`, `sources[].resource`, `superseded_by`, `computation`, `executor.resource`, `attester.resource`), start bundle-root paths with `/` (e.g. `"/raw/deck.pptx"`).
 - Ensure reciprocal connections: when note A links to note B as a key dependency/relation, verify note B reflects the relationship.
 - **Table Formatting Invariant**: Inside Markdown tables, NEVER escape the pipe character within a wikilink alias (always use `[[Target|Alias]]`, never `[[Target\\|Alias]]`). Escaped pipes break Obsidian link graph resolution and vault linters.
 """
 
 DEFAULT_INDEX_MD = """---
+okf_version: "0.3"
 title: "Knowledge Vault Index"
-type: meta
-updated: {today}
+description: "Master vault index covering compiled sources, entities, concepts, and synthesis notes."
 ---
 
 # 🗂️ Master Index
@@ -127,22 +129,16 @@ Welcome to the **Knowledge Compiler** index. This document provides a high-level
 | :--- | :--- | :--- |
 | [Vault Teleology & Strategic Anchors](purpose.md) | `meta/teleology` | Active engagements, architectural pillars, and open theses. |
 | [Skill Impact & Evolution Ledger](wiki/skill-impact.md) | `skill-evolution/ledger` | Tracks WikiSkill evolution proposals and validation outcomes. |
+| [Vault Schema & Compiler Protocol](GEMINI.md) | `meta/schema` | OKF v0.3 frontmatter rules, linking invariants, and directory architecture. |
+| [Vault Activity Log](log.md) | `meta/audit` | Chronological log of ingest, query, correction, and lint runs. |
 """
 
-DEFAULT_LOG_MD = """---
-title: "Vault Activity Log"
-type: meta
-updated: {today}
----
-
-# 📜 Vault Activity Log
+DEFAULT_LOG_MD = """# 📜 Vault Activity Log
 
 Chronological audit log tracking all vault operations (`ingest`, `query`, `lint`, `refactor`).
 
-## [{today}] init | Vault Initialized
-- Scaffolding generated for OKF v0.2 Knowledge Compiler Obsidian Vault.
-- Directory structure: `raw/`, `raw/assets/`, `wiki/sources/`, `wiki/entities/`, `wiki/concepts/`, `wiki/synthesis/`.
-- Core navigation files created: `index.md`, `log.md`, `GEMINI.md`.
+## {today}
+- **init** | Vault Initialized: Scaffolding generated for OKF v0.3 Knowledge Compiler Obsidian Vault (`raw/`, `raw/assets/`, `wiki/sources/`, `wiki/entities/`, `wiki/concepts/`, `wiki/synthesis/`, `index.md`, `log.md`, `GEMINI.md`).
 """
 
 DEFAULT_PURPOSE_MD = """---
@@ -193,7 +189,7 @@ This ledger tracks all autonomous and manual skill evolution proposals, benchmar
 ## 📜 Evolutionary History
 | Iteration | Target Skill | Patch Summary | Validation Delta | Status | Failure / Success Rationale |
 | :---: | :--- | :--- | :--- | :---: | :--- |
-| **001** | `knowledge-compiler` | Initial OKF v0.2 scaffolding and extraction pipeline | High | ✅ Accepted | Baseline skill initialization and multi-format extraction verified. |
+| **001** | `knowledge-compiler` | Initial OKF v0.3 scaffolding and extraction pipeline | High | ✅ Accepted | Baseline skill initialization and multi-format extraction verified. |
 """
 
 DEFAULT_ARCHITECTURE_BASE = """filters:
@@ -578,7 +574,7 @@ def init_vault(
         print(json.dumps(results, indent=2))
     else:
         if results["success"]:
-            print(f"🚀 OKF v0.2 Knowledge Compiler Vault initialized at: {target_path}")
+            print(f"🚀 OKF v0.3 Knowledge Compiler Vault initialized at: {target_path}")
             print("\n📁 Created Directory Hierarchy:")
             print("  ├── raw/               (Immutable sources)")
             print("  │   └── assets/        (Extracted diagrams & raster media)")
@@ -602,7 +598,7 @@ def init_vault(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Initialize an OKF v0.2 Knowledge Compiler Obsidian Vault."
+        description="Initialize an OKF v0.3 Knowledge Compiler Obsidian Vault."
     )
     parser.add_argument(
         "--target",

@@ -711,6 +711,158 @@ class TestVaultLintV1Conformance(unittest.TestCase):
         self.assertEqual(res_ex["fixed_files"], [])
         self.assertEqual(ex_note.read_text(encoding="utf-8"), raw_ex)
 
+    def test_okf_v03_migration_idempotency_superseded_and_log_union(self) -> None:
+        from scripts.hooks import auto_sync_vault
+
+        vault = self.tmp_dir / "LegacyV02Vault"
+        (vault / "raw").mkdir(parents=True)
+        (vault / "wiki" / "concepts").mkdir(parents=True)
+        (vault / "raw" / "briefing.pdf").write_text("dummy pdf", encoding="utf-8")
+
+        # Legacy v0.2 root index.md (no okf_version), sub-index.md with frontmatter,
+        # and log.md with frontmatter + out-of-order legacy headings
+        (vault / "index.md").write_text(
+            "---\ntitle: Legacy Vault\ncreated: 2026-10-01\n---\n\n"
+            "# Master Index\n\n- [[Old Concept]]\n- [[New Concept]]\n",
+            encoding="utf-8",
+        )
+        (vault / "wiki" / "index.md").write_text(
+            "---\ntitle: Sub Index\n---\n\n# Wiki Sub Index\n",
+            encoding="utf-8",
+        )
+        (vault / "log.md").write_text(
+            "---\ntitle: Audit Log\ntype: meta\n---\n\n"
+            "# Audit Log\n\n"
+            "## [2026-10-01] init | Initialized vault\n"
+            "- Created initial layout.\n\n"
+            "## [2026-11-10] ingest | Added briefing\n"
+            "- Compiled [[Old Concept]].\n",
+            encoding="utf-8",
+        )
+        (vault / "wiki" / "concepts" / "New Concept.md").write_text(
+            "---\n"
+            "title: New Concept\n"
+            "type: concept\n"
+            "status: stable\n"
+            "generated:\n"
+            "  by: knowledge-compiler/1.2.0\n"
+            "  at: 2026-11-17T12:00:00Z\n"
+            "verified:\n"
+            "  - by: human:reviewer\n"
+            "    at: 2026-11-10T12:00:00Z\n"
+            "---\n\n"
+            "# New Concept\n\nReplaces [[Old Concept]].\n",
+            encoding="utf-8",
+        )
+        (vault / "wiki" / "concepts" / "Old Concept.md").write_text(
+            "---\n"
+            "title: Old Concept\n"
+            "type: concept\n"
+            "status: deprecated\n"
+            "superseded_by: wiki/concepts/New Concept.md\n"
+            "sources:\n"
+            "  - id: brief\n"
+            "    resource: raw/briefing.pdf\n"
+            "---\n\n"
+            "# Old Concept\n\nGrounded in briefing.[^brief]\n",
+            encoding="utf-8",
+        )
+
+        # First migration run upgrades index.md, log.md, wiki/index.md, and Old Concept.md
+        code1, out1, _ = self._run_cli([str(vault), "--fix", "--migrate-v03", "--strict", "--json"])
+        rep1 = json.loads(out1)
+        self.assertEqual(code1, 0, msg=json.dumps(rep1, indent=2))
+        self.assertEqual(rep1["bundle_okf_version"], "0.3")
+        self.assertIn("index.md", rep1["migrated_v03_files"])
+        self.assertIn("log.md", rep1["migrated_v03_files"])
+        self.assertIn("wiki/index.md", rep1["migrated_v03_files"])
+        self.assertIn("wiki/concepts/Old Concept.md", rep1["migrated_v03_files"])
+        self.assertIn("wiki/concepts/New Concept.md", rep1["stale_verification_notes"])
+        self.assertEqual(rep1["trust_tier_counts"]["unverified"], 2)
+
+        idx_after = (vault / "index.md").read_text(encoding="utf-8")
+        self.assertIn('okf_version: "0.3"', idx_after)
+        log_after = (vault / "log.md").read_text(encoding="utf-8")
+        self.assertFalse(log_after.startswith("---"))
+        self.assertLess(log_after.index("## 2026-11-10"), log_after.index("## 2026-10-01"))
+        self.assertFalse((vault / "wiki" / "index.md").read_text(encoding="utf-8").startswith("---"))
+        old_after = (vault / "wiki" / "concepts" / "Old Concept.md").read_text(encoding="utf-8")
+        self.assertIn("/raw/briefing.pdf", old_after)
+        self.assertIn("/wiki/concepts/New Concept.md", old_after)
+
+        # Second migration run is 100% idempotent
+        code2, out2, _ = self._run_cli([str(vault), "--fix", "--migrate-v03", "--strict", "--json"])
+        rep2 = json.loads(out2)
+        self.assertEqual(code2, 0)
+        self.assertEqual(rep2["migrated_v03_files"], [])
+        self.assertEqual(rep2["fixed_files"], [])
+
+        # Verify OKF v0.3 same-day bullet union in auto_sync_vault.merge_log_markdown
+        ours = "# Audit Log\n\n## 2026-11-17\n\n- **sync** | Added Note A\n"
+        theirs = "# Audit Log\n\n## 2026-11-17\n\n- **sync** | Added Note B\n"
+        merged = auto_sync_vault.merge_log_markdown(ours, theirs)
+        self.assertEqual(merged.count("## 2026-11-17"), 1)
+        self.assertIn("Added Note A", merged)
+        self.assertIn("Added Note B", merged)
+
+    def test_shipped_starter_vault_is_strict_okf_v03_conformant(self) -> None:
+        import vault_graph
+        import vault_query
+
+        starter = REPO_ROOT / "examples" / "starter-vault"
+        self.assertTrue(starter.is_dir(), f"Missing shipped starter vault at {starter}")
+
+        code, out, err = self._run_cli([str(starter), "--strict", "--json"])
+        self.assertEqual(code, 0, msg=f"Starter vault failed strict lint:\n{out}\n{err}")
+        rep = json.loads(out)
+        self.assertTrue(rep["is_healthy"])
+        self.assertTrue(rep["strict_passed"])
+        self.assertEqual(rep["bundle_okf_version"], "0.3")
+        self.assertEqual(rep["total_wiki_notes"], 21)
+        self.assertEqual(rep["broken_links"], [])
+        self.assertEqual(rep["orphan_notes"], [])
+        self.assertEqual(rep["missing_from_index"], [])
+        self.assertEqual(rep["conformance_errors"], [])
+        self.assertGreaterEqual(rep["trust_tier_counts"]["machine-confirmed"], 1)
+
+        for query_text in (
+            "BigQuery partition pruning",
+            "Pub/Sub dead-letter",
+            "Workload Identity Federation",
+            "canary rollout",
+        ):
+            q_res = vault_query.query_vault(starter, query_text, limit=5)
+            self.assertGreaterEqual(
+                q_res["total_results"],
+                2,
+                msg=f"Expected >= 2 matches for query {query_text!r}, got {q_res}",
+            )
+            scores = [r["score"] for r in q_res["results"]]
+            self.assertEqual(scores, sorted(scores, reverse=True))
+
+        graph = vault_graph.build_vault_graph(starter, ce_patterns_root=self.tmp_dir / "no_shared")
+        cat_counts = graph["stats"]["categoryCounts"]
+        for category in ("anchor", "raw", "source", "entity", "concept", "pattern", "synthesis"):
+            self.assertGreaterEqual(
+                cat_counts.get(category, 0),
+                1,
+                msg=f"Expected >= 1 node in category {category!r}, got {cat_counts}",
+            )
+        edge_counts = graph["stats"]["edgeTypeCounts"]
+        for edge_type in (
+            "CORROBORATES",
+            "COMPLEMENTS",
+            "EXTENDS",
+            "CONTRADICTS",
+            "SUPERSEDES",
+            "LINKS_TO",
+        ):
+            self.assertGreaterEqual(
+                edge_counts.get(edge_type, 0),
+                1,
+                msg=f"Expected >= 1 edge of type {edge_type!r}, got {edge_counts}",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -34,11 +34,12 @@ PLUGIN_MANIFEST = {
     "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
     "name": "knowledge-compiler",
     "displayName": "Knowledge Compiler",
-    "version": "1.1.3",
+    "version": "1.2.0",
     "description": (
         "Compile PDFs, slides, docs, and agent sessions into a local Open Knowledge Format "
-        "(OKF v0.2) Markdown wiki with a 2D/3D WebGL graph and linter."
+        "(OKF v0.3) Markdown wiki with a 2D/3D WebGL graph and linter."
     ),
+    "category": "productivity",
     "logo": "assets/logo.svg",
     "author": {"name": "Google LLC"},
     "license": "Apache-2.0",
@@ -58,7 +59,7 @@ PLUGIN_MANIFEST = {
         "google-cloud",
     ],
     "suggestedPrompts": [
-        "Initialize an OKF v0.2 knowledge vault in ./vault and compile the current session into it",
+        "Initialize an OKF v0.3 knowledge vault in ./vault and compile the current session into it",
         "Ingest a PDF, slide deck, or markdown folder into my knowledge vault and update index.md",
         "Audit my knowledge vault for broken wikilinks, frontmatter errors, and orphan notes",
     ],
@@ -348,13 +349,22 @@ def install_global_plugin(
             shutil.copytree(skill_folder, target_skill)
             copied_skills.append(skill_folder.name)
 
+    # 5b. Sync bundled clean-room starter vault (examples/starter-vault/) for read-only graph preview
+    starter_src = root / "examples" / "starter-vault"
+    if starter_src.is_dir() and not starter_src.is_symlink():
+        starter_dst = plugin_dir / "examples" / "starter-vault"
+        if starter_dst.exists():
+            shutil.rmtree(starter_dst)
+        starter_dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(starter_src, starter_dst)
+
     # 6. Install WebGL Graph UI Sidecar for AuxPane
     sidecar_manifest = {
         "command": "python3",
         "args": ["-B", "-u", "server.py"],
         "restart_policy": "always",
         "display_name": "Knowledge Graph",
-        "description": "Interactive 2D/3D graph of your Open Knowledge Format wiki with search and a Markdown reader (v1.1.3).",
+        "description": "Interactive 2D/3D graph of your Open Knowledge Format wiki with a 21-note sample preview, search, and Markdown reader (v1.2.0).",
         "has_web_ui": True,
         "ui_config": {
             "display_name": "Vault WebGL Graph",
@@ -472,7 +482,7 @@ def sync_repo_marketplace_bundle(repo_root: Path | None = None) -> dict:
         "args": ["-B", "-u", "server.py"],
         "restart_policy": "always",
         "display_name": "Knowledge Graph",
-        "description": "Interactive 2D/3D graph of your Open Knowledge Format wiki with search and a Markdown reader (v1.1.3).",
+        "description": "Interactive 2D/3D graph of your Open Knowledge Format wiki with a 21-note sample preview, search, and Markdown reader (v1.2.0).",
         "has_web_ui": True,
         "ui_config": {
             "display_name": "Vault WebGL Graph",
@@ -586,7 +596,7 @@ def main() -> None:
         harnesses.append("Default (~/.gemini/config)")
 
     print("============================================================")
-    print(" Knowledge Compiler — Global Plugin Installer (v1.1.3)")
+    print(" Knowledge Compiler — Global Plugin Installer (v1.2.0)")
     print("============================================================")
     print(f" Detected Harnesses : {', '.join(harnesses)}")
     print(f" Plugin Directory   : {result['plugin_dir']}")

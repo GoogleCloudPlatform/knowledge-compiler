@@ -13,10 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-OKF v0.2 Knowledge Compiler Vault Linter & Conformance Auditor.
-Validates OKF v0.2 bundle conformance inside `wiki/`, wikilink integrity,
+OKF v0.3 Knowledge Compiler Vault Linter & Conformance Auditor (with v0.2 compatibility).
+Validates OKF v0.3 bundle conformance inside `wiki/`, wikilink integrity,
 table formatting invariants, orphan notes, ranked `wanted_pages`, trust-tier
-breakdown, freshness (`stale_after`), and Workspace Profile root files.
+breakdown (`verified[].at >= generated.at`), freshness (`stale_after`),
+`superseded_by` lifecycle edges, and Workspace Profile root files.
 """
 from __future__ import annotations
 
@@ -43,12 +44,12 @@ if str(_SCRIPT_DIR) not in sys.path:
 import okf  # noqa: E402
 
 SUPPORTED_OKF_VERSION = okf.SUPPORTED_OKF_VERSION
-UPSTREAM_OKF_REPO_URL = "https://github.com/GoogleCloudPlatform/open-knowledge-format"
+UPSTREAM_OKF_REPO_URL = "https://github.com/open-knowledge-format/open-knowledge-format"
 UPSTREAM_OKF_SPEC_RAW_URL = (
-    "https://raw.githubusercontent.com/GoogleCloudPlatform/open-knowledge-format/main/SPEC.md"
+    "https://raw.githubusercontent.com/open-knowledge-format/open-knowledge-format/main/SPEC.md"
 )
 UPSTREAM_OKF_COMMITS_API_URL = (
-    "https://api.github.com/repos/GoogleCloudPlatform/open-knowledge-format/commits/main"
+    "https://api.github.com/repos/open-knowledge-format/open-knowledge-format/commits/main"
 )
 
 IGNORED_DIR_NAMES = frozenset(
@@ -100,7 +101,7 @@ def _parse_version_tuple(version_str: str) -> tuple[int, ...]:
 
 
 def check_upstream_okf_version(timeout: float = 5.0) -> dict[str, Any]:
-    """Check upstream GoogleCloudPlatform/open-knowledge-format SPEC.md version."""
+    """Check upstream open-knowledge-format/open-knowledge-format SPEC.md version."""
     result: dict[str, Any] = {
         "supported_version": SUPPORTED_OKF_VERSION,
         "upstream_version": None,
@@ -116,7 +117,7 @@ def check_upstream_okf_version(timeout: float = 5.0) -> dict[str, Any]:
     }
 
     headers = {
-        "User-Agent": "knowledge-compiler-okf-checker/1.1.3",
+        "User-Agent": "knowledge-compiler-okf-checker/1.2.0",
         "Accept": "application/vnd.github.v3+json",
     }
 
@@ -127,7 +128,7 @@ def check_upstream_okf_version(timeout: float = 5.0) -> dict[str, Any]:
 
         header_chunk = "\n".join(spec_text.splitlines()[:40])
         m = re.search(
-            r"(?:\*\*Version\s+([0-9]+(?:\.[0-9]+)+)\*\*|Version[:\s]+([0-9]+(?:\.[0-9]+)+))",
+            r"(?:\*\*Version\s+([0-9]+(?:\.[0-9]+)+)[^*\r\n]*\*\*|Version[:\s]+([0-9]+(?:\.[0-9]+)+))",
             header_chunk,
             re.IGNORECASE,
         )
@@ -593,10 +594,13 @@ def _mask_markdown_code(body: str) -> tuple[str, Any, bool]:
     return masked, _restore, has_unclosed_fence
 
 
-def _validate_log_headings(body: str, rel_path: str) -> list[dict[str, str]]:
-    """Verify `log.md` level-2 headings match `## [YYYY-MM-DD]` or `## YYYY-MM-DD`."""
+def _validate_log_headings(
+    body: str, rel_path: str, *, check_date_order: bool = True
+) -> list[dict[str, str]]:
+    """Verify `log.md` level-2 headings match `## YYYY-MM-DD` (OKF v0.3) or legacy `## [YYYY-MM-DD]` and optionally are newest-first."""
     masked_body, _restore, _unclosed = _mask_markdown_code(body)
     issues: list[dict[str, str]] = []
+    seen_dates: list[tuple[int, str]] = []
     for line_no, raw_line in enumerate(masked_body.splitlines(), start=1):
         m = _LOG_H2_RE.match(raw_line)
         if not m:
@@ -610,7 +614,7 @@ def _validate_log_headings(body: str, rel_path: str) -> list[dict[str, str]]:
                     "rule": "okf_log_date_heading",
                     "message": (
                         f"log.md line {line_no} heading '## {heading_rest}' must start with "
-                        "'## [YYYY-MM-DD]' or '## YYYY-MM-DD'"
+                        "'## YYYY-MM-DD' or legacy '## [YYYY-MM-DD]'"
                     ),
                 }
             )
@@ -626,6 +630,21 @@ def _validate_log_headings(body: str, rel_path: str) -> list[dict[str, str]]:
                     "message": f"log.md line {line_no} has invalid calendar date '{date_str}'",
                 }
             )
+            continue
+        seen_dates.append((line_no, date_str))
+    if check_date_order:
+        for (_, newer), (line_no, older) in zip(seen_dates, seen_dates[1:]):
+            if older > newer:
+                issues.append(
+                    {
+                        "file": rel_path,
+                        "rule": "okf_log_date_order",
+                        "message": (
+                            f"log.md line {line_no} date '{older}' follows older date '{newer}'; "
+                            "OKF v0.3 §9 puts newest date first"
+                        ),
+                    }
+                )
     return issues
 
 
@@ -771,7 +790,7 @@ def approve_human_note(
 
 
 def _extract_epistemic_wikilinks(fm: dict[str, Any]) -> list[str]:
-    """Extract `[[wikilink]]` targets from frontmatter epistemic edge keys."""
+    """Extract `[[wikilink]]` targets from frontmatter epistemic edge keys and OKF v0.3 `superseded_by`."""
     targets: list[str] = []
     for ep_k in EPISTEMIC_EDGE_KEYS:
         val = fm.get(ep_k)
@@ -786,6 +805,14 @@ def _extract_epistemic_wikilinks(fm: dict[str, Any]) -> list[str]:
                     tgt = tgt.split("#", 1)[0].strip()
                     if tgt:
                         targets.append(tgt)
+    sup_by = fm.get("superseded_by")
+    if isinstance(sup_by, str) and sup_by.strip():
+        clean_sup = re.sub(r"^\[\[|\]\]$", "", sup_by.strip())
+        clean_sup = re.split(r"\\?\|", clean_sup)[0].split("#", 1)[0].strip()
+        if clean_sup and not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", clean_sup):
+            clean_sup = clean_sup.lstrip("/")
+            if clean_sup:
+                targets.append(clean_sup)
     return targets
 
 
@@ -1732,6 +1759,382 @@ def apply_dedup_manifest(vault_root: Path, manifest_path: Path | str) -> dict[st
     }
 
 
+_LEGACY_LOG_H2_RE = re.compile(r"^##\s+\[(\d{4}-\d{2}-\d{2})\]\s*(.*)$")
+_V03_LOG_H2_RE = re.compile(r"^##\s+(\d{4}-\d{2}-\d{2})\s*$")
+_GENERIC_H2_RE = re.compile(r"^##\s+(.+?)\s*$")
+_URI_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
+
+
+def _upgrade_bare_bundle_path(raw_val: Any, vault_root: Path, file_path: Path) -> str | None:
+    """Prefix bare v0.2 bundle-root paths with '/' when resolving under OKF v0.3 §6.2."""
+    if not isinstance(raw_val, str):
+        return None
+    val = raw_val.strip()
+    if (
+        not val
+        or val.startswith(("/", "//", "[[", "#"))
+        or _URI_SCHEME_RE.match(val)
+        or any(ch in val for ch in ("\r", "\n", "\t"))
+    ):
+        return None
+    clean = val.split("#", 1)[0].split("?", 1)[0]
+    if not clean:
+        return None
+    rel_candidate = Path(os.path.normpath(str(file_path.parent / clean)))
+    try:
+        rel_candidate.resolve().relative_to(vault_root)
+        if rel_candidate.exists():
+            return None
+    except (OSError, ValueError):
+        pass
+    root_candidate = Path(os.path.normpath(str(vault_root / clean)))
+    try:
+        root_candidate.resolve().relative_to(vault_root)
+        if root_candidate.exists():
+            return f"/{val}"
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _render_yaml_mapping_list_block(
+    key: str,
+    items: list[dict[str, Any]],
+    preferred_order: tuple[str, ...],
+    nl: str,
+) -> str:
+    """Format a top-level YAML list of mappings cleanly."""
+    lines = [f"{key}:"]
+    for entry in items:
+        first_kv = True
+        ordered: list[str] = [k for k in preferred_order if k in entry]
+        for k in entry:
+            if k not in ordered:
+                ordered.append(k)
+        for k in ordered:
+            prefix = "  - " if first_kv else "    "
+            lines.append(f"{prefix}{k}: {okf._format_yaml_value(entry[k])}")
+            first_kv = False
+    return nl.join(lines)
+
+
+def _render_yaml_mapping_block(
+    key: str,
+    mapping: dict[str, Any],
+    preferred_order: tuple[str, ...],
+    nl: str,
+) -> str:
+    """Format a top-level YAML mapping block cleanly."""
+    lines = [f"{key}:"]
+    ordered: list[str] = [k for k in preferred_order if k in mapping]
+    for k in mapping:
+        if k not in ordered:
+            ordered.append(k)
+    for k in ordered:
+        lines.append(f"  {k}: {okf._format_yaml_value(mapping[k])}")
+    return nl.join(lines)
+
+
+def _migrate_log_content_to_v03(content: str) -> tuple[str, bool]:
+    """Convert a v0.2 log.md (frontmatter and/or `## [YYYY-MM-DD] op | title`) to OKF v0.3 §9.
+
+    Idempotent: returns `(content, False)` if already frontmatter-free with strictly
+    newest-first `## YYYY-MM-DD` headings.
+    """
+    bom = "\ufeff" if content.startswith("\ufeff") else ""
+    text = content[len(bom) :]
+    nl = "\r\n" if "\r\n" in text else "\n"
+    _fm_prefix, yaml_text, body = okf.split_frontmatter(text)
+    has_fm = yaml_text is not None
+    raw_body = body if has_fm else text
+
+    # Check if already clean OKF v0.3 log.md (no frontmatter, strictly ## YYYY-MM-DD newest-first)
+    if not has_fm:
+        masked_check, _restore, _unclosed = _mask_markdown_code(raw_body)
+        all_v03 = True
+        dates_seen: list[str] = []
+        for raw_ln in masked_check.splitlines():
+            if raw_ln.startswith("## "):
+                m_v03 = _V03_LOG_H2_RE.match(raw_ln)
+                if not m_v03:
+                    all_v03 = False
+                    break
+                d_str = m_v03.group(1)
+                try:
+                    datetime.date.fromisoformat(d_str)
+                except ValueError:
+                    all_v03 = False
+                    break
+                dates_seen.append(d_str)
+        if all_v03 and all(a >= b for a, b in zip(dates_seen, dates_seen[1:])):
+            return content, False
+
+    lines = raw_body.splitlines()
+    preamble_lines: list[str] = []
+    entries_by_date: dict[str, list[str]] = {}
+    current_date: str | None = None
+    in_fence: str | None = None
+    seen_first_h2 = False
+    fallback_date = datetime.date.today().isoformat()
+
+    for line in lines:
+        stripped = line.lstrip()
+        if in_fence is None and stripped.startswith(("```", "~~~")):
+            in_fence = stripped[:3]
+        elif in_fence is not None:
+            if stripped.startswith(in_fence):
+                in_fence = None
+            if seen_first_h2 and current_date is not None:
+                entries_by_date[current_date].append(line)
+            else:
+                preamble_lines.append(line)
+            continue
+
+        if in_fence is None and line.startswith("## "):
+            seen_first_h2 = True
+            m_v03 = _V03_LOG_H2_RE.match(line)
+            m_leg = _LEGACY_LOG_H2_RE.match(line)
+            if m_v03:
+                d_str = m_v03.group(1)
+                current_date = d_str
+                entries_by_date.setdefault(current_date, [])
+            elif m_leg:
+                d_str = m_leg.group(1)
+                rest = m_leg.group(2).strip()
+                current_date = d_str
+                bucket = entries_by_date.setdefault(current_date, [])
+                if rest:
+                    if " | " in rest:
+                        op_part, title_part = rest.split(" | ", 1)
+                        bucket.append(f"- **{op_part.strip()}** | {title_part.strip()}")
+                    else:
+                        bucket.append(f"- {rest}")
+            else:
+                m_gen = _GENERIC_H2_RE.match(line)
+                heading_txt = m_gen.group(1).strip() if m_gen else line[3:].strip()
+                current_date = current_date or fallback_date
+                entries_by_date.setdefault(current_date, []).append(f"- {heading_txt}")
+            continue
+
+        if not seen_first_h2:
+            preamble_lines.append(line)
+        elif current_date is not None:
+            entries_by_date[current_date].append(line)
+
+    # Trim leading/trailing blank lines on preamble
+    while preamble_lines and not preamble_lines[0].strip():
+        preamble_lines.pop(0)
+    while preamble_lines and not preamble_lines[-1].strip():
+        preamble_lines.pop()
+
+    out_chunks: list[str] = []
+    if preamble_lines:
+        out_chunks.append(nl.join(preamble_lines))
+    else:
+        out_chunks.append("# Audit Log")
+
+    for d_str in sorted(entries_by_date.keys(), reverse=True):
+        body_lines = list(entries_by_date[d_str])
+        while body_lines and not body_lines[0].strip():
+            body_lines.pop(0)
+        while body_lines and not body_lines[-1].strip():
+            body_lines.pop()
+        if body_lines:
+            out_chunks.append(f"## {d_str}{nl}{nl}" + nl.join(body_lines))
+        else:
+            out_chunks.append(f"## {d_str}")
+
+    new_text = bom + f"{nl}{nl}".join(out_chunks) + nl
+    return (new_text, new_text != content)
+
+
+def migrate_vault_to_v03(vault_root: Path) -> dict[str, Any]:
+    """Deterministically upgrade a vault to OKF v0.3 conformance (idempotent).
+
+    Performs three safe, deterministic upgrades:
+      1. Adds `okf_version: "0.3"` (plus `title` / `description` if missing) to root `index.md`.
+      2. Strips YAML frontmatter from `log.md` (and any sub-`index.md`) and normalizes
+         `log.md` date headings to newest-first `## YYYY-MM-DD` (OKF v0.3 §8.2, §9).
+      3. Prefixes bare v0.2 bundle-root path fields (`sources[].resource`, `superseded_by`,
+         `resource`, `computation`, `executor.resource`, `attester.resource`) inside `wiki/`
+         with `/` when the target resolves from the vault root (OKF v0.3 §6.2).
+    """
+    v_root = Path(vault_root).resolve()
+    migrated_files: list[str] = []
+    errors: list[dict[str, str]] = []
+
+    # 1. Root index.md -> okf_version: "0.3", title, description
+    root_index = v_root / "index.md"
+    if root_index.is_file() and not root_index.is_symlink():
+        orig, ok_u8 = _read_text_preserve_eol(root_index)
+        if ok_u8:
+            bom = "\ufeff" if orig.startswith("\ufeff") else ""
+            text = orig[len(bom) :]
+            nl = "\r\n" if "\r\n" in text else "\n"
+            match = okf._FRONTMATTER_RE.match(text)
+            default_title = v_root.name.replace("-", " ").replace("_", " ").strip() or "Knowledge Vault"
+            default_desc = "OKF v0.3 Knowledge Compiler vault catalog."
+            new_content = orig
+            if not match:
+                fm_block = (
+                    f"---{nl}"
+                    f'okf_version: "0.3"{nl}'
+                    f"title: {okf._format_yaml_scalar(default_title)}{nl}"
+                    f"description: {okf._format_yaml_scalar(default_desc)}{nl}"
+                    f"---{nl}{nl}"
+                )
+                new_content = bom + fm_block + text.lstrip("\r\n")
+            else:
+                fm_nl = match.group(1)
+                yaml_text = match.group(2) if match.group(2) is not None else ""
+                close_nl = match.group(3)
+                body = match.group(4)
+                fm = okf.parse_frontmatter(yaml_text, strict=False)
+                updated_yaml = yaml_text
+                if str(fm.get("okf_version") or "").strip() != "0.3" or not isinstance(
+                    fm.get("okf_version"), str
+                ):
+                    updated_yaml = okf._replace_top_level_key_block(
+                        updated_yaml, "okf_version", 'okf_version: "0.3"', fm_nl
+                    )
+                if not str(fm.get("title") or "").strip():
+                    updated_yaml = okf._replace_top_level_key_block(
+                        updated_yaml,
+                        "title",
+                        f"title: {okf._format_yaml_scalar(default_title)}",
+                        fm_nl,
+                    )
+                if not str(fm.get("description") or "").strip():
+                    updated_yaml = okf._replace_top_level_key_block(
+                        updated_yaml,
+                        "description",
+                        f"description: {okf._format_yaml_scalar(default_desc)}",
+                        fm_nl,
+                    )
+                if updated_yaml != yaml_text:
+                    new_content = f"{bom}---{fm_nl}{updated_yaml}{fm_nl}---{close_nl}{body}"
+            if new_content != orig:
+                _atomic_write_text(root_index, new_content)
+                migrated_files.append("index.md")
+
+    # 2. Root log.md (and wiki/log.md if present) -> frontmatter-free ## YYYY-MM-DD newest-first
+    for log_cand in (v_root / "log.md", v_root / "wiki" / "log.md"):
+        if log_cand.is_file() and not log_cand.is_symlink():
+            orig, ok_u8 = _read_text_preserve_eol(log_cand)
+            if ok_u8:
+                new_log, changed = _migrate_log_content_to_v03(orig)
+                if changed:
+                    _atomic_write_text(log_cand, new_log)
+                    migrated_files.append(log_cand.relative_to(v_root).as_posix())
+
+    # 3. Walk wiki/ for sub-index.md frontmatter stripping & bare bundle-root path prefixing
+    wiki_root = v_root / "wiki"
+    if wiki_root.is_dir() and not wiki_root.is_symlink():
+        for root, dirs, files in os.walk(wiki_root, followlinks=False):
+            root_p = Path(root)
+            dirs[:] = sorted(
+                d for d in dirs if d not in IGNORED_DIR_NAMES and not (root_p / d).is_symlink()
+            )
+            for fname in sorted(files):
+                if not fname.endswith(".md"):
+                    continue
+                fp = root_p / fname
+                if fp.is_symlink():
+                    continue
+                rel_posix = fp.relative_to(v_root).as_posix()
+                orig, ok_u8 = _read_text_preserve_eol(fp)
+                if not ok_u8:
+                    continue
+
+                if fname.lower() == "index.md":
+                    bom = "\ufeff" if orig.startswith("\ufeff") else ""
+                    text = orig[len(bom) :]
+                    _p, y_txt, b_txt = okf.split_frontmatter(text)
+                    if y_txt is not None:
+                        cleaned_sub = bom + b_txt.lstrip("\r\n")
+                        if cleaned_sub != orig:
+                            _atomic_write_text(fp, cleaned_sub)
+                            migrated_files.append(rel_posix)
+                    continue
+
+                if fname.lower() == "log.md" or _is_protected_from_migrate_sources(rel_posix):
+                    continue
+
+                bom = "\ufeff" if orig.startswith("\ufeff") else ""
+                text = orig[len(bom) :]
+                match = okf._FRONTMATTER_RE.match(text)
+                if not match:
+                    continue
+                fm_nl = match.group(1)
+                yaml_text = match.group(2) if match.group(2) is not None else ""
+                close_nl = match.group(3)
+                body = match.group(4)
+                try:
+                    fm = okf.parse_frontmatter(yaml_text, strict=True)
+                except okf.OKFParseError:
+                    continue
+
+                updated_yaml = yaml_text
+                # Scalar path fields
+                for scalar_key in ("superseded_by", "resource", "computation"):
+                    upgraded = _upgrade_bare_bundle_path(fm.get(scalar_key), v_root, fp)
+                    if upgraded is not None:
+                        updated_yaml = okf._replace_top_level_key_block(
+                            updated_yaml,
+                            scalar_key,
+                            f"{scalar_key}: {okf._format_yaml_scalar(upgraded)}",
+                            fm_nl,
+                        )
+
+                # sources[].resource
+                raw_sources = fm.get("sources")
+                if isinstance(raw_sources, (list, dict)):
+                    src_items = raw_sources if isinstance(raw_sources, list) else [raw_sources]
+                    new_sources: list[dict[str, Any]] = []
+                    sources_changed = False
+                    all_dicts = True
+                    for item in src_items:
+                        if not isinstance(item, dict):
+                            all_dicts = False
+                            break
+                        entry = dict(item)
+                        upgraded_res = _upgrade_bare_bundle_path(entry.get("resource"), v_root, fp)
+                        if upgraded_res is not None:
+                            entry["resource"] = upgraded_res
+                            sources_changed = True
+                        new_sources.append(entry)
+                    if all_dicts and sources_changed:
+                        block = _render_yaml_mapping_list_block(
+                            "sources", new_sources, ("id", "resource"), fm_nl
+                        )
+                        updated_yaml = okf._replace_top_level_key_block(
+                            updated_yaml, "sources", block, fm_nl
+                        )
+
+                # executor.resource / attester.resource
+                for map_key in ("executor", "attester"):
+                    m_val = fm.get(map_key)
+                    if isinstance(m_val, dict):
+                        upgraded_res = _upgrade_bare_bundle_path(m_val.get("resource"), v_root, fp)
+                        if upgraded_res is not None:
+                            new_map = dict(m_val)
+                            new_map["resource"] = upgraded_res
+                            block = _render_yaml_mapping_block(
+                                map_key, new_map, ("resource", "receipt"), fm_nl
+                            )
+                            updated_yaml = okf._replace_top_level_key_block(
+                                updated_yaml, map_key, block, fm_nl
+                            )
+
+                if updated_yaml != yaml_text:
+                    new_content = f"{bom}---{fm_nl}{updated_yaml}{fm_nl}---{close_nl}{body}"
+                    if new_content != orig:
+                        _atomic_write_text(fp, new_content)
+                        migrated_files.append(rel_posix)
+
+    return {"migrated_files": migrated_files, "errors": errors}
+
+
 def run_vault_lint(
     vault_root: Path,
     auto_fix: bool = False,
@@ -1739,10 +2142,11 @@ def run_vault_lint(
     check_okf_upstream: bool = False,
     strict: bool = False,
     migrate_sources: bool = False,
+    migrate_v03: bool = False,
     strict_drift: bool = False,
     include_mentions: bool = False,
 ) -> dict[str, Any]:
-    """Audit a Knowledge Compiler vault against OKF v0.2 conformance and graph invariants."""
+    """Audit a Knowledge Compiler vault against OKF v0.3/v0.2 conformance and graph invariants."""
     raw_vault = Path(vault_root)
     if not raw_vault.exists() or not raw_vault.is_dir():
         err_res: dict[str, Any] = {
@@ -1771,6 +2175,27 @@ def run_vault_lint(
         else:
             print(f"❌ Error: {err_res['error']}", file=sys.stderr)
         return err_res
+
+    migrated_v03_files: list[str] = []
+    if auto_fix and migrate_v03:
+        mig_res = migrate_vault_to_v03(vault_root)
+        migrated_v03_files = list(mig_res.get("migrated_files", []))
+
+    bundle_okf_version: str | None = None
+    root_idx_path = vault_root / "index.md"
+    if root_idx_path.is_file() and not root_idx_path.is_symlink():
+        try:
+            root_idx_txt, root_idx_u8 = _read_text_preserve_eol(root_idx_path)
+            if root_idx_u8:
+                root_idx_doc = okf.parse_okf_document(root_idx_txt, strict=False)
+                if root_idx_doc.get("has_frontmatter"):
+                    raw_ver = (root_idx_doc.get("frontmatter") or {}).get("okf_version")
+                    if raw_ver is not None and str(raw_ver).strip():
+                        bundle_okf_version = str(raw_ver).strip()
+        except OSError:
+            pass
+    bundle_ver_tuple = okf._parse_okf_version_tuple(bundle_okf_version)
+    is_v03_bundle = bundle_ver_tuple is not None and bundle_ver_tuple >= (0, 3)
 
     all_md_files: dict[str, dict[str, Any]] = {}
     raw_assets: dict[str, dict[str, Any]] = {}
@@ -1865,13 +2290,14 @@ def run_vault_lint(
     }
 
     table_invariant_violations: list[dict[str, str]] = []
-    fixed_files: list[str] = []
+    fixed_files: list[str] = list(migrated_v03_files)
     migrated_sources_files: list[str] = []
     conformance_errors: list[dict[str, str]] = []
     missing_frontmatter: list[str] = []
     legacy_sources_notes: list[str] = []
     dangling_footnotes: list[dict[str, str]] = []
     stale_notes: list[dict[str, str]] = []
+    stale_verification_notes: list[str] = []
     workspace_profile_warnings: list[dict[str, str]] = []
     scan_meta: dict[str, tuple[int, str, Any, str, str, int]] = {}
     trust_tier_counts = {
@@ -2019,11 +2445,17 @@ def run_vault_lint(
                 if rel_path not in fixed_files:
                     fixed_files.append(rel_path)
 
-        # 3. Validate OKF v0.2 Bundle Root (`wiki/`) vs Workspace Profile root files
+        # 3. Validate OKF v0.3/v0.2 Bundle Root (`wiki/`) vs Workspace Profile root files
         val: dict[str, Any] | None = None
         if is_wiki_note and not is_reserved_wiki:
             try:
-                val = okf.validate_okf_concept(content, is_reserved=False)
+                val = okf.validate_okf_concept(
+                    content,
+                    is_reserved=False,
+                    bundle_root=vault_root,
+                    file_path=data["full_path"],
+                    okf_version=bundle_okf_version,
+                )
             except Exception as exc:
                 val = None
                 try:
@@ -2035,7 +2467,7 @@ def run_vault_lint(
                 conformance_errors.append(
                     {
                         "file": rel_path,
-                        "rule": "okf_v02",
+                        "rule": "okf_v03",
                         "message": f"Unexpected validation error: {exc}",
                     }
                 )
@@ -2081,9 +2513,29 @@ def run_vault_lint(
         if is_wiki_note:
             if is_reserved_wiki:
                 if note_filename_lower == "log.md":
-                    log_issues = _validate_log_headings(body_to_scan, rel_path)
+                    if yaml_text is not None and is_v03_bundle:
+                        fm_issue = {
+                            "file": rel_path,
+                            "rule": "okf_log_frontmatter",
+                            "message": "log.md must not have YAML frontmatter (OKF v0.3 §9); run 'vault-lint --fix --migrate-v03'",
+                        }
+                        workspace_profile_warnings.append(fm_issue)
+                        conformance_errors.append(fm_issue)
+                    log_issues = _validate_log_headings(
+                        body_to_scan, rel_path, check_date_order=is_v03_bundle
+                    )
                     workspace_profile_warnings.extend(log_issues)
-                    conformance_errors.extend(log_issues)
+                    conformance_errors.extend(
+                        i for i in log_issues if i.get("rule") != "okf_log_date_order"
+                    )
+                elif note_filename_lower == "index.md" and yaml_text is not None and is_v03_bundle:
+                    sub_idx_issue = {
+                        "file": rel_path,
+                        "rule": "okf_subindex_frontmatter",
+                        "message": "Subdirectory index.md must not have YAML frontmatter (OKF v0.3 §8.2); run 'vault-lint --fix --migrate-v03'",
+                    }
+                    workspace_profile_warnings.append(sub_idx_issue)
+                    conformance_errors.append(sub_idx_issue)
             else:
                 if val is not None:
                     if not val["has_frontmatter"]:
@@ -2124,7 +2576,7 @@ def run_vault_lint(
                         conformance_errors.append(
                             {
                                 "file": rel_path,
-                                "rule": "okf_v02",
+                                "rule": "okf_v03",
                                 "message": (
                                     "Unresolved footnote citation(s) in body matching neither "
                                     f"sources[].id nor [^id]: definitions: {', '.join(seen_dangling)}"
@@ -2136,11 +2588,14 @@ def run_vault_lint(
                         if err_msg.startswith("Unresolved footnote citation(s)"):
                             continue
                         conformance_errors.append(
-                            {"file": rel_path, "rule": "okf_v02", "message": err_msg}
+                            {"file": rel_path, "rule": "okf_v03", "message": err_msg}
                         )
 
                     if val["legacy_sources"]:
                         legacy_sources_notes.append(rel_path)
+
+                    if val.get("stale_verifications"):
+                        stale_verification_notes.append(rel_path)
 
                     tier = val["trust_tier"]
                     trust_tier_counts[tier] = trust_tier_counts.get(tier, 0) + 1
@@ -2155,8 +2610,18 @@ def run_vault_lint(
         else:
             # Workspace Profile root files (`index.md`, `log.md`, `GEMINI.md`, etc.)
             if rel_path == "log.md":
+                if yaml_text is not None and is_v03_bundle:
+                    workspace_profile_warnings.append(
+                        {
+                            "file": rel_path,
+                            "rule": "okf_log_frontmatter",
+                            "message": "log.md should not have YAML frontmatter (OKF v0.3 §9); run 'vault-lint --fix --migrate-v03'",
+                        }
+                    )
                 workspace_profile_warnings.extend(
-                    _validate_log_headings(body_to_scan, rel_path)
+                    _validate_log_headings(
+                        body_to_scan, rel_path, check_date_order=is_v03_bundle
+                    )
                 )
 
         # 4. Extract outbound [[wikilinks]] and local .md links from masked prose
@@ -2298,6 +2763,7 @@ def run_vault_lint(
         "vault_path": str(vault_root),
         "bundle_root": "wiki",
         "supported_okf_version": SUPPORTED_OKF_VERSION,
+        "bundle_okf_version": bundle_okf_version,
         "total_markdown_files": len(all_md_files),
         "total_wiki_notes": total_wiki_notes,
         "broken_links": broken_links,
@@ -2305,6 +2771,7 @@ def run_vault_lint(
         "table_invariant_violations": table_invariant_violations,
         "fixed_files": fixed_files,
         "migrated_sources_files": migrated_sources_files,
+        "migrated_v03_files": migrated_v03_files,
         "orphan_notes": orphan_notes,
         "missing_from_index": missing_from_index,
         "missing_frontmatter": missing_frontmatter,
@@ -2312,6 +2779,7 @@ def run_vault_lint(
         "legacy_sources_notes": legacy_sources_notes,
         "dangling_footnotes": dangling_footnotes,
         "stale_notes": stale_notes,
+        "stale_verification_notes": stale_verification_notes,
         "stale_syntheses": stale_syntheses,
         "unlinked_mentions": unlinked_mentions,
         "workspace_profile_warnings": workspace_profile_warnings,
@@ -2335,15 +2803,16 @@ def run_vault_lint(
 
 
 def _print_lint_report(results: dict[str, Any], *, auto_fix: bool, strict: bool) -> None:
-    """Print human-readable OKF v0.2 vault audit report."""
+    """Print human-readable OKF v0.3 vault audit report."""
     ep = results["epistemic_edge_counts"]
     tt = results["trust_tier_counts"]
     total_ep = sum(ep.values())
 
     print("=" * 60)
-    print("🔍 OKF v0.2 Knowledge Compiler Vault Audit Report")
+    print("🔍 OKF v0.3 Knowledge Compiler Vault Audit Report")
     print("=" * 60)
-    print(f"📁 Vault Path: {results['vault_path']} (OKF Bundle Root: wiki/)")
+    bver = results.get("bundle_okf_version") or "legacy/0.2"
+    print(f"📁 Vault Path: {results['vault_path']} (OKF Bundle Root: wiki/, Spec: {bver})")
     print(f"📄 Total Markdown Files: {results['total_markdown_files']}")
     print(f"📚 Total Wiki Concepts: {results['total_wiki_notes']}")
     print(
@@ -2362,6 +2831,13 @@ def _print_lint_report(results: dict[str, Any], *, auto_fix: bool, strict: bool)
     )
     print("-" * 60)
 
+    if results.get("migrated_v03_files"):
+        print(
+            f"🚀 Migrated Vault Files to OKF v0.3 ({len(results['migrated_v03_files'])}):"
+        )
+        for mv in results["migrated_v03_files"]:
+            print(f"   • {mv}")
+
     if results["migrated_sources_files"]:
         print(
             f"🔄 Migrated Legacy String Sources to {{id, resource}} ({len(results['migrated_sources_files'])}):"
@@ -2375,7 +2851,7 @@ def _print_lint_report(results: dict[str, Any], *, auto_fix: bool, strict: bool)
         )
     else:
         if results["conformance_errors"]:
-            print(f"❌ OKF v0.2 Conformance Errors ({len(results['conformance_errors'])}):")
+            print(f"❌ OKF v0.3 Conformance Errors ({len(results['conformance_errors'])}):")
             for err in results["conformance_errors"]:
                 print(f"   • [{err['file']}] {err['message']}")
 
@@ -2435,6 +2911,13 @@ def _print_lint_report(results: dict[str, Any], *, auto_fix: bool, strict: bool)
             print(f"ℹ️ Notes not mentioned in index.md ({len(results['missing_from_index'])}):")
             for mi in results["missing_from_index"]:
                 print(f"   • {mi}")
+
+    if results.get("stale_verification_notes"):
+        print(
+            f"ℹ️ Stale Verifications (verified.at < generated.at, OKF v0.3 §5.3, {len(results['stale_verification_notes'])}):"
+        )
+        for sv in results["stale_verification_notes"]:
+            print(f"   • {sv}")
 
     if results.get("stale_syntheses"):
         label = "❌" if results.get("strict_drift") else "⚠️"
@@ -2512,7 +2995,7 @@ def _resolve_vault_arg_for_approve(vault_arg: str | None, note_arg: str) -> Path
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        description="Audit and lint an OKF v0.2 Knowledge Compiler Obsidian Vault."
+        description="Audit and lint an OKF v0.3/v0.2 Knowledge Compiler Obsidian Vault."
     )
     parser.add_argument(
         "vault",
@@ -2529,6 +3012,11 @@ def main(argv: list[str] | None = None) -> None:
         "--migrate-sources",
         action="store_true",
         help="With --fix, deterministically convert legacy string `sources:` entries in wiki/ to `{id, resource}`.",
+    )
+    parser.add_argument(
+        "--migrate-v03",
+        action="store_true",
+        help="With --fix, deterministically upgrade index.md (okf_version: '0.3'), log.md (frontmatter-free ## YYYY-MM-DD), and bare bundle-root path fields to OKF v0.3.",
     )
     parser.add_argument(
         "--strict",
@@ -2574,7 +3062,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--check-okf-upstream",
         action="store_true",
-        help="Check https://github.com/GoogleCloudPlatform/open-knowledge-format for a newer OKF spec version.",
+        help="Check https://github.com/open-knowledge-format/open-knowledge-format for a newer OKF spec version.",
     )
     args = parser.parse_args(argv)
 
@@ -2641,6 +3129,7 @@ def main(argv: list[str] | None = None) -> None:
         check_okf_upstream=args.check_okf_upstream,
         strict=args.strict,
         migrate_sources=args.migrate_sources,
+        migrate_v03=args.migrate_v03,
         strict_drift=args.strict_drift,
         include_mentions=args.mentions,
     )
