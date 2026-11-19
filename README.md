@@ -10,7 +10,8 @@
 </p>
 
 <p>
-  <a href="https://github.com/GoogleCloudPlatform/knowledge-compiler/releases"><img src="https://img.shields.io/badge/version-1.3.0-1A73E8?style=flat-square" alt="Version 1.3.0" /></a>
+  <a href="https://googlecloudplatform.github.io/knowledge-compiler/"><img src="https://img.shields.io/badge/live_demo-3D_WebGL_Starter_Vault-1A73E8?style=flat-square" alt="Live 3D WebGL Demo" /></a>
+  <a href="https://github.com/GoogleCloudPlatform/knowledge-compiler/releases"><img src="https://img.shields.io/badge/version-1.3.0-0F766E?style=flat-square" alt="Version 1.3.0" /></a>
   <a href="https://github.com/GoogleCloudPlatform/knowledge-compiler/actions/workflows/ci.yml"><img src="https://github.com/GoogleCloudPlatform/knowledge-compiler/actions/workflows/ci.yml/badge.svg" alt="CI Status" /></a>
   <a href="https://github.com/open-knowledge-format/open-knowledge-format"><img src="https://img.shields.io/badge/OKF_v0.3-0_Errors_Strict-34A853?style=flat-square" alt="OKF v0.3 Conformant" /></a>
   <a href="pyproject.toml"><img src="https://img.shields.io/badge/python-%3E%3D3.10-3776AB?style=flat-square" alt="Python 3.10+" /></a>
@@ -19,6 +20,7 @@
 </p>
 
 <p>
+  <a href="https://googlecloudplatform.github.io/knowledge-compiler/"><strong>Live 3D Demo &#8599;</strong></a> &middot;
   <a href="#quick-start-60-second-walkthrough"><strong>60-Second Demo</strong></a> &middot;
   <a href="#compile-once-consume-anywhere"><strong>OKF v0.3 Interoperability</strong></a> &middot;
   <a href="#interactive-60-fps-webgl-workbench"><strong>WebGL Workbench</strong></a> &middot;
