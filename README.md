@@ -53,13 +53,29 @@ If you work with AI assistants on complex projects, you have probably hit the sa
 
 **Prerequisites**: Python `>= 3.10` (`>= 3.11` recommended) and Git on Windows, macOS, or Linux. Zero cloud accounts or API keys required.
 
+### Option 1: Install in Antigravity (Recommended, 1 Command)
+
+Install the full plugin directly from GitHub. All 10 skills, the cross-platform 3D WebGL Graph side pane, workspace rules, and the 21-note Starter Vault preview work out of the box with zero `pip install` needed:
+
+```bash
+agy plugin install https://github.com/GoogleCloudPlatform/knowledge-compiler
+```
+
+In the **Antigravity App** or **Antigravity for IDEs**, run `/plugin` or ask the agent to install `https://github.com/GoogleCloudPlatform/knowledge-compiler`, then open the **Vault WebGL Graph** side pane or try `/ingest`, `/distill-session`, `/vault-query`, or `/vault-lint`.
+
+> **Optional PDF CLI extra**: `.pptx`, `.docx`, `.xlsx`, `.html`, Markdown, and web URLs extract using Python's standard library alone, and Antigravity can also read PDFs natively. For offline CLI PDF extraction on machines without `pdftotext`, optionally run `python3 -m pip install pypdf`.
+
+### Option 2: Standalone CLI, CI, or Other Coding Agents
+
+Use this setup for Gemini CLI, Claude Code, Codex, Cursor, CI pipelines, or if you want `vault-lint`, `vault-query`, `vault-graph`, and full PDF/Office extras on your `$PATH`:
+
 ```bash
 git clone https://github.com/GoogleCloudPlatform/knowledge-compiler.git
 cd knowledge-compiler
 python3 -m pip install -e ".[extract]"
 ```
 
-### 1. Explore the Included 21-Note OKF v0.3 Starter Vault
+#### 1. Explore the Included 21-Note OKF v0.3 Starter Vault
 
 The repository ships a clean-room Google Cloud architecture vault in [`examples/starter-vault/`](examples/starter-vault/index.md) (`32` total Markdown files, `434` standard inter-note relative Markdown links, `0` prose wikilinks, `57` `x-kc-*` epistemic edges, `10` inline Mermaid diagrams, `33` GFM tables, a deprecated concept with `superseded_by`, and an `Attested Computation`):
 
@@ -74,7 +90,7 @@ vault-query "BigQuery partition pruning" --vault examples/starter-vault
 vault-graph examples/starter-vault
 ```
 
-### 2. Initialize or Upgrade Your Own Knowledge Vault
+#### 2. Initialize or Upgrade Your Own Knowledge Vault
 
 ```bash
 # Scaffold a fresh OKF v0.3 vault (bundle root '.', compiled concepts in wiki/)
@@ -163,7 +179,7 @@ Use **Knowledge Compiler** through slash commands inside your AI coding agent or
 <!-- mdformat off -->
 | Environment | Setup | Included Surfaces |
 | :--- | :--- | :--- |
-| **Antigravity & Agent Plugin Hosts** | Native root `plugin.json`, `skills/`, `rules/`, `hooks.json`, and `sidecars/vault_graph` | All 10 slash-command skills, workspace rule, opt-in hooks, and WebGL Graph side pane |
+| **Antigravity (CLI, App & IDEs)** | `agy plugin install https://github.com/GoogleCloudPlatform/knowledge-compiler` (or `/plugin`) | All 10 slash-command skills, workspace rule, opt-in hooks, and 3D WebGL Graph side pane |
 | **Gemini CLI & `SKILL.md` Harnesses** | Run `kc-install-plugin` (or copy `skills/` and `rules/AGENTS.md`) | Portable `SKILL.md` bundles + `vault-*` console scripts |
 | **Standalone CLI & CI Pipelines** | `python3 -m pip install -e ".[extract]"` | Deterministic `vault-lint --strict --json`, `vault-query`, `vault-correct`, and `vault-graph --export` |
 <!-- mdformat on -->
