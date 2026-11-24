@@ -5,8 +5,8 @@
 <h1>Knowledge Compiler</h1>
 
 <p>
-  <strong>Compile messy slide decks, PDFs, Office docs, and coding-agent sessions into a verified, local-first <a href="https://github.com/open-knowledge-format/open-knowledge-format">OKF v0.3</a> knowledge graph</strong><br />
-  Readable out of the box by generic OKF tools, AI coding agents, GitHub, Obsidian, and the built-in 60 FPS 3D WebGL workbench.
+  <strong>Give your AI coding agent persistent, inspectable memory saved across sessions.</strong><br />
+  Turn slide decks, PDFs, Office docs, and long working sessions into a clean, local-first Markdown library (<a href="https://github.com/open-knowledge-format/open-knowledge-format">OKF v0.3</a>) with a built-in 60 FPS 3D WebGL graph viewer.
 </p>
 
 <p>
@@ -20,6 +20,7 @@
 </p>
 
 <p>
+  <a href="#how-it-helps-in-day-to-day-work">How It Works</a> &middot;
   <a href="#quick-start-60-second-walkthrough">60-Second Demo</a> &middot;
   <a href="#compile-once-consume-anywhere">OKF v0.3 Interoperability</a> &middot;
   <a href="#interactive-60-fps-webgl-workbench">WebGL Workbench</a> &middot;
@@ -35,15 +36,16 @@
 
 ---
 
-## Why Compiled OKF Beats Raw Prompting and RAG Chunking
+## How It Helps in Day-to-Day Work
 
-Most coding-agent knowledge setups fail in one of three ways: stuffing 100-page slide decks directly into context windows, slicing tables and diagrams into arbitrary 500-token RAG chunks, or trapping notes inside a proprietary format that external tools cannot read.
+If you work with AI assistants on complex projects, you have probably hit the same walls: uploading 100-slide decks and PDFs into chat quickly hits context limits, details inside tables and diagrams get lost in chunking, and lessons you spent hours figuring out disappear the moment you open a new conversation.
 
-**Knowledge Compiler** implements Google Cloud's [**Open Knowledge Format (`OKF v0.3`)**](https://github.com/open-knowledge-format/open-knowledge-format) (with full `OKF v0.2` backward compatibility) and Andrej Karpathy's compiled LLM-Wiki pattern as a pure-Python CLI and portable agent plugin:
+**Knowledge Compiler** fixes that by giving your AI agent a structured, local Markdown memory that compounds from session to session:
 
-- **Progressive Disclosure Instead of Context Saturation**: Agents scan a `~500`-token root `index.md` and follow 1-hop / 2-hop links to only the exact dossiers they need.
-- **Structured Provenance Instead of Lossy Chunks**: Preserves Markdown tables, inline Mermaid architecture diagrams, footnote citations, verification freshness (`verified[].at >= generated.at`), and deprecation chains (`status: deprecated` + `superseded_by`).
-- **Open Standards Instead of Lock-In**: Emits plain UTF-8 Markdown with RFC 3986 relative `.md` links, frontmatter-free `wiki/**/index.md` sub-indexes (§8), and namespaced `x-kc-*` epistemic extensions (§4.1), passing upstream `open-knowledge-format` `validate.py --strict` with **`0 errors, 0 warnings, 0 info`**.
+- **Turn messy files and sessions into lasting memory**: Drop in slide decks, PDFs, Office docs, web pages, or notes from a working session. It compiles them into an organized library of linked Markdown notes right on your machine, so your AI assistant still knows your project context weeks later without re-uploading a single slide.
+- **Solve hard problems once and reuse them**: Capture what worked during a deep dive or architecture review, automatically scrub private details, and share clean, reusable playbooks with your team.
+- **Keep facts accurate without rewriting history**: When a requirement, target, or design changes mid-project, update the current truth across your notes while leaving original meeting notes and historical records completely untouched.
+- **Stay 100% local and portable**: Everything stays on your computer in plain UTF-8 Markdown files built on Google Cloud's open [**Open Knowledge Format (`OKF v0.3`)**](https://github.com/open-knowledge-format/open-knowledge-format) with zero cloud backend or lock-in. It works out of the box across Antigravity, Gemini CLI, Claude Code, Codex, Cursor, GitHub, and Obsidian, and includes an interactive 3D graph viewer to explore how all your ideas connect.
 
 ---
 
@@ -96,7 +98,7 @@ vault-hooks enable
 
 ## Compile Once, Consume Anywhere
 
-Every vault compiled by **Knowledge Compiler** uses standard OKF v0.3 conventions so the exact same directory works across the entire OKF ecosystem without exporters or proprietary databases:
+Under the hood, **Knowledge Compiler** implements Google Cloud's [**Open Knowledge Format (`OKF v0.3`)**](https://github.com/open-knowledge-format/open-knowledge-format) (with full `OKF v0.2` backward compatibility) and Andrej Karpathy's compiled LLM-Wiki pattern. Agents scan a `~500`-token root `index.md` and follow 1-hop / 2-hop links instead of saturating context windows, preserving Markdown tables, inline Mermaid diagrams, footnote citations, verification freshness (`verified[].at >= generated.at`), and deprecation chains (`status: deprecated` + `superseded_by`), while passing upstream `open-knowledge-format` `validate.py --strict` with **`0 errors, 0 warnings, 0 info`**:
 
 <!-- mdformat off -->
 | Consumer | What Works Out of the Box |
