@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/logo.svg" width="96" height="96" alt="Knowledge Compiler Animated 3D Knowledge Crystal Logo" />
+<img src="assets/logo.svg" width="72" height="72" alt="Knowledge Compiler Animated 3D Knowledge Crystal Logo" />
 
 <h1>Knowledge Compiler</h1>
 
@@ -10,22 +10,21 @@
 </p>
 
 <p>
-  <a href="https://googlecloudplatform.github.io/knowledge-compiler/"><img src="https://img.shields.io/badge/live_demo-3D_WebGL_Starter_Vault-1A73E8?style=flat-square" alt="Live 3D WebGL Demo" /></a>
-  <a href="https://github.com/GoogleCloudPlatform/knowledge-compiler/releases"><img src="https://img.shields.io/badge/version-1.3.0-0F766E?style=flat-square" alt="Version 1.3.0" /></a>
-  <a href="https://github.com/GoogleCloudPlatform/knowledge-compiler/actions/workflows/ci.yml"><img src="https://github.com/GoogleCloudPlatform/knowledge-compiler/actions/workflows/ci.yml/badge.svg" alt="CI Status" /></a>
-  <a href="https://github.com/open-knowledge-format/open-knowledge-format"><img src="https://img.shields.io/badge/OKF_v0.3-0_Errors_Strict-34A853?style=flat-square" alt="OKF v0.3 Conformant" /></a>
-  <a href="pyproject.toml"><img src="https://img.shields.io/badge/python-%3E%3D3.10-3776AB?style=flat-square" alt="Python 3.10+" /></a>
-  <a href="https://okf.md/tools/#knowledge-compiler"><img src="https://img.shields.io/badge/ecosystem-okf.md-8430CE?style=flat-square" alt="Listed on okf.md" /></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache_2.0-FBBC04?style=flat-square" alt="Apache 2.0 License" /></a>
+  <a href="https://googlecloudplatform.github.io/knowledge-compiler/"><strong>Live 3D Demo &#8599;</strong></a> &middot;
+  <a href="https://github.com/GoogleCloudPlatform/knowledge-compiler/releases"><strong>v1.3.1</strong></a> &middot;
+  <a href="https://github.com/GoogleCloudPlatform/knowledge-compiler/actions/workflows/ci.yml"><strong>CI</strong></a> &middot;
+  <a href="https://github.com/open-knowledge-format/open-knowledge-format"><strong>OKF v0.3 Strict</strong></a> &middot;
+  <a href="https://okf.md/tools/#knowledge-compiler"><strong>okf.md</strong></a> &middot;
+  <a href="pyproject.toml"><strong>Python 3.10+</strong></a> &middot;
+  <a href="LICENSE"><strong>Apache-2.0</strong></a>
 </p>
 
 <p>
-  <a href="https://googlecloudplatform.github.io/knowledge-compiler/"><strong>Live 3D Demo &#8599;</strong></a> &middot;
-  <a href="#quick-start-60-second-walkthrough"><strong>60-Second Demo</strong></a> &middot;
-  <a href="#compile-once-consume-anywhere"><strong>OKF v0.3 Interoperability</strong></a> &middot;
-  <a href="#interactive-60-fps-webgl-workbench"><strong>WebGL Workbench</strong></a> &middot;
-  <a href="#10-portable-agent-skills-and-cli"><strong>Skills &amp; CLI</strong></a> &middot;
-  <a href="#local-first-privacy-and-offline-proof"><strong>Offline Proof</strong></a>
+  <a href="#quick-start-60-second-walkthrough">60-Second Demo</a> &middot;
+  <a href="#compile-once-consume-anywhere">OKF v0.3 Interoperability</a> &middot;
+  <a href="#interactive-60-fps-webgl-workbench">WebGL Workbench</a> &middot;
+  <a href="#10-portable-agent-skills-and-cli">Skills &amp; CLI</a> &middot;
+  <a href="#local-first-privacy-and-offline-proof">Offline Proof</a>
 </p>
 
 </div>
@@ -50,7 +49,7 @@ Most coding-agent knowledge setups fail in one of three ways: stuffing 100-page 
 
 ## Quick Start (60-Second Walkthrough)
 
-**Prerequisites**: Python `>= 3.10` (`>= 3.11` recommended) and Git. Zero cloud accounts or API keys required.
+**Prerequisites**: Python `>= 3.10` (`>= 3.11` recommended) and Git on Windows, macOS, or Linux. Zero cloud accounts or API keys required.
 
 ```bash
 git clone https://github.com/GoogleCloudPlatform/knowledge-compiler.git
@@ -206,7 +205,7 @@ Use **Knowledge Compiler** through slash commands inside your AI coding agent or
 
 ## Release History
 
-### **v1.3.0** (`Latest`)
+### **v1.3.1** (`Latest`)
 - **Full OKF v0.3 Interoperability (`vault-lint`, `vault-graph`, `vault-init`, `examples/starter-vault/`)**:
   - **Portable Standard Relative Markdown Links (`--portable-links`)**: First-class validation, orphan/index tracking, BM25 excerpt unwrapping, and clickable WebGL Reader navigation for standard RFC 3986 `%20`-encoded relative Markdown links (`[Label](../dir/Note%20Name.md)`) alongside full backward compatibility for Obsidian `[[wikilinks]]`. Adds deterministic `vault-lint --fix --portable-links` conversion and upgrades `examples/starter-vault/` (434 inter-note Markdown links, 0 prose wikilinks) so generic OKF consumers (`okf-consume`, `viz.html`, GitHub, and Obsidian) all see the complete graph.
   - **Unambiguous OKF v0.3 Bundle Root (`.`) & Subdirectory Indexes (§8)**: Reports `"bundle_root": "."` and `"concepts_dir": "wiki"` in `vault-lint`, scaffolds frontmatter-free `wiki/index.md` on `vault-init`, and generates frontmatter-free `wiki/index.md` + `wiki/<subdir>/index.md` progressive-disclosure indexes in `examples/starter-vault/` and `--fix --migrate-v03`.

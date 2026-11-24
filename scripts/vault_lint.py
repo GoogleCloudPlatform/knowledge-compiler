@@ -150,7 +150,7 @@ def check_upstream_okf_version(timeout: float = 5.0) -> dict[str, Any]:
     }
 
     headers = {
-        "User-Agent": "knowledge-compiler-okf-checker/1.3.0",
+        "User-Agent": "knowledge-compiler-okf-checker/1.3.1",
         "Accept": "application/vnd.github.v3+json",
     }
 

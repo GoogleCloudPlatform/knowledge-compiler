@@ -1371,7 +1371,7 @@ def audit_vault(vault_root: Path) -> Dict[str, List[Dict]]:
         if not s_dir.exists():
             continue
         for file in sorted(s_dir.glob("*.md")):
-            rel_path = str(file.relative_to(vault_root))
+            rel_path = file.relative_to(vault_root).as_posix()
             blocked, reason = is_path_blocked(rel_path)
             if blocked:
                 results["blocked"].append({"file": rel_path, "reason": reason})
@@ -1728,7 +1728,7 @@ def share_pattern(
         pattern_file = pattern_file.resolve()
 
     try:
-        rel_path = str(pattern_file.relative_to(vault_root))
+        rel_path = pattern_file.relative_to(vault_root).as_posix()
     except ValueError:
         raise SecurityException(
             f"File '{pattern_file}' is outside the vault root '{vault_root}'."
@@ -1804,7 +1804,7 @@ def share_pattern(
     return {
         "success": True,
         "source": rel_path,
-        "destination": str(dest_file.relative_to(target_repo_path)),
+        "destination": dest_file.relative_to(target_repo_path).as_posix(),
         "scrub_notes": scrub_notes,
         "dry_run": dry_run,
     }
@@ -2518,7 +2518,7 @@ from pathlib import Path
 # Basic link and frontmatter validation
 errors = 0
 for f in Path('wiki').rglob('*.md'):
-    content = f.read_text()
+    content = f.read_text(encoding='utf-8')
     if not content.startswith('---'):
         print(f'Missing frontmatter: {f}')
         errors += 1

@@ -1438,7 +1438,7 @@ class TestV1ReleaseGates(unittest.TestCase):
             self.assertGreaterEqual(g_10k["stats"]["wikiNotes"], 10000)
 
     def test_gate7_version_entrypoints_and_clean_room_3p_gate(self) -> None:
-        """Gate 7: STABILITY.md, 1.3.0 version parity, 12 console entrypoints, and clean-room 3P gate."""
+        """Gate 7: STABILITY.md, 1.3.1 version parity, 12 console entrypoints, and clean-room 3P gate."""
         stability_path = REPO_ROOT / "STABILITY.md"
         self.assertTrue(stability_path.is_file(), "Missing STABILITY.md")
         stability_txt = stability_path.read_text(encoding="utf-8")
@@ -1448,18 +1448,18 @@ class TestV1ReleaseGates(unittest.TestCase):
         self.assertIn("wikiskill_eval", stability_txt)
         self.assertIn("vault_hooks", stability_txt)
 
-        # Version "1.3.0" parity across plugin.json, pyproject.toml, and scripts/__init__.py
+        # Version "1.3.1" parity across plugin.json, pyproject.toml, and scripts/__init__.py
         manifest = json.loads((REPO_ROOT / "plugin.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest.get("version"), "1.3.0")
+        self.assertEqual(manifest.get("version"), "1.3.1")
 
         py_ver, console_scripts = _parse_pyproject_v1_fields(REPO_ROOT / "pyproject.toml")
-        self.assertEqual(py_ver, "1.3.0")
+        self.assertEqual(py_ver, "1.3.1")
         pyproject_raw = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
         self.assertIn("Development Status :: 5 - Production/Stable", pyproject_raw)
         self.assertNotIn("Development Status :: 4 - Beta", pyproject_raw)
 
         scripts_pkg = importlib.import_module("scripts")
-        self.assertEqual(getattr(scripts_pkg, "__version__", None), "1.3.0")
+        self.assertEqual(getattr(scripts_pkg, "__version__", None), "1.3.1")
 
         # All 12 primary vault-* / kc-* console script targets import & resolve to callable functions
         for script_name in EXPECTED_CONSOLE_SCRIPTS:
@@ -1505,7 +1505,7 @@ class TestV1ReleaseGates(unittest.TestCase):
                 output_dir=oss_out,
                 slug="knowledge-compiler",
                 display_name="Knowledge Compiler",
-                version="1.3.0",
+                version="1.3.1",
                 run_tests=True,
             )
         finally:
@@ -1514,12 +1514,12 @@ class TestV1ReleaseGates(unittest.TestCase):
             else:
                 os.environ["_KC_SKIP_NESTED_GATE7"] = prev_skip
 
-        self.assertEqual(summary["version"], "1.3.0")
+        self.assertEqual(summary["version"], "1.3.1")
         self.assertEqual(summary["leakage_violations"], 0)
         self.assertTrue((oss_out / "STABILITY.md").is_file())
         self.assertTrue((oss_out / "scripts" / "__init__.py").is_file())
         oss_manifest = json.loads((oss_out / "plugin.json").read_text(encoding="utf-8"))
-        self.assertEqual(oss_manifest.get("version"), "1.3.0")
+        self.assertEqual(oss_manifest.get("version"), "1.3.1")
 
 
 if __name__ == "__main__":

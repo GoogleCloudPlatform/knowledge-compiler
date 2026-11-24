@@ -531,7 +531,7 @@ def init_vault(
         for d in directories:
             if not d.exists():
                 d.mkdir(parents=True, exist_ok=True)
-                results["directories_created"].append(str(d.relative_to(target_path)))
+                results["directories_created"].append(d.relative_to(target_path).as_posix())
 
         today_str = datetime.date.today().isoformat()
 
@@ -568,7 +568,7 @@ def init_vault(
         for file_path, content in file_templates:
             if not file_path.exists() or force:
                 file_path.write_text(content, encoding="utf-8")
-                results["files_created"].append(str(file_path.relative_to(target_path)))
+                results["files_created"].append(file_path.relative_to(target_path).as_posix())
 
         if init_git and not (target_path / ".git").exists():
             import subprocess

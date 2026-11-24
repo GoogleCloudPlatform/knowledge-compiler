@@ -25,6 +25,12 @@ if _plugin_scripts.is_dir() and str(_plugin_scripts) not in sys.path:
 import vault_graph  # noqa: E402
 
 if __name__ == '__main__':
+    for _stream in (sys.stdout, sys.stderr):
+        if hasattr(_stream, 'reconfigure'):
+            try:
+                _stream.reconfigure(encoding='utf-8', errors='replace')
+            except Exception:
+                pass
     port = int(os.environ.get('ANTIGRAVITY_SIDECAR_WEB_PORT', '8765'))
     vault = vault_graph.resolve_default_vault(None)
     vault_graph.serve_vault_graph(vault, port=port, sidecar_mode=True)

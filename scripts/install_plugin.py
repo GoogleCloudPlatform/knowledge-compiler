@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -34,7 +35,7 @@ PLUGIN_MANIFEST = {
     "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
     "name": "knowledge-compiler",
     "displayName": "Knowledge Compiler",
-    "version": "1.3.0",
+    "version": "1.3.1",
     "description": (
         "Compile PDFs, slides, docs, and agent sessions into a local Open Knowledge Format "
         "(OKF v0.3) Markdown wiki with a 2D/3D WebGL graph and linter."
@@ -85,20 +86,29 @@ LOGO_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width=
 </svg>
 """
 
+def _cross_platform_hook_cmd(script_rel: str) -> str:
+    """Build a POSIX + Windows cmd.exe compatible command for a hook script."""
+    return (
+        f"python3 -X utf8 -B {script_rel} "
+        f"|| py -3 -X utf8 -B {script_rel} "
+        f"|| python -X utf8 -B {script_rel} || exit 0"
+    )
+
+
 REPO_HOOKS_CONFIG = {
     "vault-session-start": {
         "enabled": False,
         "SessionStart": [
             {
                 "type": "command",
-                "command": "python3 -B scripts/hooks/session_sync.py || exit 0",
+                "command": _cross_platform_hook_cmd("scripts/hooks/session_sync.py"),
                 "timeout": 15,
             }
         ],
         "PreInvocation": [
             {
                 "type": "command",
-                "command": "python3 -B scripts/hooks/session_sync.py || exit 0",
+                "command": _cross_platform_hook_cmd("scripts/hooks/session_sync.py"),
                 "timeout": 15,
             }
         ],
@@ -108,7 +118,7 @@ REPO_HOOKS_CONFIG = {
         "Stop": [
             {
                 "type": "command",
-                "command": "python3 -B scripts/hooks/auto_sync_vault.py || exit 0",
+                "command": _cross_platform_hook_cmd("scripts/hooks/auto_sync_vault.py"),
                 "timeout": 15,
             }
         ],
@@ -121,7 +131,7 @@ REPO_HOOKS_CONFIG = {
                 "hooks": [
                     {
                         "type": "command",
-                        "command": "python3 -B scripts/hooks/log_tool_failure.py || exit 0",
+                        "command": _cross_platform_hook_cmd("scripts/hooks/log_tool_failure.py"),
                         "timeout": 10,
                     }
                 ],
@@ -136,14 +146,14 @@ GLOBAL_HOOKS_CONFIG = {
         "SessionStart": [
             {
                 "type": "command",
-                "command": f"python3 -B ~/{_GLOBAL_PLUGIN_REL}/scripts/hooks/session_sync.py || exit 0",
+                "command": f"python3 -X utf8 -B ~/{_GLOBAL_PLUGIN_REL}/scripts/hooks/session_sync.py || exit 0",
                 "timeout": 15,
             }
         ],
         "PreInvocation": [
             {
                 "type": "command",
-                "command": f"python3 -B ~/{_GLOBAL_PLUGIN_REL}/scripts/hooks/session_sync.py || exit 0",
+                "command": f"python3 -X utf8 -B ~/{_GLOBAL_PLUGIN_REL}/scripts/hooks/session_sync.py || exit 0",
                 "timeout": 15,
             }
         ],
@@ -153,7 +163,7 @@ GLOBAL_HOOKS_CONFIG = {
         "Stop": [
             {
                 "type": "command",
-                "command": f"python3 -B ~/{_GLOBAL_PLUGIN_REL}/scripts/hooks/auto_sync_vault.py || exit 0",
+                "command": f"python3 -X utf8 -B ~/{_GLOBAL_PLUGIN_REL}/scripts/hooks/auto_sync_vault.py || exit 0",
                 "timeout": 15,
             }
         ],
@@ -166,7 +176,7 @@ GLOBAL_HOOKS_CONFIG = {
                 "hooks": [
                     {
                         "type": "command",
-                        "command": f"python3 -B ~/{_GLOBAL_PLUGIN_REL}/scripts/hooks/log_tool_failure.py || exit 0",
+                        "command": f"python3 -X utf8 -B ~/{_GLOBAL_PLUGIN_REL}/scripts/hooks/log_tool_failure.py || exit 0",
                         "timeout": 10,
                     }
                 ],
@@ -247,6 +257,26 @@ def install_global_plugin(
     # 2. Write hooks.json at plugin root (preserving user-enabled hook states across upgrades)
     hooks_path = plugin_dir / "hooks.json"
     hooks_cfg = copy.deepcopy(GLOBAL_HOOKS_CONFIG)
+    if sys.platform == "win32":
+        py_exe = sys.executable or "python"
+        for hook_name, script_file in (
+            ("vault-session-start", "session_sync.py"),
+            ("vault-stop-hook", "auto_sync_vault.py"),
+            ("wikiskill-error-recorder", "log_tool_failure.py"),
+        ):
+            abs_hook = str((plugin_dir / "scripts" / "hooks" / script_file).resolve())
+            win_cmd = f'"{py_exe}" -X utf8 -B "{abs_hook}" || exit 0'
+            entry = hooks_cfg[hook_name]
+            for ev_key, ev_list in entry.items():
+                if not isinstance(ev_list, list):
+                    continue
+                for item in ev_list:
+                    if isinstance(item, dict) and "command" in item:
+                        item["command"] = win_cmd
+                    elif isinstance(item, dict) and isinstance(item.get("hooks"), list):
+                        for sub in item["hooks"]:
+                            if isinstance(sub, dict) and "command" in sub:
+                                sub["command"] = win_cmd
     if preserve_existing_hooks and hooks_path.is_file() and not hooks_path.is_symlink():
         try:
             prev_hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
@@ -358,13 +388,13 @@ def install_global_plugin(
         starter_dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(starter_src, starter_dst)
 
-    # 6. Install WebGL Graph UI Sidecar for AuxPane
+    # 6. Install WebGL Graph UI Sidecar for AuxPane (cross-platform Node launcher)
     sidecar_manifest = {
-        "command": "python3",
-        "args": ["-B", "-u", "server.py"],
+        "command": "node",
+        "args": ["launcher.mjs"],
         "restart_policy": "always",
         "display_name": "Knowledge Graph",
-        "description": "Interactive 2D/3D graph of your Open Knowledge Format wiki with a 21-note sample preview, search, and Markdown reader (v1.3.0).",
+        "description": "Interactive 2D/3D graph of your Open Knowledge Format wiki with a 21-note sample preview, search, and Markdown reader (v1.3.1).",
         "has_web_ui": True,
         "ui_config": {
             "display_name": "Vault WebGL Graph",
@@ -379,6 +409,19 @@ def install_global_plugin(
     }
     sidecar_server_code = (
         "#!/usr/bin/env python3\n"
+        "# Copyright 2026 Google LLC\n"
+        "#\n"
+        '# Licensed under the Apache License, Version 2.0 (the "License");\n'
+        "# you may not use this file except in compliance with the License.\n"
+        "# You may obtain a copy of the License at\n"
+        "#\n"
+        "#     http://www.apache.org/licenses/LICENSE-2.0\n"
+        "#\n"
+        "# Unless required by applicable law or agreed to in writing, software\n"
+        '# distributed under the License is distributed on an "AS IS" BASIS,\n'
+        "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n"
+        "# See the License for the specific language governing permissions and\n"
+        "# limitations under the License.\n"
         '"""UI Sidecar entrypoint for the Knowledge Compiler WebGL Graph Visualizer."""\n'
         "from __future__ import annotations\n"
         "import os\n"
@@ -387,8 +430,14 @@ def install_global_plugin(
         "_plugin_scripts = Path(os.path.abspath(__file__)).parents[2] / 'scripts'\n"
         "if _plugin_scripts.is_dir() and str(_plugin_scripts) not in sys.path:\n"
         "    sys.path.insert(0, str(_plugin_scripts))\n\n"
-        "import vault_graph\n\n"
+        "import vault_graph  # noqa: E402\n\n"
         "if __name__ == '__main__':\n"
+        "    for _stream in (sys.stdout, sys.stderr):\n"
+        "        if hasattr(_stream, 'reconfigure'):\n"
+        "            try:\n"
+        "                _stream.reconfigure(encoding='utf-8', errors='replace')\n"
+        "            except Exception:\n"
+        "                pass\n"
         "    port = int(os.environ.get('ANTIGRAVITY_SIDECAR_WEB_PORT', '8765'))\n"
         "    vault = vault_graph.resolve_default_vault(None)\n"
         "    vault_graph.serve_vault_graph(vault, port=port, sidecar_mode=True)\n"
@@ -396,12 +445,24 @@ def install_global_plugin(
 
     sidecar_dir = plugin_dir / "sidecars" / "vault_graph"
     sidecar_dir.mkdir(parents=True, exist_ok=True)
+    src_sidecar_dir = root / "sidecars" / "vault_graph"
     (sidecar_dir / "sidecar.json").write_text(
         json.dumps(sidecar_manifest, indent=2) + "\n", encoding="utf-8"
     )
+    src_server_py = src_sidecar_dir / "server.py"
     srv_file = sidecar_dir / "server.py"
-    srv_file.write_text(sidecar_server_code, encoding="utf-8")
+    if src_server_py.is_file() and src_server_py.resolve() != srv_file.resolve():
+        shutil.copy2(src_server_py, srv_file)
+    else:
+        srv_file.write_text(sidecar_server_code, encoding="utf-8")
     srv_file.chmod(0o750)
+    for sc_asset in ("launcher.mjs", "preload.js"):
+        src_asset = src_sidecar_dir / sc_asset
+        dst_asset = sidecar_dir / sc_asset
+        if src_asset.is_file() and src_asset.resolve() != dst_asset.resolve():
+            shutil.copy2(src_asset, dst_asset)
+        elif sc_asset == "preload.js" and not dst_asset.is_file():
+            dst_asset.write_text("window.sidecar = window.sidecar || {};\n", encoding="utf-8")
 
     # Remove legacy standalone global sidecar copy so the host does not list duplicate
     # "Vault WebGL Graph" extensions (`knowledge-compiler/vault_graph` + `vault_graph`).
@@ -478,11 +539,11 @@ def sync_repo_marketplace_bundle(repo_root: Path | None = None) -> dict:
 
     # 3. Root sidecars/vault_graph/
     sidecar_manifest = {
-        "command": "python3",
-        "args": ["-B", "-u", "server.py"],
+        "command": "node",
+        "args": ["launcher.mjs"],
         "restart_policy": "always",
         "display_name": "Knowledge Graph",
-        "description": "Interactive 2D/3D graph of your Open Knowledge Format wiki with a 21-note sample preview, search, and Markdown reader (v1.3.0).",
+        "description": "Interactive 2D/3D graph of your Open Knowledge Format wiki with a 21-note sample preview, search, and Markdown reader (v1.3.1).",
         "has_web_ui": True,
         "ui_config": {
             "display_name": "Vault WebGL Graph",
@@ -497,6 +558,19 @@ def sync_repo_marketplace_bundle(repo_root: Path | None = None) -> dict:
     }
     sidecar_server_code = (
         "#!/usr/bin/env python3\n"
+        "# Copyright 2026 Google LLC\n"
+        "#\n"
+        '# Licensed under the Apache License, Version 2.0 (the "License");\n'
+        "# you may not use this file except in compliance with the License.\n"
+        "# You may obtain a copy of the License at\n"
+        "#\n"
+        "#     http://www.apache.org/licenses/LICENSE-2.0\n"
+        "#\n"
+        "# Unless required by applicable law or agreed to in writing, software\n"
+        '# distributed under the License is distributed on an "AS IS" BASIS,\n'
+        "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n"
+        "# See the License for the specific language governing permissions and\n"
+        "# limitations under the License.\n"
         '"""UI Sidecar entrypoint for the Knowledge Compiler WebGL Graph Visualizer."""\n'
         "from __future__ import annotations\n"
         "import os\n"
@@ -505,8 +579,14 @@ def sync_repo_marketplace_bundle(repo_root: Path | None = None) -> dict:
         "_plugin_scripts = Path(os.path.abspath(__file__)).parents[2] / 'scripts'\n"
         "if _plugin_scripts.is_dir() and str(_plugin_scripts) not in sys.path:\n"
         "    sys.path.insert(0, str(_plugin_scripts))\n\n"
-        "import vault_graph\n\n"
+        "import vault_graph  # noqa: E402\n\n"
         "if __name__ == '__main__':\n"
+        "    for _stream in (sys.stdout, sys.stderr):\n"
+        "        if hasattr(_stream, 'reconfigure'):\n"
+        "            try:\n"
+        "                _stream.reconfigure(encoding='utf-8', errors='replace')\n"
+        "            except Exception:\n"
+        "                pass\n"
         "    port = int(os.environ.get('ANTIGRAVITY_SIDECAR_WEB_PORT', '8765'))\n"
         "    vault = vault_graph.resolve_default_vault(None)\n"
         "    vault_graph.serve_vault_graph(vault, port=port, sidecar_mode=True)\n"
@@ -596,7 +676,7 @@ def main() -> None:
         harnesses.append("Default (~/.gemini/config)")
 
     print("============================================================")
-    print(" Knowledge Compiler — Global Plugin Installer (v1.3.0)")
+    print(" Knowledge Compiler — Global Plugin Installer (v1.3.1)")
     print("============================================================")
     print(f" Detected Harnesses : {', '.join(harnesses)}")
     print(f" Plugin Directory   : {result['plugin_dir']}")

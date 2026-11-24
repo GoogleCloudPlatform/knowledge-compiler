@@ -171,11 +171,19 @@ def _build_hook_entry(
     spec = HOOK_DEFS[hook_id]
     script_name = spec["script"]
     if workspace_relative:
-        cmd = f"python3 -B scripts/hooks/{script_name} || exit 0"
+        cmd = (
+            f"python3 -X utf8 -B scripts/hooks/{script_name} "
+            f"|| py -3 -X utf8 -B scripts/hooks/{script_name} "
+            f"|| python -X utf8 -B scripts/hooks/{script_name} || exit 0"
+        )
     else:
         assert plugin_dir is not None
-        script_abs = (plugin_dir / "scripts" / "hooks" / script_name).resolve().as_posix()
-        cmd = f'python3 -B "{script_abs}" || exit 0'
+        script_resolved = (plugin_dir / "scripts" / "hooks" / script_name).resolve()
+        if sys.platform == "win32":
+            py_exe = sys.executable or "python"
+            cmd = f'"{py_exe}" -X utf8 -B "{script_resolved}" || exit 0'
+        else:
+            cmd = f'python3 -X utf8 -B "{script_resolved.as_posix()}" || exit 0'
 
     entry: dict[str, Any] = {"enabled": bool(enabled)}
     timeout = int(spec["timeout"])

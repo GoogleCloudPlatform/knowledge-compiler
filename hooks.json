@@ -4,14 +4,14 @@
     "SessionStart": [
       {
         "type": "command",
-        "command": "python3 -B scripts/hooks/session_sync.py || exit 0",
+        "command": "python3 -X utf8 -B scripts/hooks/session_sync.py || py -3 -X utf8 -B scripts/hooks/session_sync.py || python -X utf8 -B scripts/hooks/session_sync.py || exit 0",
         "timeout": 15
       }
     ],
     "PreInvocation": [
       {
         "type": "command",
-        "command": "python3 -B scripts/hooks/session_sync.py || exit 0",
+        "command": "python3 -X utf8 -B scripts/hooks/session_sync.py || py -3 -X utf8 -B scripts/hooks/session_sync.py || python -X utf8 -B scripts/hooks/session_sync.py || exit 0",
         "timeout": 15
       }
     ]
@@ -21,7 +21,7 @@
     "Stop": [
       {
         "type": "command",
-        "command": "python3 -B scripts/hooks/auto_sync_vault.py || exit 0",
+        "command": "python3 -X utf8 -B scripts/hooks/auto_sync_vault.py || py -3 -X utf8 -B scripts/hooks/auto_sync_vault.py || python -X utf8 -B scripts/hooks/auto_sync_vault.py || exit 0",
         "timeout": 15
       }
     ]
@@ -34,7 +34,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -B scripts/hooks/log_tool_failure.py || exit 0",
+            "command": "python3 -X utf8 -B scripts/hooks/log_tool_failure.py || py -3 -X utf8 -B scripts/hooks/log_tool_failure.py || python -X utf8 -B scripts/hooks/log_tool_failure.py || exit 0",
             "timeout": 10
           }
         ]

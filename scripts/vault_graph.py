@@ -3443,7 +3443,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <button id="btn-onboard-sample" class="onboard-primary-btn" type="button" style="display:none;">
           ✨ Explore 21-Note Sample Vault
         </button>
-        <button id="btn-onboard-ace" class="onboard-secondary-btn" type="button" style="display:none;">
+        <button id="btn-onboard-ace" class="onboard-secondary-btn" type="button" style="display:none !important;">
           ☁️ Browse Remote Tier (42+ Shared Patterns)
         </button>
       </div>
@@ -8370,7 +8370,7 @@ def _is_secure_token_file(tok_path: Path) -> bool:
         return False
     if hasattr(os, "getuid") and st.st_uid != os.getuid():
         return False
-    if (st.st_mode & 0o077) != 0:
+    if sys.platform != "win32" and (st.st_mode & 0o077) != 0:
         return False
     return True
 
@@ -8991,6 +8991,8 @@ def create_graph_request_handler(
                         ["antigravity_cli", *args],
                         capture_output=True,
                         text=True,
+                        encoding="utf-8",
+                        errors="replace",
                         env=env,
                         timeout=25,
                         check=False,
