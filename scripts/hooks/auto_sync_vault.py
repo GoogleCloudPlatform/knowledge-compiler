@@ -86,9 +86,10 @@ def acquire_vault_lock(vault_path: Path) -> Iterator[bool]:
 
     resolved = vault_path.expanduser().resolve()
     sha16 = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:16]
+    uid_part = str(os.getuid()) if hasattr(os, "getuid") else "user"
     lock_dirs = [
         get_plugin_data_dir() / "locks",
-        Path(tempfile.gettempdir()) / f"kc-locks-{os.getuid()}",
+        Path(tempfile.gettempdir()) / f"kc-locks-{uid_part}",
     ]
 
     fd: int | None = None
@@ -216,6 +217,8 @@ def run_cmd(
         cwd=str(cwd),
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=timeout,
         check=False,
         env=env,

@@ -641,12 +641,12 @@ def record_cache_entry(
     """Records or updates a cache entry."""
     cache = load_cache(vault_root)
     rel_source = (
-        str(file_path.relative_to(vault_root))
+        file_path.relative_to(vault_root).as_posix()
         if file_path.is_relative_to(vault_root)
         else file_path.name
     )
     rel_output = (
-        str(output_md.relative_to(vault_root))
+        output_md.relative_to(vault_root).as_posix()
         if output_md.is_relative_to(vault_root)
         else output_md.name
     )
@@ -677,7 +677,7 @@ def is_source_cached(
 
     cache = load_cache(vault_root)
     rel_source = (
-        str(file_path.relative_to(vault_root))
+        file_path.relative_to(vault_root).as_posix()
         if file_path.is_relative_to(vault_root)
         else file_path.name
     )
@@ -1413,9 +1413,9 @@ def rebuild_cache(vault_root: Path):
                     item.stem.replace("Copy of ", "").replace("Copy of", "").strip()
                 )
                 target_md = raw_dir / f"{stem}.md"
-                rel_source = str(item.relative_to(vault_root))
+                rel_source = item.relative_to(vault_root).as_posix()
                 rel_output = (
-                    str(target_md.relative_to(vault_root)) if target_md.exists() else ""
+                    target_md.relative_to(vault_root).as_posix() if target_md.exists() else ""
                 )
 
                 cache[rel_source] = {
@@ -1432,7 +1432,7 @@ def rebuild_cache(vault_root: Path):
             elif suffix == ".md":
                 # Standalone raw markdown source
                 sha = compute_sha256(item)
-                rel_source = str(item.relative_to(vault_root))
+                rel_source = item.relative_to(vault_root).as_posix()
                 cache[rel_source] = {
                     "sha256": sha,
                     "mtime": item.stat().st_mtime,

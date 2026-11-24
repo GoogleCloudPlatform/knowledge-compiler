@@ -1,6 +1,6 @@
-# Knowledge Compiler `1.x` Stability & Compatibility Policy (`v1.3.0`)
+# Knowledge Compiler `1.x` Stability & Compatibility Policy (`v1.3.1`)
 
-This document defines the Semantic Versioning (`SemVer 2.0.0`) and backward-compatibility guarantees for **Knowledge Compiler** across the `1.x` release series, starting with `v1.0.0` (updated for `v1.3.0` with full `OKF v0.3` interoperability: portable relative Markdown links, unambiguous `.` bundle root + `wiki/**/index.md` progressive disclosure, and `x-kc-*` namespaced epistemic extensions, while keeping full `OKF v0.2` backward compatibility).
+This document defines the Semantic Versioning (`SemVer 2.0.0`) and backward-compatibility guarantees for **Knowledge Compiler** across the `1.x` release series, starting with `v1.0.0` (updated for `v1.3.1` with full `OKF v0.3` interoperability: portable relative Markdown links, unambiguous `.` bundle root + `wiki/**/index.md` progressive disclosure, and `x-kc-*` namespaced epistemic extensions, while keeping full `OKF v0.2` backward compatibility).
 
 Throughout `1.x`, patch releases (`1.0.z`) contain only bug fixes and security hardening, and minor releases (`1.y.0`) introduce backward-compatible features without breaking the frozen contracts documented below.
 
