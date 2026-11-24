@@ -755,20 +755,28 @@ limitations under the License.
       <div class="container">
         <div class="section-head">
           <h2>60-Second Quick Start</h2>
-          <p>Requires Python <code>&gt;= 3.10</code> and Git. No accounts, API keys, or external databases needed.</p>
+          <p>Install in Antigravity with one command (zero <code>pip install</code> required), or install the standalone Python CLI for CI and other coding agents. Requires Python <code>&gt;= 3.10</code> and Git.</p>
         </div>
 
         <div class="code-card">
           <div class="code-tabs" role="tablist" aria-label="Quick Start Workflows">
             <div class="tab-group">
-              <button class="tab-btn" role="tab" id="tab-starter" aria-selected="true" aria-controls="pane-starter" type="button">1. Explore Starter Vault</button>
-              <button class="tab-btn" role="tab" id="tab-new" aria-selected="false" aria-controls="pane-new" type="button">2. New OKF v0.3 Vault</button>
-              <button class="tab-btn" role="tab" id="tab-migrate" aria-selected="false" aria-controls="pane-migrate" type="button">3. Upgrade v0.2 &rarr; v0.3</button>
+              <button class="tab-btn" role="tab" id="tab-agy" aria-selected="true" aria-controls="pane-agy" type="button">1. Antigravity Plugin</button>
+              <button class="tab-btn" role="tab" id="tab-starter" aria-selected="false" aria-controls="pane-starter" type="button">2. CLI &amp; Starter Vault</button>
+              <button class="tab-btn" role="tab" id="tab-new" aria-selected="false" aria-controls="pane-new" type="button">3. New OKF v0.3 Vault</button>
+              <button class="tab-btn" role="tab" id="tab-migrate" aria-selected="false" aria-controls="pane-migrate" type="button">4. Upgrade v0.2 &rarr; v0.3</button>
             </div>
             <button class="copy-btn" id="copy-quickstart-btn" type="button">Copy</button>
           </div>
 
-          <pre class="code-pane active" id="pane-starter" role="tabpanel" aria-labelledby="tab-starter"><code>git clone https://github.com/GoogleCloudPlatform/knowledge-compiler.git
+          <pre class="code-pane active" id="pane-agy" role="tabpanel" aria-labelledby="tab-agy"><code># Install all 10 skills + 3D WebGL Graph side pane (zero pip install required)
+agy plugin install https://github.com/GoogleCloudPlatform/knowledge-compiler
+
+# Antigravity App / IDEs: run /plugin or ask the agent to install the GitHub URL above
+# Optional: offline CLI PDF extraction on machines without pdftotext:
+# python3 -m pip install pypdf</code></pre>
+
+          <pre class="code-pane" id="pane-starter" role="tabpanel" aria-labelledby="tab-starter"><code>git clone https://github.com/GoogleCloudPlatform/knowledge-compiler.git
 cd knowledge-compiler
 python3 -m pip install -e ".[extract]"
 

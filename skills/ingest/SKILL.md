@@ -56,10 +56,15 @@ To ensure maximum extraction fidelity, dense cross-referencing, and graph connec
 ### 1. Step 0: Locate Vault Root, Extract & Check Cache
 Locate the active Knowledge Compiler vault (checks current working directory, upward parent directories for `GEMINI.md`/`raw/`/`wiki/`, or defaults to `$OBSIDIAN_VAULT_PATH` or `~/ObsidianVault`).
 
-Run the automated extraction script to unpack text, tables, speaker notes, and embedded media assets with SHA-256 caching:
+Run the automated extraction script to unpack text, tables, speaker notes, and embedded media assets with SHA-256 caching (`.pptx`, `.docx`, `.xlsx`, `.html`, Markdown, and web URLs work with Python 3 stdlib alone; `.pdf` uses `pypdf` if installed or falls back to `pdftotext`):
 ```bash
-uv run --with python-pptx --with openpyxl python <plugin_dir>/skills/ingest/scripts/extract_source.py [target]
+# Pure Python 3 stdlib (works immediately after `agy plugin install`)
+python3 <plugin_dir>/skills/ingest/scripts/extract_source.py [target]
+
+# Optional: if `uv` is installed and you want full PDF/Office extras without a global pip install
+uv run --with pypdf --with python-pptx --with python-docx --with openpyxl python <plugin_dir>/skills/ingest/scripts/extract_source.py [target]
 ```
+If extracting a `.pdf` fails because neither `pypdf` nor `pdftotext` is installed, read the PDF directly with the agent's native file-reading tool (`read_file` / `view_file`) instead of blocking on `pip install`.
 
 ### 2. Pass 1: Structured Analysis & Cross-Reference Mapping
 Before writing or modifying any permanent wiki notes:
