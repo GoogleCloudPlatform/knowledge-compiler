@@ -224,13 +224,17 @@ Use **Knowledge Compiler** through slash commands inside your AI coding agent or
 ## Release History
 
 ### **v1.3.1** (`Latest`)
+- **Cross-Platform Bundled Node.js Sidecar Launcher (`sidecars/vault_graph/launcher.mjs`)**: Runs the interactive 3D WebGL Graph side pane reliably across Windows, macOS, and Linux via Antigravity's bundled Node runtime, probing Python 3.9+ while skipping Windows Store stubs, enforcing `PYTHONUTF8=1` and hidden console windows (`windowsHide: true`), and serving a theme-adaptive setup page with live `POST /api/recheck` when Python is not yet installed.
+- **Cross-Platform Opt-In Hooks & 1-Command Antigravity Quick Start (`hooks.json`, `README.md`, `docs/index.html`, `skills/ingest/SKILL.md`)**: Adds `cmd.exe`/`sh` Python fallback chains (`python3 || py -3 || python` with `-X utf8 -B`), promotes `agy plugin install https://github.com/GoogleCloudPlatform/knowledge-compiler` (zero `pip install` needed for core workflows) to Option 1 in Quick Start, and updates `/ingest` to run pure Python 3 stdlib first with `uv --with pypdf` and native `read_file` PDF fallbacks.
+
+<details>
+<summary><strong>Previous Releases (v1.3.0 &ndash; v1.0.0)</strong></summary>
+
+### **v1.3.0**
 - **Full OKF v0.3 Interoperability (`vault-lint`, `vault-graph`, `vault-init`, `examples/starter-vault/`)**:
   - **Portable Standard Relative Markdown Links (`--portable-links`)**: First-class validation, orphan/index tracking, BM25 excerpt unwrapping, and clickable WebGL Reader navigation for standard RFC 3986 `%20`-encoded relative Markdown links (`[Label](../dir/Note%20Name.md)`) alongside full backward compatibility for Obsidian `[[wikilinks]]`. Adds deterministic `vault-lint --fix --portable-links` conversion and upgrades `examples/starter-vault/` (434 inter-note Markdown links, 0 prose wikilinks) so generic OKF consumers (`okf-consume`, `viz.html`, GitHub, and Obsidian) all see the complete graph.
   - **Unambiguous OKF v0.3 Bundle Root (`.`) & Subdirectory Indexes (§8)**: Reports `"bundle_root": "."` and `"concepts_dir": "wiki"` in `vault-lint`, scaffolds frontmatter-free `wiki/index.md` on `vault-init`, and generates frontmatter-free `wiki/index.md` + `wiki/<subdir>/index.md` progressive-disclosure indexes in `examples/starter-vault/` and `--fix --migrate-v03`.
   - **OKF v0.3 §4.1 Namespaced `x-kc-*` Epistemic Extensions**: Adopts `x-kc-corroborates`, `x-kc-complements`, `x-kc-extends`, `x-kc-contradicts`, and `x-kc-supersedes` as canonical v0.3 frontmatter keys (migrated automatically by `--fix --migrate-v03` while remaining 100% backward-compatible with legacy unprefixed keys). `examples/starter-vault/` passes the official OKF v0.3 `validate.py --strict` with **0 errors, 0 warnings, and 0 info**.
-
-<details>
-<summary><strong>Previous Releases (v1.2.0 &ndash; v1.0.0)</strong></summary>
 
 ### **v1.2.0**
 - **Native Open Knowledge Format (`OKF v0.3`) Support with Full `v0.2` Backward Compatibility**: Upgrades `scripts/okf.py`, `scripts/init_vault.py`, `scripts/vault_lint.py`, `scripts/vault_graph.py`, `scripts/sync_patterns.py`, and `scripts/hooks/auto_sync_vault.py` to conform to the [OKF v0.3 specification](https://github.com/open-knowledge-format/open-knowledge-format):

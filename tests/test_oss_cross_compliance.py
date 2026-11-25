@@ -220,7 +220,87 @@ def audit_tree_compliance(root_dir: Path, *, strict_mode: bool) -> list[str]:
 class TestOssCrossCompliance(unittest.TestCase):
     """Verify Open Source licensing, Clean-Room compliance, and CI gate invariants."""
 
+    def test_release_version_and_changelog_parity(self) -> None:
+        """Fail closed when version bumps omit matching Release History notes."""
+        import json
+
+        plugin_data = json.loads(
+            (REPO_ROOT / "plugin.json").read_text(encoding="utf-8")
+        )
+        plugin_version = str(plugin_data.get("version", "")).strip()
+        self.assertRegex(plugin_version, r"^\d+\.\d+\.\d+$")
+
+        pyproject_txt = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        m_pyver = re.search(
+            r'^version\s*=\s*"([^"]+)"', pyproject_txt, flags=re.MULTILINE
+        )
+        self.assertIsNotNone(m_pyver, "pyproject.toml missing project version")
+        self.assertEqual(
+            m_pyver.group(1),
+            plugin_version,
+            "plugin.json version and pyproject.toml version must match",
+        )
+
+        readme_txt = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        m_rel_hdr = re.search(
+            r"^##\s+.*Release History\s*$", readme_txt, flags=re.MULTILINE
+        )
+        self.assertIsNotNone(
+            m_rel_hdr,
+            "README.md must include a Release History section",
+        )
+        release_tail = readme_txt[m_rel_hdr.end() :]
+        heading_re = re.compile(
+            r"^### \*\*v(\d+\.\d+\.\d+)\*\*", flags=re.MULTILINE
+        )
+        headings = list(heading_re.finditer(release_tail))
+        self.assertTrue(headings, "README.md Release History has no version headings")
+        self.assertEqual(
+            headings[0].group(1),
+            plugin_version,
+            f"Top README.md Release History heading must match plugin.json version v{plugin_version}",
+        )
+        seen_versions = [m.group(1) for m in headings]
+        self.assertEqual(
+            len(seen_versions),
+            len(set(seen_versions)),
+            f"Duplicate version headings found in README.md Release History: {seen_versions}",
+        )
+        end_idx = headings[1].start() if len(headings) > 1 else len(release_tail)
+        latest_block = release_tail[headings[0].end() : end_idx].strip()
+        self.assertGreater(
+            len(latest_block),
+            40,
+            f"README.md Release History entry for v{plugin_version} must include substantive release notes",
+        )
+
+        if not IS_3P_BUNDLE:
+            import build_oss_release
+
+            self.assertEqual(
+                build_oss_release.DEFAULT_VERSION,
+                plugin_version,
+                "build_oss_release.DEFAULT_VERSION must match plugin.json version",
+            )
+            oss_versions = [v for v, _ in build_oss_release._OSS_RELEASE_NOTES]
+            self.assertEqual(
+                oss_versions[0],
+                plugin_version,
+                f"Top _OSS_RELEASE_NOTES entry must match v{plugin_version}",
+            )
+            self.assertEqual(
+                len(oss_versions),
+                len(set(oss_versions)),
+                f"Duplicate versions in _OSS_RELEASE_NOTES: {oss_versions}",
+            )
+            with self.assertRaises(ValueError):
+                build_oss_release._render_3p_readme(
+                    "knowledge-compiler", "Knowledge Compiler", "9.9.9"
+                )
+
     def test_repository_open_source_compliance(self) -> None:
+        import json
+
         violations = audit_tree_compliance(
             REPO_ROOT,
             strict_mode=IS_3P_BUNDLE,
@@ -230,10 +310,16 @@ class TestOssCrossCompliance(unittest.TestCase):
         if not IS_3P_BUNDLE:
             import build_oss_release
 
+            current_version = str(
+                json.loads((REPO_ROOT / "plugin.json").read_text(encoding="utf-8"))[
+                    "version"
+                ]
+            )
             readme_3p = build_oss_release._render_3p_readme(
-                "knowledge-compiler", "Knowledge Compiler", "1.3.1"
+                "knowledge-compiler", "Knowledge Compiler", current_version
             )
             self.assertIn("This is not an officially supported Google product", readme_3p)
+            self.assertIn(f"### **v{current_version}**", readme_3p)
             contrib_3p = build_oss_release._render_3p_contributing(
                 "knowledge-compiler", "Knowledge Compiler"
             )
